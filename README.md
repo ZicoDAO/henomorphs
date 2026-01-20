@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://henomorphs.xyz/logo.png" alt="Henomorphs Logo" width="200"/>
+  <img src="assets/images/logo-henomorphs.png" alt="Henomorphs Logo" width="200"/>
 </p>
 
-<h1 align="center">🐔 HENOMORPHS</h1>
+<h1 align="center">🐣 HENOMORPHS</h1>
 
 <p align="center">
   <strong>Cyberpunk Chicken Warriors • Strategic Territory Warfare • Blockchain Gaming</strong>
