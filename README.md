@@ -223,6 +223,43 @@ Full gameplay on the go
 
 ---
 
+## 📜 Deployed Contracts
+
+All contracts are deployed on **Polygon Mainnet** (Chain ID: 137)
+
+### 💎 Diamond Architecture (EIP-2535)
+
+| Contract | Address | Description |
+|----------|---------|-------------|
+| **Staking Diamond** | [`0xA16C7963be1d90006A1D36c39831052A89Bc97BE`](https://polygonscan.com/address/0xA16C7963be1d90006A1D36c39831052A89Bc97BE) | Core staking & rewards logic |
+| **Chargepod Diamond** | [`0xA899050674ABC1EC6F433373d55466342c27Db76`](https://polygonscan.com/address/0xA899050674ABC1EC6F433373d55466342c27Db76) | Energy management & Colony Wars |
+| **Collections Diamond** | [`0x8AAb21E086FDA555d682B64fd9368836D5859e5E`](https://polygonscan.com/address/0x8AAb21E086FDA555d682B64fd9368836D5859e5E) | Modular NFT system |
+
+### 🐣 NFT Collections
+
+| Collection | Address | Supply |
+|------------|---------|--------|
+| **Henomorphs Genesis** | [`0x4B13EA1896599129dF5415910d6A38772a1EAAfb`](https://polygonscan.com/address/0x4B13EA1896599129dF5415910d6A38772a1EAAfb) | 2,300 |
+| **Henomorphs Matrix** | [`0x3999b6d269a1711223E0A72CB1AF73cbC1E6917C`](https://polygonscan.com/address/0x3999b6d269a1711223E0A72CB1AF73cbC1E6917C) | 2,100 |
+| **Henomorphs Conduit** | [`0x0275179C97BfE26e3F464F191DBCF97B003f0BA3`](https://polygonscan.com/address/0x0275179C97BfE26e3F464F191DBCF97B003f0BA3) | Entry tokens |
+| **Augments V1** | [`0x41271DfDa3AEc48F445d17a096e82B5251D0B4f9`](https://polygonscan.com/address/0x41271DfDa3AEc48F445d17a096e82B5251D0B4f9) | Genesis augments |
+| **Augments V2** | [`0x4728CE1F5ba75f2F73Afa96a7D9055Fc0EEaa56e`](https://polygonscan.com/address/0x4728CE1F5ba75f2F73Afa96a7D9055Fc0EEaa56e) | Matrix augments |
+| **Territory Cards** | [`0x01AeeC0a113419902Cd51d254FdDAfA1d2d35e9c`](https://polygonscan.com/address/0x01AeeC0a113419902Cd51d254FdDAfA1d2d35e9c) | 50 territories |
+| **Infrastructure Cards** | [`0x0Ba576451F84B54c33B292AB15F5d571F87E2d89`](https://polygonscan.com/address/0x0Ba576451F84B54c33B292AB15F5d571F87E2d89) | 4,000 |
+| **Resource Cards** | [`0x84253294Ef7B11A0574A1659847e2321b7975101`](https://polygonscan.com/address/0x84253294Ef7B11A0574A1659847e2321b7975101) | 5,500 |
+| **Henomorphs Achievements** | [`0xC76D58BaD18A61a8b5093A96d0506D70340312c6`](https://polygonscan.com/address/0xC76D58BaD18A61a8b5093A96d0506D70340312c6) | ERC-1155 badges |
+| **Colonial Crests** | [`0x7C95e4cb423AA85A7247E527c0bfD27132Be01fE`](https://polygonscan.com/address/0x7C95e4cb423AA85A7247E527c0bfD27132Be01fE) | Colony emblems |
+| **stkHeno** | [`0xeD927994Fc3bbFB998D927EF318C90540D51d227`](https://polygonscan.com/address/0xeD927994Fc3bbFB998D927EF318C90540D51d227) | Staking receipts |
+
+### 💰 Tokens
+
+| Token | Address | Type |
+|-------|---------|------|
+| **ZICO** | [`0x486ebcFEe0466Def0302A944Bd6408cD2CB3E806`](https://polygonscan.com/address/0x486ebcFEe0466Def0302A944Bd6408cD2CB3E806) | Governance |
+| **YELLOW (YLW)** | [`0x79e60C812161eBcAfF14b1F06878c6Be451CD3Ef`](https://polygonscan.com/address/0x79e60C812161eBcAfF14b1F06878c6Be451CD3Ef) | Utility |
+
+---
+
 ## 🔗 Quick Links
 
 | Resource | Link |

@@ -136,3 +136,5 @@ dist
 .pnp.*
 
 *.ps1
+
+.claude/
