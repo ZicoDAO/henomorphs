@@ -5,13 +5,13 @@ import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibGamingStorage} from "../libraries/LibGamingStorage.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
-import {PodsUtils} from "../../../libraries/PodsUtils.sol";
+import {PodsUtils} from "../../libraries/PodsUtils.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import {PowerMatrix, ChargeSeason, SpecimenCollection} from "../../../libraries/HenomorphsModel.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
+import {PowerMatrix, ChargeSeason, SpecimenCollection} from "../../libraries/HenomorphsModel.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
 
 /**
  * @title SpecializationEvolutionFacet - Hybrid Approach
@@ -32,6 +32,7 @@ contract SpecializationEvolutionFacet is AccessControlBase {
     uint8 private constant MAX_EVOLUTION_LEVEL = 10;
     uint8 private constant XP_PER_LEVEL = 100;
     uint16 private constant MAX_EVOLUTION_XP = 10000;
+    uint256 private constant MAX_ITEMS_IN_BATCH = 50;
     
     // Fair level requirements using existing Calibration system
     uint8 private constant REQUIRED_LEVEL_TIER_1 = 15;  // For actions 6 & 7
@@ -232,7 +233,184 @@ contract SpecializationEvolutionFacet is AccessControlBase {
             calibrationLevel
         );
     }
-        
+
+    /**
+     * @notice Batch perform specialization actions with upfront validation
+     * @param collectionId Collection ID
+     * @param tokenIds Array of token IDs
+     * @param actionId Specialization action ID (6-8)
+     * @return results Array of rewards (0 = failed)
+     * @return successCount Number of successful actions
+     */
+    function batchPerformSpecializationAction(
+        uint256 collectionId,
+        uint256[] calldata tokenIds,
+        uint8 actionId
+    ) external nonReentrant whenNotPaused returns (uint256[] memory results, uint256 successCount) {
+        if (tokenIds.length == 0 || tokenIds.length > MAX_ITEMS_IN_BATCH) {
+            revert LibHenomorphsStorage.InvalidCallData();
+        }
+
+        if (actionId < 6 || actionId > 8) {
+            revert LibHenomorphsStorage.UnsupportedAction();
+        }
+
+        address user = LibMeta.msgSender();
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        if (collectionId == 0 || collectionId > hs.collectionCounter) {
+            revert LibHenomorphsStorage.InvalidCallData();
+        }
+
+        SpecimenCollection storage collection = hs.specimenCollections[collectionId];
+        if (!collection.enabled) {
+            revert LibHenomorphsStorage.CollectionNotEnabled(collectionId);
+        }
+
+        results = new uint256[](tokenIds.length);
+
+        // Count valid tokens for upfront fee collection
+        uint256 validCount = 0;
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            if (_canPerformBatchAction(collectionId, tokenIds[i], actionId, user, hs)) {
+                validCount++;
+            }
+        }
+
+        if (validCount > 0) {
+            // Collect fees upfront for all valid actions
+            LibColonyWarsStorage.OperationFee storage masteryActionFee = LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_MASTERY_ACTION);
+            LibFeeCollection.processOperationFee(
+                masteryActionFee.currency,
+                masteryActionFee.beneficiary,
+                masteryActionFee.baseAmount,
+                masteryActionFee.multiplier,
+                masteryActionFee.burnOnCollect,
+                masteryActionFee.enabled,
+                user,
+                validCount,
+                "batch_specializationAction"
+            );
+        }
+
+        // Execute actions
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            uint256 reward = _performSingleAction(
+                collectionId,
+                tokenIds[i],
+                actionId,
+                user,
+                true // skipFeeCollection since we paid upfront
+            );
+            results[i] = reward;
+            if (reward > 0) {
+                successCount++;
+            }
+        }
+
+        return (results, successCount);
+    }
+
+    /**
+     * @notice Batch get specialization info for multiple tokens
+     * @param collectionId Collection ID
+     * @param tokenIds Array of token IDs
+     * @return specializations Array of specialization types
+     * @return evolutionLevels Array of evolution levels
+     * @return evolutionXPs Array of evolution XP values
+     * @return nextLevelXPs Array of XP needed for next level
+     * @return masteryPointsArray Array of mastery points
+     * @return calibrationLevels Array of calibration levels
+     */
+    function batchGetSpecializationInfo(
+        uint256 collectionId,
+        uint256[] calldata tokenIds
+    ) external view returns (
+        uint8[] memory specializations,
+        uint8[] memory evolutionLevels,
+        uint256[] memory evolutionXPs,
+        uint256[] memory nextLevelXPs,
+        uint256[] memory masteryPointsArray,
+        uint256[] memory calibrationLevels
+    ) {
+        if (tokenIds.length == 0 || tokenIds.length > MAX_ITEMS_IN_BATCH) {
+            revert LibHenomorphsStorage.InvalidCallData();
+        }
+
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        specializations = new uint8[](tokenIds.length);
+        evolutionLevels = new uint8[](tokenIds.length);
+        evolutionXPs = new uint256[](tokenIds.length);
+        nextLevelXPs = new uint256[](tokenIds.length);
+        masteryPointsArray = new uint256[](tokenIds.length);
+        calibrationLevels = new uint256[](tokenIds.length);
+
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            uint256 combinedId = PodsUtils.combineIds(collectionId, tokenIds[i]);
+            PowerMatrix storage charge = hs.performedCharges[combinedId];
+
+            specializations[i] = charge.specialization;
+            evolutionLevels[i] = charge.evolutionLevel;
+            evolutionXPs[i] = charge.evolutionXP;
+            masteryPointsArray[i] = charge.masteryPoints;
+            calibrationLevels[i] = _getCalibrationLevel(collectionId, tokenIds[i]);
+
+            if (charge.evolutionLevel < MAX_EVOLUTION_LEVEL) {
+                uint256 requiredXP = (uint256(charge.evolutionLevel) + 1) * XP_PER_LEVEL;
+                nextLevelXPs[i] = charge.evolutionXP >= requiredXP ? 0 : requiredXP - charge.evolutionXP;
+            } else {
+                nextLevelXPs[i] = 0;
+            }
+        }
+
+        return (specializations, evolutionLevels, evolutionXPs, nextLevelXPs, masteryPointsArray, calibrationLevels);
+    }
+
+    /**
+     * @notice Batch check if specialization actions can be performed
+     * @param collectionId Collection ID
+     * @param tokenIds Array of token IDs
+     * @param actionId Specialization action ID (6-8)
+     * @return canPerformArray Array of booleans indicating if action can be performed
+     * @return reasons Array of reason strings for each token
+     */
+    function batchCanPerformSpecializationAction(
+        uint256 collectionId,
+        uint256[] calldata tokenIds,
+        uint8 actionId
+    ) external view returns (
+        bool[] memory canPerformArray,
+        string[] memory reasons
+    ) {
+        if (tokenIds.length == 0 || tokenIds.length > MAX_ITEMS_IN_BATCH) {
+            revert LibHenomorphsStorage.InvalidCallData();
+        }
+
+        canPerformArray = new bool[](tokenIds.length);
+        reasons = new string[](tokenIds.length);
+
+        if (actionId < 6 || actionId > 8) {
+            for (uint256 i = 0; i < tokenIds.length; i++) {
+                canPerformArray[i] = false;
+                reasons[i] = "Invalid action ID (must be 6-8)";
+            }
+            return (canPerformArray, reasons);
+        }
+
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            (bool canPerform, string memory reason,,) = this.canPerformSpecializationAction(
+                collectionId,
+                tokenIds[i],
+                actionId
+            );
+            canPerformArray[i] = canPerform;
+            reasons[i] = reason;
+        }
+
+        return (canPerformArray, reasons);
+    }
+
     /**
      * @notice Validation - calibration for access, evolution for bonuses
      */
@@ -552,7 +730,125 @@ contract SpecializationEvolutionFacet is AccessControlBase {
     }
     
     // =================== INTERNAL FUNCTIONS - ALL RESTORED ===================
-    
+
+    /**
+     * @notice Check if token can perform batch action (lightweight validation)
+     */
+    function _canPerformBatchAction(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint8 actionId,
+        address user,
+        LibHenomorphsStorage.HenomorphsStorage storage hs
+    ) internal view returns (bool) {
+        // Check ownership
+        if (!_checkTokenOwnership(collectionId, tokenId, user)) {
+            return false;
+        }
+
+        uint256 combinedId = PodsUtils.combineIds(collectionId, tokenId);
+        PowerMatrix storage charge = hs.performedCharges[combinedId];
+
+        // Check power core is active
+        if (charge.lastChargeTime == 0) {
+            return false;
+        }
+
+        // Check specialization matches action
+        if (actionId == EFFICIENCY_MASTERY_ACTION && charge.specialization != 1) return false;
+        if (actionId == REGENERATION_MASTERY_ACTION && charge.specialization != 2) return false;
+        if (actionId == BALANCED_MASTERY_ACTION && charge.specialization != 0) return false;
+
+        // Check calibration level
+        uint256 calibrationLevel = _getCalibrationLevel(collectionId, tokenId);
+        uint8 requiredLevel = _getRequiredCalibrationLevel(actionId);
+        if (calibrationLevel < requiredLevel) {
+            return false;
+        }
+
+        // Check cooldown
+        uint256 lastUse = hs.actionLogs[combinedId][actionId];
+        if (lastUse > 0 && block.timestamp - lastUse < 21600) {
+            return false;
+        }
+
+        // Check charge
+        uint256 chargeCost = _calculateSpecializationChargeCost(actionId, calibrationLevel, charge.evolutionLevel);
+        if (charge.currentCharge < chargeCost) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @notice Perform specialization action for a single token (batch helper)
+     */
+    function _performSingleAction(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint8 actionId,
+        address user,
+        bool skipFeeCollection
+    ) internal returns (uint256) {
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+        uint256 combinedId = PodsUtils.combineIds(collectionId, tokenId);
+        PowerMatrix storage charge = hs.performedCharges[combinedId];
+
+        // Validate token can perform action
+        if (!_canPerformBatchAction(collectionId, tokenId, actionId, user, hs)) {
+            return 0;
+        }
+
+        uint256 calibrationLevel = _getCalibrationLevel(collectionId, tokenId);
+        uint8 evolutionLevel = charge.evolutionLevel;
+
+        // Calculate costs and rewards
+        uint256 chargeCost = _calculateSpecializationChargeCost(actionId, calibrationLevel, evolutionLevel);
+        uint256 baseReward = _calculateSpecializationReward(actionId, calibrationLevel, evolutionLevel);
+
+        // Process fee if not skipped (for single operations)
+        if (!skipFeeCollection) {
+            LibColonyWarsStorage.OperationFee storage masteryActionFee = LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_MASTERY_ACTION);
+            LibFeeCollection.processOperationFee(
+                masteryActionFee.currency,
+                masteryActionFee.beneficiary,
+                masteryActionFee.baseAmount,
+                masteryActionFee.multiplier,
+                masteryActionFee.burnOnCollect,
+                masteryActionFee.enabled,
+                user,
+                1,
+                "specializationAction"
+            );
+        }
+
+        // Deduct charge
+        charge.currentCharge -= uint128(chargeCost);
+
+        // Apply bonuses
+        uint256 finalReward = _applySpecializationBonuses(
+            baseReward,
+            collectionId,
+            tokenId,
+            user
+        );
+
+        // Award XP and update logs
+        awardSpecializationXP(collectionId, tokenId, actionId, finalReward);
+        hs.actionLogs[combinedId][actionId] = uint32(block.timestamp);
+
+        emit SpecializationActionPerformed(
+            collectionId,
+            tokenId,
+            actionId,
+            finalReward,
+            calibrationLevel
+        );
+
+        return finalReward;
+    }
+
     function _checkTokenControl(uint256 collectionId, uint256 tokenId) internal view {
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
         

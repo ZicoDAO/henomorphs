@@ -4,12 +4,12 @@ pragma solidity ^0.8.27;
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {ColonyHelper} from "../libraries/ColonyHelper.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
-import {PowerMatrix} from "../../../libraries/HenomorphsModel.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {PowerMatrix} from "../../libraries/HenomorphsModel.sol";
 import {WarfareHelper} from "../libraries/WarfareHelper.sol";
 import {LibAchievementTrigger} from "../libraries/LibAchievementTrigger.sol";
 
@@ -118,12 +118,14 @@ contract TerritoryWarsFacet is AccessControlBase {
             revert RaidCooldownActive();
         }
 
-        // Ensure both colonies are registered for current season
-        if (!cws.colonyWarProfiles[raiderColony].registered) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Colony not registered for season");
+        // Ensure both colonies are registered for current season (not pre-registered for future)
+        LibColonyWarsStorage.ColonyWarProfile storage raiderProfile = cws.colonyWarProfiles[raiderColony];
+        if (!raiderProfile.registered || raiderProfile.registeredSeasonId != cws.currentSeason) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Colony not registered for current season");
         }
-        if (!cws.colonyWarProfiles[territory.controllingColony].registered) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Target colony not registered for season");
+        LibColonyWarsStorage.ColonyWarProfile storage targetProfile = cws.colonyWarProfiles[territory.controllingColony];
+        if (!targetProfile.registered || targetProfile.registeredSeasonId != cws.currentSeason) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Target colony not registered for current season");
         }
 
         // Calculate minimum stake based on territory value and bonus
@@ -286,6 +288,15 @@ contract TerritoryWarsFacet is AccessControlBase {
 
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        // Warfare period check - scouting only during active warfare
+        LibColonyWarsStorage.Season storage season = cws.seasons[cws.currentSeason];
+        if (block.timestamp < season.registrationEnd) {
+            revert WarfareNotStarted();
+        }
+        if (block.timestamp > season.warfareEnd) {
+            revert WarfareEnded();
+        }
 
         // Rate limiting - one scout per hour per observatory
         if (block.timestamp < cws.territoryLastScout[observatoryId] + 3600) {

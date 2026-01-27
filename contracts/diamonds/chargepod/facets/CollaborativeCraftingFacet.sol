@@ -4,10 +4,11 @@ pragma solidity ^0.8.27;
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {LibAchievementTrigger} from "../libraries/LibAchievementTrigger.sol";
+import {IResourcePodFacet} from "../interfaces/IStakingInterfaces.sol";
 
 /**
  * @notice Colony authorization interface
@@ -392,12 +393,20 @@ contract CollaborativeCraftingFacet is AccessControlBase {
         if (contribution == 0) {
             revert NoContributionToWithdraw(contributor);
         }
-        
-        // Clear contribution and refund
+
+        // Clear contribution
         rs.projectContributions[projectId][contributor][resourceType] = 0;
-        rs.userResources[contributor][resourceType] += contribution;
-        
-        // Note: Does NOT emit ResourceContributed (it's a withdrawal)
+
+        // Refund via centralized ResourcePodFacet for consistent event tracking
+        try IResourcePodFacet(address(this)).awardResourcesDirect(
+            contributor,
+            resourceType,
+            contribution
+        ) {} catch {
+            // Fallback to direct storage if ResourcePodFacet call fails
+            LibResourceStorage.applyResourceDecay(contributor);
+            rs.userResources[contributor][resourceType] += contribution;
+        }
     }
     
     // ==================== VIEW FUNCTIONS ====================

@@ -2,7 +2,8 @@
 pragma solidity ^0.8.27;
 
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
  * @title ResourceDecayFacet
@@ -113,25 +114,38 @@ contract ResourceDecayFacet is AccessControlBase {
         needsDecay = timePassed >= 86400;
     }
     
+    /**
+     * @notice Estimate decay using SQRT formula
+     * @dev Uses same formula as LibResourceStorage.applyResourceDecay:
+     *      decayAmount = sqrt(currentAmount) * rate * days / 100
+     */
     function estimateDecay(address user) external view returns (uint256[4] memory estimatedDecay) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        
+
         if (!rs.config.resourceDecayEnabled || rs.config.baseResourceDecayRate == 0) {
             return estimatedDecay;
         }
-        
+
         uint32 lastUpdate = rs.lastDecayUpdate[user];
         if (lastUpdate == 0) return estimatedDecay;
-        
+
         uint32 timePassed = uint32(block.timestamp) - lastUpdate;
         if (timePassed < 86400) return estimatedDecay;
-        
+
         uint32 daysPassed = timePassed / 86400;
-        
+
         for (uint8 i = 0; i < 4; i++) {
             uint256 currentAmount = rs.userResources[user][i];
             if (currentAmount > 0) {
-                uint256 decayAmount = (currentAmount * rs.config.baseResourceDecayRate * daysPassed) / 10000;
+                // SQRT-based decay formula (same as LibResourceStorage)
+                uint256 sqrtAmount = Math.sqrt(currentAmount);
+                uint256 decayAmount = (sqrtAmount * rs.config.baseResourceDecayRate * daysPassed) / 100;
+
+                // Minimum decay of 1
+                if (decayAmount == 0 && currentAmount > 0) {
+                    decayAmount = 1;
+                }
+
                 estimatedDecay[i] = decayAmount > currentAmount ? currentAmount : decayAmount;
             }
         }

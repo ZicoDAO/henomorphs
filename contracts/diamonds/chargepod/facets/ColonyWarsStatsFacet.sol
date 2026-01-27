@@ -3,7 +3,7 @@ pragma solidity ^0.8.27;
 
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
 
 /**
  * @title ColonyWarsStatsFacet
@@ -917,12 +917,50 @@ contract ColonyWarsStatsFacet is AccessControlBase {
      * @param user User address
      * @return primaryColony Primary colony ID
      */
-    function getUserPrimaryColony(address user) 
-        external 
-        view 
-        returns (bytes32 primaryColony) 
+    function getUserPrimaryColony(address user)
+        external
+        view
+        returns (bytes32 primaryColony)
     {
         return LibColonyWarsStorage.getUserPrimaryColony(user);
+    }
+
+    /**
+     * @notice Get user's pre-registered colonies for a season
+     * @param user User address
+     * @param seasonId Season to check
+     * @return colonies Array of pre-registered colony IDs
+     * @return stakes Array of staked amounts
+     */
+    function getUserPreRegisteredColonies(address user, uint32 seasonId)
+        external
+        view
+        returns (bytes32[] memory colonies, uint256[] memory stakes)
+    {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        bytes32[] storage allPreReg = cws.preRegisteredColonies[seasonId];
+
+        // Count matching colonies
+        uint256 count = 0;
+        for (uint256 i = 0; i < allPreReg.length; i++) {
+            LibColonyWarsStorage.PreRegistration storage preReg = cws.preRegistrations[seasonId][allPreReg[i]];
+            if (preReg.owner == user && !preReg.cancelled) {
+                count++;
+            }
+        }
+
+        // Build result arrays
+        colonies = new bytes32[](count);
+        stakes = new uint256[](count);
+        uint256 idx = 0;
+        for (uint256 i = 0; i < allPreReg.length && idx < count; i++) {
+            LibColonyWarsStorage.PreRegistration storage preReg = cws.preRegistrations[seasonId][allPreReg[i]];
+            if (preReg.owner == user && !preReg.cancelled) {
+                colonies[idx] = allPreReg[i];
+                stakes[idx] = preReg.stake;
+                idx++;
+            }
+        }
     }
 
     /**

@@ -3,18 +3,18 @@ pragma solidity ^0.8.27;
 
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
-import {PodsUtils} from "../../../libraries/PodsUtils.sol";
+import {PodsUtils} from "../../libraries/PodsUtils.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibTraitPackHelper} from "../libraries/LibTraitPackHelper.sol";
-import {LibBiopodIntegration} from "../../staking/libraries/LibBiopodIntegration.sol";
+import {LibBiopodIntegration} from "../libraries/LibBiopodIntegration.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import {Calibration, SpecimenCollection, PowerMatrix, ChargeAccessory, ChargeActionType} from "../../../libraries/HenomorphsModel.sol";
-import {ISpecimenBiopod} from "../../../interfaces/ISpecimenBiopod.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {IStakingSystem} from "../../staking/interfaces/IStakingInterfaces.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
+import {Calibration, SpecimenCollection, PowerMatrix, ChargeAccessory, ChargeActionType} from "../../libraries/HenomorphsModel.sol";
+import {ISpecimenBiopod} from "../../interfaces/ISpecimenBiopod.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {IStakingSystem, IResourcePodFacet} from "../interfaces/IStakingInterfaces.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
 
 // Interface for external collections
 interface ISpecimenCollection {
@@ -47,6 +47,7 @@ contract BiopodFacet is AccessControlBase {
     event WearRepairApplied(uint256 indexed collectionId, uint256 indexed tokenId, uint256 repairAmount);
     event TraitPackBoost(uint256 indexed collectionId, uint256 indexed tokenId, uint8 traitPackId, uint256 boostAmount);
     event InspectionHandled(uint256 indexed collectionId, uint256 indexed tokenId, uint256 kinship, uint256 level, uint256 experience);
+    event ResourceGenerated(address indexed user, uint256 indexed collectionId, uint256 indexed tokenId, uint8 resourceType, uint256 amount);
     event CalibrationImported(uint256 indexed collectionId, uint256 indexed tokenId, address biopodSource);
 
 
@@ -857,7 +858,35 @@ contract BiopodFacet is AccessControlBase {
             emit ChargeUpdated(collectionId, tokenId, _charge.currentCharge, _charge.maxCharge);
         }
 
+        // Generate resources from inspection
+        _generateResourcesFromInspection(collectionId, tokenId, xpGain);
+
         return true;
+    }
+
+    /**
+     * @notice Generate resources for token owner from inspection
+     * @dev Delegates to ResourcePodFacet for centralized resource generation with collectionConfig
+     * @param collectionId Collection ID
+     * @param tokenId Token ID
+     * @param xpGain XP gained from inspection (used as base for resource amount)
+     */
+    function _generateResourcesFromInspection(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint256 xpGain
+    ) private {
+        // Delegate to ResourcePodFacet for centralized resource generation
+        // Uses collectionConfig for resource type and multiplier settings
+        // actionType=0 indicates inspection (vs action types 1-5)
+        try IResourcePodFacet(address(this)).generateResources(
+            collectionId,
+            tokenId,
+            0, // actionType 0 = inspection
+            xpGain
+        ) {} catch {
+            // Fail silently - resource generation is secondary to inspection
+        }
     }
 
     /**

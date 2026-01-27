@@ -4,9 +4,9 @@ pragma solidity ^0.8.27;
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
 import {ResourceHelper} from "../libraries/ResourceHelper.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /**
@@ -36,6 +36,12 @@ contract ResourceProcessingFacet is AccessControlBase {
         uint32 completionTime
     );
     event ProcessingCompleted(bytes32 indexed orderId, bytes32 indexed colonyId, uint256 outputAmount);
+    event ProcessingCancelled(
+        bytes32 indexed orderId,
+        bytes32 indexed colonyId,
+        address indexed canceller,
+        uint256 resourcesReturned
+    );
     event ResourcesProcessed(
         bytes32 indexed colonyId,
         LibColonyWarsStorage.ResourceType inputType,
@@ -90,9 +96,12 @@ contract ResourceProcessingFacet is AccessControlBase {
         order.completionTime = uint32(block.timestamp + recipe.processingTime);
         order.completed = false;
         order.claimed = false;
-        
+
+        // Track order for UI/user queries
+        cws.colonyProcessingOrders[colonyId].push(orderId);
+
         emit ProcessingStarted(orderId, colonyId, recipeId, inputAmount, order.completionTime);
-        
+
         return orderId;
     }
 
@@ -182,7 +191,7 @@ contract ResourceProcessingFacet is AccessControlBase {
     ) external onlyAuthorized{
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibColonyWarsStorage.ProcessingRecipe storage recipe = cws.processingRecipes[recipeId];
-        
+
         recipe.recipeId = recipeId;
         recipe.inputType = inputType;
         recipe.outputType = outputType;
@@ -192,7 +201,121 @@ contract ResourceProcessingFacet is AccessControlBase {
         recipe.processingTime = processingTime;
         recipe.requiredTechLevel = requiredTechLevel;
         recipe.active = true;
-        
+
         emit RecipeCreated(recipeId, auxCost, processingTime);
+    }
+
+    /**
+     * @notice Get all active processing recipes
+     * @return recipeIds Array of active recipe IDs
+     * @return recipes Array of recipe details
+     */
+    function getAllProcessingRecipes() external view returns (
+        uint8[] memory recipeIds,
+        LibColonyWarsStorage.ProcessingRecipe[] memory recipes
+    ) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+
+        // Count active recipes
+        uint256 count = 0;
+        for (uint8 i = 0; i < 255; i++) {
+            if (cws.processingRecipes[i].active) {
+                count++;
+            }
+        }
+
+        // Populate arrays
+        recipeIds = new uint8[](count);
+        recipes = new LibColonyWarsStorage.ProcessingRecipe[](count);
+
+        uint256 index = 0;
+        for (uint8 i = 0; i < 255; i++) {
+            if (cws.processingRecipes[i].active) {
+                recipeIds[index] = i;
+                recipes[index] = cws.processingRecipes[i];
+                index++;
+            }
+        }
+
+        return (recipeIds, recipes);
+    }
+
+    /**
+     * @notice Get user's processing orders
+     * @param user User address
+     * @return orderIds Array of order IDs
+     * @return orders Array of order details
+     */
+    function getUserProcessingOrders(address user) external view returns (
+        bytes32[] memory orderIds,
+        LibColonyWarsStorage.ProcessingOrder[] memory orders
+    ) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+
+        // Get user's colony
+        bytes32 colonyId = cws.userToColony[user];
+        if (colonyId == bytes32(0)) {
+            return (new bytes32[](0), new LibColonyWarsStorage.ProcessingOrder[](0));
+        }
+
+        bytes32[] storage colonyOrders = cws.colonyProcessingOrders[colonyId];
+
+        // Count active (non-claimed) orders
+        uint256 count = 0;
+        for (uint256 i = 0; i < colonyOrders.length; i++) {
+            LibColonyWarsStorage.ProcessingOrder storage order = cws.processingOrders[colonyOrders[i]];
+            if (!order.claimed) {
+                count++;
+            }
+        }
+
+        // Populate arrays
+        orderIds = new bytes32[](count);
+        orders = new LibColonyWarsStorage.ProcessingOrder[](count);
+
+        uint256 index = 0;
+        for (uint256 i = 0; i < colonyOrders.length; i++) {
+            bytes32 orderId = colonyOrders[i];
+            LibColonyWarsStorage.ProcessingOrder storage order = cws.processingOrders[orderId];
+            if (!order.claimed) {
+                orderIds[index] = orderId;
+                orders[index] = order;
+                index++;
+            }
+        }
+
+        return (orderIds, orders);
+    }
+
+    /**
+     * @notice Cancel active processing order and return resources
+     * @param orderId Order to cancel
+     */
+    function cancelProcessingOrder(bytes32 orderId) external whenNotPaused nonReentrant {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibColonyWarsStorage.ProcessingOrder storage order = cws.processingOrders[orderId];
+
+        if (order.colonyId == bytes32(0)) revert OrderNotFound();
+        if (order.claimed) revert OrderAlreadyClaimed();
+
+        // Verify caller is colony owner
+        address caller = LibMeta.msgSender();
+        bytes32 colonyId = cws.userToColony[caller];
+        require(order.colonyId == colonyId, "Not your order");
+
+        // Get recipe to calculate resources to return
+        LibColonyWarsStorage.ProcessingRecipe storage recipe = cws.processingRecipes[order.recipeId];
+
+        // Calculate input resources used
+        uint256 totalInputNeeded = recipe.inputAmount * (order.inputAmount / recipe.outputAmount);
+
+        // Return resources to colony using ResourceHelper
+        LibColonyWarsStorage.ResourceBalance storage balance = cws.colonyResources[colonyId];
+        ResourceHelper.addResources(balance, recipe.inputType, totalInputNeeded);
+
+        // Mark as claimed to prevent completeProcessing()
+        order.claimed = true;
+
+        emit ProcessingCancelled(orderId, colonyId, caller, totalInputNeeded);
     }
 }

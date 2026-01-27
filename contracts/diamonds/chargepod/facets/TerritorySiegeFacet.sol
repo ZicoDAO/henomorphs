@@ -4,14 +4,23 @@ pragma solidity ^0.8.27;
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {ColonyHelper} from "../libraries/ColonyHelper.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
-import {PowerMatrix} from "../../../libraries/HenomorphsModel.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {PowerMatrix} from "../../libraries/HenomorphsModel.sol";
 import {WarfareHelper, TokenStats, IAccessoryFacet} from "../libraries/WarfareHelper.sol";
 import {LibAchievementTrigger} from "../libraries/LibAchievementTrigger.sol";
+import {ResourceHelper} from "../libraries/ResourceHelper.sol";
+
+/**
+ * @title ITerritoryCards
+ * @notice Minimal interface for Territory Cards integration
+ */
+interface ITerritoryCards {
+    function assignToColony(uint256 tokenId, uint256 colonyId) external;
+}
 
 /**
  * @title TerritorySiegeFacet
@@ -19,6 +28,8 @@ import {LibAchievementTrigger} from "../libraries/LibAchievementTrigger.sol";
  * @dev Extracted from TerritoryWarsFacet to reduce contract size
  */
 contract TerritorySiegeFacet is AccessControlBase {
+
+    uint256 constant DEFAULT_MAX_TERRITORY_PER_COLONY = 6;
 
     // Struct to reduce stack depth in siegeTerritory
     struct SiegeSetupParams {
@@ -88,6 +99,18 @@ contract TerritorySiegeFacet is AccessControlBase {
     error RateLimitExceeded();
     error RaidCooldownActive();
     error TaskForceInvalid();
+    // Capture/Fortify errors
+    error TerritoryNotAvailable();
+    error TerritoryLimitExceeded();
+    error CaptureNotYetAllowed();
+    error InvalidFortificationAmount();
+    error FortificationLimitExceeded();
+
+    // Capture/Fortify events
+    event TerritoryCaptured(uint256 indexed territoryId, bytes32 indexed colony, uint256 cost);
+    event TerritoryLost(uint256 indexed territoryId, bytes32 indexed previousOwner, string reason);
+    event TerritoryFortified(uint256 indexed territoryId, bytes32 indexed colony, uint256 amount);
+    event TerritoryCardActivated(uint256 indexed territoryId, uint256 indexed cardTokenId, bytes32 indexed colony);
 
     /**
      * @notice Siege territory with tokens and stake
@@ -192,11 +215,17 @@ contract TerritorySiegeFacet is AccessControlBase {
 
         // Cooldown and registration checks
         if (block.timestamp < territory.lastRaidTime + 86400) revert RaidCooldownActive();
-        if (!cws.colonyWarProfiles[attackerColony].registered) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Colony not registered");
+
+        // Attacker must be registered for current season (not just pre-registered for future)
+        LibColonyWarsStorage.ColonyWarProfile storage attackerProfile = cws.colonyWarProfiles[attackerColony];
+        if (!attackerProfile.registered || attackerProfile.registeredSeasonId != cws.currentSeason) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Colony not registered for current season");
         }
-        if (!cws.colonyWarProfiles[territory.controllingColony].registered) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Target colony not registered");
+
+        // Defender must be registered for current season
+        LibColonyWarsStorage.ColonyWarProfile storage defenderCheck = cws.colonyWarProfiles[territory.controllingColony];
+        if (!defenderCheck.registered || defenderCheck.registeredSeasonId != cws.currentSeason) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Target colony not registered for current season");
         }
 
         // Stake validation
@@ -479,6 +508,7 @@ contract TerritorySiegeFacet is AccessControlBase {
         external
         whenNotPaused
         nonReentrant
+        returns (bytes32 winner, bool territoryCaptured, uint256 winnerReward)
     {
         LibColonyWarsStorage.requireInitialized();
         LibColonyWarsStorage.requireFeatureNotPaused("territories");
@@ -583,7 +613,7 @@ contract TerritorySiegeFacet is AccessControlBase {
 
         } else {
             // Both sides valid - proceed with normal siege resolution
-            bytes32 winner = _calculateSiegeOutcome(siegeId, siege, cws);
+            winner = _calculateSiegeOutcome(siegeId, siege, cws);
             siege.winner = winner;
 
             // Calculate and apply territory damage if attacker wins
@@ -602,6 +632,7 @@ contract TerritorySiegeFacet is AccessControlBase {
                 // If this siege destroyed the territory (brought damage to 100), record siege for capture priority
                 if (previousDamage < 100 && territory.damageLevel >= 100) {
                     cws.lastDestroyingSiegeId[siege.territoryId] = siegeId;
+                    territoryCaptured = true;
                 }
             }
 
@@ -644,6 +675,11 @@ contract TerritorySiegeFacet is AccessControlBase {
         }
 
         emit SiegeResolved(siegeId, siege.territoryId, siege.winner, siege.prizePool, 0);
+
+        // Return values for frontend
+        winner = siege.winner;
+        winnerReward = siege.prizePool;
+        // territoryCaptured is already set above if applicable
     }
 
     // ============ TASK FORCE INTEGRATION ============
@@ -933,5 +969,288 @@ contract TerritorySiegeFacet is AccessControlBase {
             siege.defenderTokens.length > 0,
             cws
         );
+    }
+
+    // ============ TERRITORY CAPTURE & FORTIFICATION ============
+
+    /**
+     * @notice Capture available territory for colony
+     * @dev Territory is available if: uncontrolled, fully damaged (100%), or abandoned (3+ days)
+     * @param territoryId Territory to capture
+     * @param colonyId Colony capturing the territory
+     */
+    function captureTerritory(uint256 territoryId, bytes32 colonyId)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        LibColonyWarsStorage.requireInitialized();
+        LibColonyWarsStorage.requireFeatureNotPaused("territories");
+
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        // Rate limiting
+        if (!LibColonyWarsStorage.checkRateLimit(LibMeta.msgSender(), this.captureTerritory.selector, 3600)) {
+            revert RateLimitExceeded();
+        }
+
+        if (!ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress) && !AccessHelper.isAuthorized()) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not colony controller");
+        }
+
+        LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
+        if (!territory.active) {
+            revert TerritoryNotFound();
+        }
+
+        uint32 currentSeason = cws.currentSeason;
+        LibColonyWarsStorage.Season storage season = cws.seasons[currentSeason];
+
+        // Determine season phase
+        bool isSeasonActive = season.active;
+        bool isOffSeason = !isSeasonActive || block.timestamp > season.resolutionEnd;
+
+        // Validate registration - colony must be registered for current or next season
+        LibColonyWarsStorage.ColonyWarProfile storage profile = cws.colonyWarProfiles[colonyId];
+        if (!profile.registered) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Colony not registered");
+        }
+
+        // Check if registered for valid season (current or next)
+        // Allows pre-registered colonies to capture territories
+        uint32 regSeason = profile.registeredSeasonId;
+        bool isValidSeason = (regSeason == currentSeason) || (regSeason == currentSeason + 1);
+        if (!isValidSeason && regSeason != 0) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Registration expired");
+        }
+
+        // Check availability - territory can be captured if:
+        // 1. Uncontrolled (no owner)
+        // 2. Fully damaged from siege (damageLevel >= 100)
+        // 3. Abandoned (3+ days without maintenance)
+        if (territory.controllingColony != bytes32(0)) {
+            bool isFullyDamaged = territory.damageLevel >= 100;
+            uint32 daysSincePayment = (uint32(block.timestamp) - territory.lastMaintenancePayment) / 86400;
+            bool isAbandoned = daysSincePayment >= 3;
+
+            if (!isFullyDamaged && !isAbandoned) {
+                revert TerritoryNotAvailable();
+            }
+
+            // If fully damaged, check destroyer priority (1 hour exclusive capture window)
+            if (isFullyDamaged) {
+                bytes32 destroyingSiegeId = cws.lastDestroyingSiegeId[territoryId];
+                if (destroyingSiegeId != bytes32(0)) {
+                    LibColonyWarsStorage.TerritorySiege storage destroyingSiege = cws.territorySieges[destroyingSiegeId];
+                    // siegeEndTime is when the siege was resolved (damage applied)
+                    uint32 timeSinceDestruction = uint32(block.timestamp) - destroyingSiege.siegeEndTime;
+                    // Within 1 hour, only the destroyer colony can capture
+                    if (timeSinceDestruction < 3600 && colonyId != destroyingSiege.attackerColony) {
+                        revert CaptureNotYetAllowed();
+                    }
+                }
+            }
+        }
+
+        // Check territory limit
+        uint256 currentTerritories = _countActiveColonyTerritories(colonyId, cws);
+        uint256 maxTerritories = cws.config.maxTerritoriesPerColony;
+        if (maxTerritories == 0) {
+            maxTerritories = DEFAULT_MAX_TERRITORY_PER_COLONY;
+        }
+
+        if (currentTerritories >= maxTerritories) {
+            revert TerritoryLimitExceeded();
+        }
+
+        // Calculate cost with off-season penalty
+        uint256 captureCost = cws.config.territoryCaptureCost;
+        if (isOffSeason) {
+            captureCost = (captureCost * 150) / 100; // +50% off-season penalty
+        }
+
+        // Transfer capture cost
+        if (!AccessHelper.isAuthorized()) {
+            ResourceHelper.collectPrimaryFee(
+                LibMeta.msgSender(),
+                captureCost,
+                "territory_capture"
+            );
+        }
+
+        // Remove from previous owner
+        if (territory.controllingColony != bytes32(0)) {
+            _removeTerritoryFromColony(territoryId, territory.controllingColony, cws);
+            emit TerritoryLost(territoryId, territory.controllingColony, "Captured");
+        }
+
+        // Assign to new colony
+        territory.controllingColony = colonyId;
+        territory.lastMaintenancePayment = uint32(block.timestamp);
+
+        // Reset damage and capture priority after capture
+        if (territory.damageLevel > 0) {
+            territory.damageLevel = 0;
+        }
+        // Clear the destroying siege reference
+        if (cws.lastDestroyingSiegeId[territoryId] != bytes32(0)) {
+            delete cws.lastDestroyingSiegeId[territoryId];
+        }
+
+        // Add to colony's territory list
+        cws.colonyTerritories[colonyId].push(territoryId);
+
+        // PHASE 6 INTEGRATION: Activate Territory Card
+        if (cws.cardContracts.territoryCards != address(0)) {
+            uint256 cardTokenId = cws.territoryToCard[territoryId];
+            if (cardTokenId > 0) {
+                _activateTerritoryCard(territoryId, cardTokenId, colonyId, cws);
+                emit TerritoryCardActivated(territoryId, cardTokenId, colonyId);
+            }
+        }
+
+        emit TerritoryCaptured(territoryId, colonyId, captureCost);
+    }
+
+    /**
+     * @notice Fortify territory with ZICO investment
+     * @param territoryId Territory to fortify
+     * @param fortificationAmount ZICO amount (must be multiple of 100)
+     */
+    function fortifyTerritory(uint256 territoryId, uint256 fortificationAmount)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        LibColonyWarsStorage.requireInitialized();
+
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        // Rate limiting - 7 days
+        if (!LibColonyWarsStorage.checkActionCooldown(territoryId, "fortify", 604800)) { // 7 days
+            revert RateLimitExceeded();
+        }
+
+        LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
+        if (!territory.active || territory.controllingColony == bytes32(0)) {
+            revert TerritoryNotFound();
+        }
+
+        if (!ColonyHelper.isColonyCreator(territory.controllingColony, hs.stakingSystemAddress)) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not territory controller");
+        }
+
+        if (fortificationAmount % 100 ether != 0 || fortificationAmount == 0) {
+            revert InvalidFortificationAmount();
+        }
+
+        // Check defense stake limit and cap fortification
+        LibColonyWarsStorage.ColonyWarProfile storage profile = cws.colonyWarProfiles[territory.controllingColony];
+        uint256 maxFortificationAllowed = profile.defensiveStake;
+        uint256 currentFortificationValue = uint256(territory.fortificationLevel) * 100 ether;
+
+        // Cap fortification amount to not exceed defensive stake
+        uint256 remainingCapacity = maxFortificationAllowed > currentFortificationValue
+            ? maxFortificationAllowed - currentFortificationValue
+            : 0;
+
+        if (remainingCapacity == 0) {
+            revert FortificationLimitExceeded();
+        }
+
+        // Limit fortification to available capacity
+        if (fortificationAmount > remainingCapacity) {
+            fortificationAmount = remainingCapacity;
+            // Round down to nearest 100 ZICO
+            fortificationAmount = (fortificationAmount / 100 ether) * 100 ether;
+
+            if (fortificationAmount == 0) {
+                revert FortificationLimitExceeded();
+            }
+        }
+
+        uint16 levelsToAdd = uint16(fortificationAmount / 100 ether);
+
+        // Transfer ZICO
+        ResourceHelper.collectPrimaryFee(
+            LibMeta.msgSender(),
+            fortificationAmount,
+            "territory_fortification"
+        );
+
+        // Update territory and award points
+        territory.fortificationLevel += levelsToAdd;
+        LibColonyWarsStorage.addColonyScore(cws.currentSeason, territory.controllingColony, levelsToAdd * 10);
+
+        emit TerritoryFortified(territoryId, territory.controllingColony, fortificationAmount);
+    }
+
+    // ============ INTERNAL HELPERS FOR CAPTURE/FORTIFY ============
+
+    /**
+     * @notice Count active territories for colony
+     * @param colonyId Colony to count for
+     * @param cws Colony wars storage reference
+     * @return count Number of active territories
+     */
+    function _countActiveColonyTerritories(
+        bytes32 colonyId,
+        LibColonyWarsStorage.ColonyWarsStorage storage cws
+    ) internal view returns (uint256 count) {
+        uint256[] storage territoryIds = cws.colonyTerritories[colonyId];
+        count = 0;
+
+        for (uint256 i = 0; i < territoryIds.length; i++) {
+            LibColonyWarsStorage.Territory storage territory = cws.territories[territoryIds[i]];
+            if (territory.active && territory.controllingColony == colonyId) {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    /**
+     * @notice Remove territory from colony's territory list
+     * @param territoryId Territory to remove
+     * @param colonyId Colony to remove from
+     * @param cws Colony wars storage reference
+     */
+    function _removeTerritoryFromColony(
+        uint256 territoryId,
+        bytes32 colonyId,
+        LibColonyWarsStorage.ColonyWarsStorage storage cws
+    ) internal {
+        uint256[] storage territoryIds = cws.colonyTerritories[colonyId];
+
+        for (uint256 i = 0; i < territoryIds.length; i++) {
+            if (territoryIds[i] == territoryId) {
+                // Move last element to current position and remove last
+                territoryIds[i] = territoryIds[territoryIds.length - 1];
+                territoryIds.pop();
+                break;
+            }
+        }
+    }
+
+    /**
+     * @notice Activate Territory Card (assign to colony)
+     * @param cardTokenId Card token ID
+     * @param colonyId Colony ID to assign to
+     * @param cws Storage reference
+     */
+    function _activateTerritoryCard(
+        uint256,
+        uint256 cardTokenId,
+        bytes32 colonyId,
+        LibColonyWarsStorage.ColonyWarsStorage storage cws
+    ) internal {
+        // Convert colonyId to uint256 for card contract
+        uint256 colonyIdUint = uint256(colonyId);
+
+        // Activate card
+        ITerritoryCards(cws.cardContracts.territoryCards).assignToColony(cardTokenId, colonyIdUint);
     }
 }

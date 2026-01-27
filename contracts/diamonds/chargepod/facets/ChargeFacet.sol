@@ -4,20 +4,21 @@ pragma solidity ^0.8.27;
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibGamingStorage} from "../libraries/LibGamingStorage.sol";
+import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {ActionHelper} from "../libraries/ActionHelper.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
-import {PodsUtils} from "../../../libraries/PodsUtils.sol";
+import {PodsUtils} from "../../libraries/PodsUtils.sol";
 import {ChargeCalculator} from "../libraries/ChargeCalculator.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import {ControlFee, Calibration, SpecimenCollection, PowerMatrix, ChargeActionType, ChargeAccessory} from "../../../libraries/HenomorphsModel.sol";
-import {UserEngagement, DailyChallengeSet, DailyChallenge, FlashEvent, FlashParticipation} from "../../../libraries/GamingModel.sol";
-import {ISpecimenBiopod} from "../../../interfaces/ISpecimenBiopod.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
-import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
-import {IExternalCollection, IRankingFacet, ISpecializationEvolution, IStakingSystem} from "../../staking/interfaces/IStakingInterfaces.sol";
+import {ControlFee, Calibration, SpecimenCollection, PowerMatrix, ChargeActionType, ChargeAccessory} from "../../libraries/HenomorphsModel.sol";
+import {UserEngagement, DailyChallengeSet, DailyChallenge, FlashEvent, FlashParticipation} from "../../libraries/GamingModel.sol";
+import {ISpecimenBiopod} from "../../interfaces/ISpecimenBiopod.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {ColonyHelper} from "../libraries/ColonyHelper.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {IExternalCollection, IRankingFacet, ISpecializationEvolution, IStakingSystem, IResourcePodFacet} from "../interfaces/IStakingInterfaces.sol";
 
 /**
  * @title ChargeFacet
@@ -46,9 +47,13 @@ contract ChargeFacet is AccessControlBase {
     event PowerCoreRestored(uint256 indexed collectionId, uint256 indexed tokenId, uint256 currentCharge, uint256 caxCharge);
     event ColonyEventBonus(address indexed user, uint256 indexed collectionId, uint256 indexed tokenId, uint32 bonusPoints, uint16 bonusPercentage);
     event UserStateReset(address indexed admin, address indexed user, string resetType, string reason);
+    event ResourceGenerated(address indexed user, uint256 indexed collectionId, uint256 indexed tokenId, uint8 resourceType, uint256 amount);
+    event CooldownBoosted(address indexed user, uint256 indexed collectionId, uint256 indexed tokenId, uint8 actionId, uint256 energySpent, uint256 cooldownReduced);
 
     error InsufficientCharge();
     error HenomorphInRepairMode();
+    error InsufficientEnergyResources(uint256 required, uint256 available);
+    error NoCooldownToBoost(uint256 collectionId, uint256 tokenId, uint8 actionId);
 
     modifier whenChargeEnabled(uint256 collectionId, uint256 tokenId) {
         _checkChargeEnabled(collectionId, tokenId);
@@ -395,6 +400,132 @@ contract ChargeFacet is AccessControlBase {
         charge.masteryPoints = masteryPoints;
         
         emit PowerCoreRestored(collectionId, tokenId, currentCharge, maxCharge);
+    }
+
+    // =================== ENERGY RESOURCE CONSUMPTION ===================
+
+    /**
+     * @notice Boost cooldown by spending Energy resources
+     * @dev UNIQUE RESOURCE USE-CASE: Energy → Cooldown Reduction
+     *      Consumes Energy (resourceType=1) to reduce remaining cooldown on a token action
+     * @param collectionId Collection ID
+     * @param tokenId Token ID
+     * @param actionId Action to boost cooldown for (1-5)
+     * @param energyAmount Amount of Energy to spend (100 Energy = 1 hour reduction)
+     * @return cooldownReduced Seconds of cooldown reduced
+     */
+    function boostCooldownWithEnergy(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint8 actionId,
+        uint256 energyAmount
+    ) external whenChargeEnabled(collectionId, tokenId) nonReentrant returns (uint256 cooldownReduced) {
+        if (actionId == 0 || actionId > MAX_SUPPORTED_ACTION) {
+            revert LibHenomorphsStorage.UnsupportedAction();
+        }
+        if (energyAmount == 0) {
+            revert InsufficientEnergyResources(1, 0);
+        }
+
+        address user = LibMeta.msgSender();
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        uint256 combinedId = PodsUtils.combineIds(collectionId, tokenId);
+        uint32 lastActionTime = hs.actionLogs[combinedId][actionId];
+        uint256 baseCooldown = hs.actionTypes[actionId].cooldown;
+
+        // Apply Unity Surge cooldown reduction for Action 5
+        if (actionId == 5 && hs.featureFlags["colonyEvents"] && hs.colonyEventConfig.active) {
+            baseCooldown = hs.colonyEventConfig.cooldownSeconds;
+        }
+
+        // Check if there's actually a cooldown to reduce
+        if (lastActionTime == 0 || block.timestamp >= lastActionTime + baseCooldown) {
+            revert NoCooldownToBoost(collectionId, tokenId, actionId);
+        }
+
+        // Apply resource decay before checking balance
+        LibResourceStorage.applyResourceDecay(user);
+
+        // Check user has enough Energy (resourceType = 1)
+        uint256 availableEnergy = rs.userResources[user][LibResourceStorage.ENERGY_CRYSTALS];
+        if (availableEnergy < energyAmount) {
+            revert InsufficientEnergyResources(energyAmount, availableEnergy);
+        }
+
+        // Calculate cooldown reduction: 100 Energy = 1 hour (3600 seconds)
+        // Formula: cooldownReduced = energyAmount * 36 (so 100 Energy = 3600s = 1hr)
+        cooldownReduced = energyAmount * 36;
+
+        // Cap reduction to remaining cooldown
+        uint256 remainingCooldown = (lastActionTime + baseCooldown) - block.timestamp;
+        if (cooldownReduced > remainingCooldown) {
+            cooldownReduced = remainingCooldown;
+            // Adjust energy spent to match actual reduction
+            energyAmount = (cooldownReduced + 35) / 36; // Round up
+        }
+
+        // Consume Energy resources
+        rs.userResources[user][LibResourceStorage.ENERGY_CRYSTALS] -= energyAmount;
+
+        // Update last action time to simulate reduced cooldown
+        // New lastActionTime = current lastActionTime - cooldownReduced
+        // This effectively makes the cooldown end sooner
+        hs.actionLogs[combinedId][actionId] = uint32(lastActionTime - cooldownReduced);
+
+        emit CooldownBoosted(user, collectionId, tokenId, actionId, energyAmount, cooldownReduced);
+
+        return cooldownReduced;
+    }
+
+    /**
+     * @notice Get cooldown boost estimate
+     * @param collectionId Collection ID
+     * @param tokenId Token ID
+     * @param actionId Action ID
+     * @param energyAmount Energy to spend
+     * @return canBoost Whether cooldown can be boosted
+     * @return actualReduction Actual cooldown reduction in seconds
+     * @return energyRequired Energy that would be consumed
+     */
+    function estimateCooldownBoost(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint8 actionId,
+        uint256 energyAmount
+    ) external view returns (bool canBoost, uint256 actualReduction, uint256 energyRequired) {
+        if (actionId == 0 || actionId > MAX_SUPPORTED_ACTION) {
+            return (false, 0, 0);
+        }
+
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        uint256 combinedId = PodsUtils.combineIds(collectionId, tokenId);
+        uint32 lastActionTime = hs.actionLogs[combinedId][actionId];
+        uint256 baseCooldown = hs.actionTypes[actionId].cooldown;
+
+        if (actionId == 5 && hs.featureFlags["colonyEvents"] && hs.colonyEventConfig.active) {
+            baseCooldown = hs.colonyEventConfig.cooldownSeconds;
+        }
+
+        if (lastActionTime == 0 || block.timestamp >= lastActionTime + baseCooldown) {
+            return (false, 0, 0);
+        }
+
+        uint256 remainingCooldown = (lastActionTime + baseCooldown) - block.timestamp;
+        uint256 maxReduction = energyAmount * 36;
+
+        if (maxReduction > remainingCooldown) {
+            actualReduction = remainingCooldown;
+            energyRequired = (remainingCooldown + 35) / 36;
+        } else {
+            actualReduction = maxReduction;
+            energyRequired = energyAmount;
+        }
+
+        canBoost = true;
+        return (canBoost, actualReduction, energyRequired);
     }
 
     // =================== INTERNAL FUNCTIONS ===================
@@ -891,17 +1022,46 @@ contract ChargeFacet is AccessControlBase {
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
         PowerMatrix storage _charge = hs.performedCharges[_combinedId];
         ChargeActionType memory _action = hs.actionTypes[actionId];
-        
+
         SpecimenCollection storage collection = hs.specimenCollections[collectionId];
-        
+
         uint256 _reward = _calculateReward(collectionId, _combinedId, _charge, _action, collection);
-        
+
         _charge.seasonPoints += uint32(_reward / 10);
         hs.operatorSeasonPoints[LibMeta.msgSender()][hs.seasonCounter] += uint32(_reward / 10);
-        
+
         _updateBiopod(collection, tokenId, _charge, _reward);
-        
+
+        // Generate resources based on action reward
+        _generateResourcesForAction(collectionId, tokenId, actionId, _reward);
+
         return _reward;
+    }
+
+    /**
+     * @notice Generate resources for the token owner based on action
+     * @dev Delegates to ResourcePodFacet for centralized resource generation with collectionConfig
+     * @param collectionId Collection ID
+     * @param tokenId Token ID
+     * @param actionId Action type performed
+     * @param baseReward Base reward amount from action
+     */
+    function _generateResourcesForAction(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint8 actionId,
+        uint256 baseReward
+    ) private {
+        // Delegate to ResourcePodFacet for centralized resource generation
+        // Uses collectionConfig for resource type and multiplier settings
+        try IResourcePodFacet(address(this)).generateResources(
+            collectionId,
+            tokenId,
+            actionId,
+            baseReward
+        ) {} catch {
+            // Fail silently - resource generation is secondary to action execution
+        }
     }
 
     function _calculateReward(

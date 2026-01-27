@@ -5,9 +5,17 @@ import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {PodsUtils} from "../../../libraries/PodsUtils.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {PodsUtils} from "../../libraries/PodsUtils.sol";
+
+/**
+ * @dev Interface for inter-facet calls to ColonyWarsFacet (pre-registration activation)
+ */
+interface IColonyWarsFacetPreReg {
+    function activatePreRegistrations(uint32 seasonId, uint256 batchSize)
+        external returns (uint256 activatedCount, uint256 remainingCount);
+}
 
 /**
  * @title ColonyWarsConfigFacet
@@ -250,6 +258,11 @@ contract ColonyWarsConfigFacet is AccessControlBase {
             if (value == 0 || value > 150) revert InvalidConfigValue(parameter);
             oldValue = config.maxGlobalTerritories;
             config.maxGlobalTerritories = uint8(value);
+        }
+        // Pre-registration window (stored in ColonyWarsStorage, not config)
+        else if (paramHash == keccak256("preRegistrationWindow")) {
+            oldValue = cws.preRegistrationWindow;
+            cws.preRegistrationWindow = uint32(value);
         }
         // === Operation Fee Configurations ===
         // raid
@@ -503,7 +516,16 @@ contract ColonyWarsConfigFacet is AccessControlBase {
         
         emit ConfigUpdated("battleModifiers", 0, 1);
     }
-    
+
+    /**
+     * @notice Get current pre-registration window setting
+     * @dev Use updateWarsConfig("preRegistrationWindow", value) to set this value
+     * @return windowSeconds Current window in seconds (0 = no limit)
+     */
+    function getPreRegistrationWindow() external view returns (uint32 windowSeconds) {
+        return LibColonyWarsStorage.colonyWarsStorage().preRegistrationWindow;
+    }
+
     /**
      * @notice Pause/unpause specific features for emergency control
      * @param featureName Name of feature to control
@@ -541,13 +563,14 @@ contract ColonyWarsConfigFacet is AccessControlBase {
 
     /**
      * @notice Start new warfare season with configurable parameters
+     * @dev Automatically activates any pre-registrations for the new season
      * @param startTime Season start timestamp (0 for current time)
      */
     function startNewWarsSeason(uint256 startTime) external onlyAuthorized whenNotPaused {
         LibColonyWarsStorage.requireInitialized();
-        
+
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        
+
         uint32 newSeasonId = cws.currentSeason + 1;
         uint32 currentTime = (startTime == 0 ? uint32(block.timestamp) : uint32(startTime));
 
@@ -558,10 +581,25 @@ contract ColonyWarsConfigFacet is AccessControlBase {
         newSeason.warfareEnd = currentTime + cws.config.registrationPeriod + (cws.config.seasonDuration - cws.config.registrationPeriod) * 2 / 3;
         newSeason.resolutionEnd = currentTime + cws.config.seasonDuration;
         newSeason.active = true;
-        
+
         cws.currentSeason = newSeasonId;
-        
+
         emit SeasonStarted(newSeasonId, currentTime);
+
+        // Automatically activate pre-registrations for this season
+        // Process all pre-registrations (batchSize = 0 means process all)
+        // If there are too many, subsequent batches can be processed via manual calls
+        uint256 preRegCount = cws.preRegisteredColonies[newSeasonId].length;
+        if (preRegCount > 0) {
+            // Limit initial batch to prevent gas issues (max 50 in single tx)
+            uint256 batchSize = preRegCount > 50 ? 50 : 0;
+            try IColonyWarsFacetPreReg(address(this)).activatePreRegistrations(newSeasonId, batchSize) {
+                // Pre-registrations activated successfully
+            } catch {
+                // If activation fails, it can be retried manually
+                // This ensures season creation doesn't fail due to pre-registration issues
+            }
+        }
     }
 
     function endWarsSeason(uint32 seasonId) external onlyAuthorized {
@@ -1307,7 +1345,7 @@ contract ColonyWarsConfigFacet is AccessControlBase {
      */
     function setResourceCardsAddress(address resourceCardsAddress) external onlyAuthorized {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        cws.contractAddresses.resourceCards = resourceCardsAddress;
+        cws.cardContracts.resourceCards = resourceCardsAddress;
     }
 
     /**
@@ -1316,7 +1354,7 @@ contract ColonyWarsConfigFacet is AccessControlBase {
      */
     function setInfrastructureCardsAddress(address infrastructureCardsAddress) external onlyAuthorized {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        cws.contractAddresses.infrastructureCards = infrastructureCardsAddress;
+        cws.cardContracts.infrastructureCards = infrastructureCardsAddress;
     }
 
     /**
@@ -1332,9 +1370,13 @@ contract ColonyWarsConfigFacet is AccessControlBase {
     ) {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         return (
-            cws.contractAddresses.territoryCards,
-            cws.contractAddresses.infrastructureCards,
-            cws.contractAddresses.resourceCards
+            cws.cardContracts.territoryCards,
+            cws.cardContracts.infrastructureCards,
+            cws.cardContracts.resourceCards
         );
     }
+
+    // Note: Infrastructure upgrade pricing uses operationFees via configureOperationFee()
+    // Fee names: "infraUpgradeCommon", "infraUpgradeUncommon", "infraUpgradeRare", "infraUpgradeEpic"
+    // Example: configureOperationFee("infraUpgradeCommon", ylwAddress, treasury, 500 ether, 100, false, true)
 }

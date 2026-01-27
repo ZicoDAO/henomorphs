@@ -4,13 +4,13 @@ pragma solidity ^0.8.27;
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
 import {ResourceHelper} from "../libraries/ResourceHelper.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {ColonyHelper} from "../libraries/ColonyHelper.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IColonyResourceCards} from "../../staking/interfaces/IColonyResourceCards.sol";
+import {IColonyResourceCards} from "../interfaces/IColonyResourceCards.sol";
 
 /**
  * @notice Interface for mintable reward token (YLW)
@@ -23,11 +23,14 @@ interface IRewardToken is IERC20 {
  * @title ResourceEconomyFacet
  * @notice Manages resource nodes, harvesting, and colony resource balances
  * @dev MODUŁ 6 - Dual Token Economy Implementation
- * 
+ *
+ * NOTE: This facet uses economyResourceNodes (keyed by auto-increment economyNodeId),
+ * separate from territoryResourceNodes used by TerritoryResourceFacet (keyed by territoryId).
+ *
  * TOKEN ALLOCATION:
  * - ZICO (Premium): Node creation, node upgrades, strategic investments
  * - YLW (Utility): Maintenance payments, harvesting rewards, daily operations
- * 
+ *
  * ECONOMIC FLOW:
  * - Players earn YLW through harvesting resources
  * - Players spend YLW on node maintenance
@@ -141,8 +144,8 @@ contract ResourceEconomyFacet is AccessControlBase {
         );
         
         // Create node
-        uint256 nodeId = ++cws.resourceNodeCounter;
-        LibColonyWarsStorage.ResourceNode storage node = cws.resourceNodes[nodeId];
+        uint256 nodeId = ++cws.economyNodeCounter;
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
         node.territoryId = territoryId;
         node.resourceType = resourceType;
         node.nodeLevel = nodeLevel;
@@ -164,7 +167,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
-        LibColonyWarsStorage.ResourceNode storage node = cws.resourceNodes[nodeId];
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
         
         if (!node.active) revert ResourceNodeNotFound();
         if (node.nodeLevel >= MAX_NODE_LEVEL) revert InvalidNodeLevel();
@@ -210,7 +213,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         LibColonyWarsStorage.requireInitialized();
         
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        LibColonyWarsStorage.ResourceNode storage node = cws.resourceNodes[nodeId];
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
         
         if (!node.active) revert ResourceNodeNotFound();
         
@@ -264,11 +267,11 @@ contract ResourceEconomyFacet is AccessControlBase {
      * @param nodeId Node to pay maintenance for
      * @dev Utility operation: Requires YLW payment for daily upkeep
      */
-    function payNodeMaintenance(uint256 nodeId) external whenNotPaused nonReentrant {
+    function maintainEconomyNode(uint256 nodeId) external whenNotPaused nonReentrant {
         LibColonyWarsStorage.requireInitialized();
         
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        LibColonyWarsStorage.ResourceNode storage node = cws.resourceNodes[nodeId];
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
         
         if (!node.active) revert ResourceNodeNotFound();
 
@@ -341,7 +344,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         returns (uint256 production, uint256 tokenReward) 
     {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        LibColonyWarsStorage.ResourceNode storage node = cws.resourceNodes[nodeId];
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
         
         if (!node.active) return (0, 0);
         
@@ -468,7 +471,7 @@ contract ResourceEconomyFacet is AccessControlBase {
     function mintResourceCard(uint8 resourceType) external payable whenNotPaused nonReentrant returns (uint256 tokenId) {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
-        address resourceAddr = cws.contractAddresses.resourceCards;
+        address resourceAddr = cws.cardContracts.resourceCards;
         if (resourceAddr == address(0)) revert ResourceCardsNotSet();
         if (resourceType > 3) revert InvalidResourceType();
 
@@ -503,12 +506,12 @@ contract ResourceEconomyFacet is AccessControlBase {
     function mintResourceCardFor(uint8 resourceType, uint256 nodeId) external payable whenNotPaused nonReentrant returns (uint256 tokenId) {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
-        address resourceAddr = cws.contractAddresses.resourceCards;
+        address resourceAddr = cws.cardContracts.resourceCards;
         if (resourceAddr == address(0)) revert ResourceCardsNotSet();
         if (resourceType > 3) revert InvalidResourceType();
 
         // Verify node ownership
-        LibColonyWarsStorage.ResourceNode storage node = cws.resourceNodes[nodeId];
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
         if (!node.active) revert ResourceNodeNotFound();
 
         LibColonyWarsStorage.Territory storage territory = cws.territories[node.territoryId];
@@ -613,7 +616,7 @@ contract ResourceEconomyFacet is AccessControlBase {
 
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
-        address resourceAddr = cws.contractAddresses.resourceCards;
+        address resourceAddr = cws.cardContracts.resourceCards;
         if (resourceAddr == address(0)) revert ResourceCardsNotSet();
 
         IColonyResourceCards resourceContract = IColonyResourceCards(resourceAddr);
@@ -666,7 +669,7 @@ contract ResourceEconomyFacet is AccessControlBase {
 
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
-        address resourceAddr = cws.contractAddresses.resourceCards;
+        address resourceAddr = cws.cardContracts.resourceCards;
         if (resourceAddr == address(0)) return (false, "Resource cards not configured");
 
         IColonyResourceCards resourceContract = IColonyResourceCards(resourceAddr);
@@ -689,5 +692,101 @@ contract ResourceEconomyFacet is AccessControlBase {
         }
 
         return (true, "");
+    }
+
+    /**
+     * @notice Get all economy nodes for a colony
+     * @param colonyId Colony ID
+     * @return nodeIds Array of node IDs belonging to colony
+     * @return nodes Array of node data
+     */
+    function getColonyEconomyNodes(bytes32 colonyId) external view returns (
+        uint256[] memory nodeIds,
+        LibColonyWarsStorage.ResourceNode[] memory nodes
+    ) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        uint256[] memory controlled = cws.colonyTerritories[colonyId];
+
+        // Count nodes on colony territories
+        uint256 count = 0;
+        for (uint256 i = 1; i <= cws.economyNodeCounter; i++) {
+            LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[i];
+            if (node.active) {
+                for (uint256 j = 0; j < controlled.length; j++) {
+                    if (node.territoryId == controlled[j]) {
+                        count++;
+                        break;
+                    }
+                }
+            }
+        }
+
+        nodeIds = new uint256[](count);
+        nodes = new LibColonyWarsStorage.ResourceNode[](count);
+
+        uint256 index = 0;
+        for (uint256 i = 1; i <= cws.economyNodeCounter && index < count; i++) {
+            LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[i];
+            if (node.active) {
+                for (uint256 j = 0; j < controlled.length; j++) {
+                    if (node.territoryId == controlled[j]) {
+                        nodeIds[index] = i;
+                        nodes[index] = node;
+                        index++;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // ==================== MIGRATION ====================
+
+    event NodesMigrated(uint256[] ids, bool toEconomy, uint256 migratedCount);
+
+    /**
+     * @notice Migrate nodes from old resourceNodes mapping to new mappings
+     * @dev ADMIN ONLY - One-time migration from resourceNodes to economyResourceNodes or territoryResourceNodes
+     * @param ids Array of IDs to migrate
+     * @param toEconomy True = economyResourceNodes, False = territoryResourceNodes
+     * @return migratedCount Number of nodes migrated
+     */
+    function migrateNodes(uint256[] calldata ids, bool toEconomy) external onlyAuthorized returns (uint256 migratedCount) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+
+        for (uint256 i = 0; i < ids.length; i++) {
+            uint256 id = ids[i];
+            LibColonyWarsStorage.ResourceNode storage oldNode = cws.resourceNodes[id];
+
+            // Skip empty nodes
+            if (oldNode.territoryId == 0 && oldNode.nodeLevel == 0 && !oldNode.active) {
+                continue;
+            }
+
+            LibColonyWarsStorage.ResourceNode storage newNode = toEconomy
+                ? cws.economyResourceNodes[id]
+                : cws.territoryResourceNodes[id];
+
+            // Skip already migrated
+            if (newNode.active) continue;
+
+            // Copy data
+            newNode.territoryId = oldNode.territoryId != 0 ? oldNode.territoryId : id;
+            newNode.resourceType = oldNode.resourceType;
+            newNode.nodeLevel = oldNode.nodeLevel;
+            newNode.accumulatedResources = oldNode.accumulatedResources;
+            newNode.lastHarvestTime = oldNode.lastHarvestTime;
+            newNode.lastMaintenancePaid = oldNode.lastMaintenancePaid;
+            newNode.active = oldNode.active;
+
+            // Update counter for economy nodes
+            if (toEconomy && id > cws.economyNodeCounter) {
+                cws.economyNodeCounter = id;
+            }
+
+            migratedCount++;
+        }
+
+        emit NodesMigrated(ids, toEconomy, migratedCount);
     }
 }

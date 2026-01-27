@@ -5,9 +5,10 @@ import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibPremiumStorage} from "../libraries/LibPremiumStorage.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibGamingStorage} from "../libraries/LibGamingStorage.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IResourcePodFacet} from "../interfaces/IStakingInterfaces.sol";
 
 /**
  * @notice Interface for mintable reward token (YLW)
@@ -29,6 +30,17 @@ interface IAchievementNFT {
 }
 
 /**
+ * @notice Reward collection interface (IRewardRedeemable - ColonyReserveNotes compatible)
+ * @dev Collection interprets tierId according to its own logic
+ */
+interface IRewardRedeemable {
+    function mintReward(uint256 collectionId, uint256 tierId, address to, uint256 amount) external returns (uint256 tokenId);
+    function canMintReward(uint256 collectionId, uint256 tierId, uint256 amount) external view returns (bool);
+    function redeemReward(uint256 tokenId, address recipient) external returns (uint256 ylwAmount);
+    function getRewardValue(uint256 tokenId) external view returns (uint256 ylwAmount);
+}
+
+/**
  * @title AchievementRewardFacet
  * @notice Extends existing achievement system with NFT minting and resource rewards
  * @dev Builds on LibGamingStorage achievement tracking with LibPremiumStorage rewards
@@ -41,15 +53,30 @@ contract AchievementRewardFacet is AccessControlBase {
 
     event AchievementAwarded(address indexed user, uint256 indexed achievementId, uint8 tier);
     event AchievementClaimed(address indexed user, uint256 indexed achievementId, uint256 tokenId, uint256 tokenReward, uint256 resourceReward);
-    
+
+    // Reward collections events
+    event RewardCollectionRegistered(uint256 indexed collectionId, address indexed collectionAddress);
+    event RewardCollectionUpdated(uint256 indexed collectionId, address indexed collectionAddress, bool enabled);
+    event AchievementCollectionRewardSet(uint256 indexed achievementId, uint256 indexed collectionId, uint256 tierId);
+    event CollectionRewardMinted(address indexed user, uint256 indexed achievementId, uint256 indexed collectionId, uint256 tokenId);
+    event CollectionRewardRedeemed(address indexed user, uint256 indexed collectionId, uint256 indexed tokenId, uint256 ylwAmount);
+
     // ==================== ERRORS ====================
-    
+
     error AchievementNotAwarded(uint256 achievementId);
     error AchievementAlreadyClaimed(uint256 achievementId);
     error InvalidAchievementTier(uint8 tier);
     error AchievementNotConfigured(uint256 achievementId);
     error InvalidResourceType(uint8 resourceType);
     error NFTMintFailed(uint256 achievementId);
+
+    // Reward collections errors
+    error CollectionNotRegistered(uint256 collectionId);
+    error CollectionAlreadyRegistered(uint256 collectionId);
+    error CollectionDisabled(uint256 collectionId);
+    error InvalidCollectionAddress();
+    error CollectionMintFailed(uint256 collectionId, uint256 achievementId);
+    error CollectionRedemptionFailed(uint256 collectionId, uint256 tokenId);
     
     // Storage moved to LibPremiumStorage - no local storage definitions
     
@@ -103,19 +130,25 @@ contract AchievementRewardFacet is AccessControlBase {
             resourceType: resourceType,
             nftMintEnabled: nftEnabled,
             minTier: minTier,
-            maxTier: maxTier,
             configured: true
         });
+
+        // Store maxTier in separate mapping (cannot modify deployed struct)
+        ps.achievementMaxTiers[achievementId] = maxTier;
     }
     
     /**
      * @notice Batch configure multiple achievement rewards
+     * @param achievementIds Array of achievement IDs
+     * @param configs Array of achievement reward configurations
+     * @param maxTiers Array of max tiers (stored separately from struct)
      */
     function batchConfigureRewards(
         uint256[] calldata achievementIds,
-        LibPremiumStorage.AchievementRewardConfig[] calldata configs
+        LibPremiumStorage.AchievementRewardConfig[] calldata configs,
+        uint8[] calldata maxTiers
     ) external onlyAuthorized {
-        require(achievementIds.length == configs.length, "Length mismatch");
+        require(achievementIds.length == configs.length && achievementIds.length == maxTiers.length, "Length mismatch");
 
         LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
 
@@ -129,6 +162,7 @@ contract AchievementRewardFacet is AccessControlBase {
             }
 
             ps.achievementRewardConfigs[achievementId] = configs[i];
+            ps.achievementMaxTiers[achievementId] = maxTiers[i];
         }
     }
 
@@ -189,7 +223,200 @@ contract AchievementRewardFacet is AccessControlBase {
         LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
         return ps.achievementNFT;
     }
-    
+
+    // ==================== REWARD COLLECTIONS REGISTRY ====================
+
+    /**
+     * @notice Register a new reward collection
+     * @param collectionId Unique identifier for the collection
+     * @param collectionAddress Contract address (must implement IRewardRedeemable)
+     */
+    function registerRewardCollection(
+        uint256 collectionId,
+        address collectionAddress
+    ) external onlyAuthorized {
+        if (collectionAddress == address(0)) revert InvalidCollectionAddress();
+
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+
+        if (ps.isCollectionRegistered[collectionId]) revert CollectionAlreadyRegistered(collectionId);
+
+        ps.rewardCollections[collectionId] = LibPremiumStorage.RewardCollectionConfig({
+            collectionAddress: collectionAddress,
+            enabled: true
+        });
+
+        ps.registeredCollectionIds.push(collectionId);
+        ps.isCollectionRegistered[collectionId] = true;
+
+        emit RewardCollectionRegistered(collectionId, collectionAddress);
+    }
+
+    /**
+     * @notice Update a reward collection address
+     * @param collectionId Collection ID to update
+     * @param collectionAddress New contract address
+     */
+    function updateRewardCollectionAddress(
+        uint256 collectionId,
+        address collectionAddress
+    ) external onlyAuthorized {
+        if (collectionAddress == address(0)) revert InvalidCollectionAddress();
+
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+
+        if (!ps.isCollectionRegistered[collectionId]) revert CollectionNotRegistered(collectionId);
+
+        ps.rewardCollections[collectionId].collectionAddress = collectionAddress;
+
+        emit RewardCollectionUpdated(collectionId, collectionAddress, ps.rewardCollections[collectionId].enabled);
+    }
+
+    /**
+     * @notice Enable or disable a reward collection
+     * @param collectionId Collection ID
+     * @param enabled New enabled state
+     */
+    function setRewardCollectionEnabled(uint256 collectionId, bool enabled) external onlyAuthorized {
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+
+        if (!ps.isCollectionRegistered[collectionId]) revert CollectionNotRegistered(collectionId);
+
+        ps.rewardCollections[collectionId].enabled = enabled;
+
+        emit RewardCollectionUpdated(
+            collectionId,
+            ps.rewardCollections[collectionId].collectionAddress,
+            enabled
+        );
+    }
+
+    // ==================== ACHIEVEMENT COLLECTION REWARDS ====================
+
+    /**
+     * @notice Set collection reward for an achievement
+     * @param achievementId Achievement ID
+     * @param collectionId Collection ID from registry (0 = remove reward)
+     * @param tierId Tier ID - interpreted by collection (e.g., reward value tier in ColonyReserveNotes)
+     * @param amount Multiplier/count passed to collection
+     */
+    function setAchievementCollectionReward(
+        uint256 achievementId,
+        uint256 collectionId,
+        uint256 tierId,
+        uint256 amount
+    ) external onlyAuthorized {
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+
+        // Validate collection exists (if not removing)
+        if (collectionId > 0 && !ps.isCollectionRegistered[collectionId]) {
+            revert CollectionNotRegistered(collectionId);
+        }
+
+        ps.achievementCollectionRewards[achievementId] = LibPremiumStorage.AchievementCollectionReward({
+            collectionId: collectionId,
+            tierId: tierId,
+            amount: amount
+        });
+
+        emit AchievementCollectionRewardSet(achievementId, collectionId, tierId);
+    }
+
+    /**
+     * @notice Batch set collection rewards for multiple achievements
+     * @param achievementIds Array of achievement IDs
+     * @param collectionIds Array of collection IDs
+     * @param tierIds Array of tier IDs
+     * @param amounts Array of amounts
+     */
+    function setAchievementCollectionRewardsBatch(
+        uint256[] calldata achievementIds,
+        uint256[] calldata collectionIds,
+        uint256[] calldata tierIds,
+        uint256[] calldata amounts
+    ) external onlyAuthorized {
+        require(
+            achievementIds.length == collectionIds.length &&
+            achievementIds.length == tierIds.length &&
+            achievementIds.length == amounts.length,
+            "Length mismatch"
+        );
+
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+
+        for (uint256 i = 0; i < achievementIds.length; i++) {
+            uint256 collectionId = collectionIds[i];
+
+            // Validate collection exists (if not removing)
+            if (collectionId > 0 && !ps.isCollectionRegistered[collectionId]) {
+                revert CollectionNotRegistered(collectionId);
+            }
+
+            ps.achievementCollectionRewards[achievementIds[i]] = LibPremiumStorage.AchievementCollectionReward({
+                collectionId: collectionId,
+                tierId: tierIds[i],
+                amount: amounts[i]
+            });
+
+            emit AchievementCollectionRewardSet(achievementIds[i], collectionId, tierIds[i]);
+        }
+    }
+
+    // ==================== REWARD COLLECTION REDEMPTION ====================
+
+    /**
+     * @notice Redeem a reward token from a registered collection for YLW
+     * @dev Burns the token and transfers YLW value to the caller
+     * @param collectionId ID of the registered collection
+     * @param tokenId Token ID to redeem
+     * @return ylwAmount Amount of YLW received
+     */
+    function redeemCollectionReward(
+        uint256 collectionId,
+        uint256 tokenId
+    ) external whenNotPaused nonReentrant returns (uint256 ylwAmount) {
+        address sender = LibMeta.msgSender();
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+
+        // Validate collection
+        if (!ps.isCollectionRegistered[collectionId]) {
+            revert CollectionNotRegistered(collectionId);
+        }
+
+        LibPremiumStorage.RewardCollectionConfig storage collConfig = ps.rewardCollections[collectionId];
+        if (!collConfig.enabled) {
+            revert CollectionDisabled(collectionId);
+        }
+
+        // Call collection to redeem (collection handles ownership check, burn, and YLW transfer)
+        try IRewardRedeemable(collConfig.collectionAddress).redeemReward(tokenId, sender) returns (uint256 amount) {
+            ylwAmount = amount;
+            emit CollectionRewardRedeemed(sender, collectionId, tokenId, ylwAmount);
+        } catch {
+            revert CollectionRedemptionFailed(collectionId, tokenId);
+        }
+    }
+
+    /**
+     * @notice Get the YLW value of a reward token without redeeming
+     * @param collectionId ID of the registered collection
+     * @param tokenId Token ID to query
+     * @return ylwAmount YLW value of the token
+     */
+    function getCollectionRewardValue(
+        uint256 collectionId,
+        uint256 tokenId
+    ) external view returns (uint256 ylwAmount) {
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+
+        if (!ps.isCollectionRegistered[collectionId]) {
+            revert CollectionNotRegistered(collectionId);
+        }
+
+        LibPremiumStorage.RewardCollectionConfig storage collConfig = ps.rewardCollections[collectionId];
+        return IRewardRedeemable(collConfig.collectionAddress).getRewardValue(tokenId);
+    }
+
     // ==================== ACHIEVEMENT AWARDING ====================
 
     /**
@@ -378,21 +605,34 @@ contract AchievementRewardFacet is AccessControlBase {
             unchecked { ps.totalTokensDistributed += totalTokens; }
         }
 
-        // 3. Award resource rewards
+        // 3. Award resource rewards via centralized ResourcePodFacet
         uint256 totalResources = 0;
         if (config.resourceReward > 0) {
-            LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-            // Apply decay before modifying resources
-            LibResourceStorage.applyResourceDecay(user);
             uint256 tierMultiplier = 100 + (reward.tierAchieved - 1) * 25;
             totalResources = (config.resourceReward * tierMultiplier) / 100;
-            rs.userResources[user][config.resourceType] += totalResources;
-            unchecked { ps.totalResourcesDistributed += totalResources; }
+
+            // Use centralized resource management for proper event emission and stats tracking
+            try IResourcePodFacet(address(this)).awardResourcesDirect(
+                user,
+                config.resourceType,
+                totalResources
+            ) {
+                unchecked { ps.totalResourcesDistributed += totalResources; }
+            } catch {
+                // Fallback to direct storage if ResourcePodFacet call fails
+                LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+                LibResourceStorage.applyResourceDecay(user);
+                rs.userResources[user][config.resourceType] += totalResources;
+                unchecked { ps.totalResourcesDistributed += totalResources; }
+            }
         }
+
+        // 4. Mint from reward collection (if configured)
+        _mintCollectionRewardIfConfigured(user, achievementId, ps);
 
         emit AchievementClaimed(user, achievementId, tokenId, totalTokens, totalResources);
     }
-    
+
     /**
      * @notice Batch claim multiple achievement rewards (NFT + tokens + resources for each)
      * @param achievementIds Array of achievement IDs to claim rewards for
@@ -438,22 +678,35 @@ contract AchievementRewardFacet is AccessControlBase {
                 unchecked { ps.totalTokensDistributed += totalTokens; }
             }
 
-            // 3. Resource rewards
+            // 3. Resource rewards via centralized ResourcePodFacet
             uint256 totalResources = 0;
             if (config.resourceReward > 0) {
-                LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-                // Apply decay before modifying resources
-                LibResourceStorage.applyResourceDecay(user);
                 uint256 tierMultiplier = 100 + (reward.tierAchieved - 1) * 25;
                 totalResources = (config.resourceReward * tierMultiplier) / 100;
-                rs.userResources[user][config.resourceType] += totalResources;
-                unchecked { ps.totalResourcesDistributed += totalResources; }
+
+                // Use centralized resource management for proper event emission and stats tracking
+                try IResourcePodFacet(address(this)).awardResourcesDirect(
+                    user,
+                    config.resourceType,
+                    totalResources
+                ) {
+                    unchecked { ps.totalResourcesDistributed += totalResources; }
+                } catch {
+                    // Fallback to direct storage if ResourcePodFacet call fails
+                    LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+                    LibResourceStorage.applyResourceDecay(user);
+                    rs.userResources[user][config.resourceType] += totalResources;
+                    unchecked { ps.totalResourcesDistributed += totalResources; }
+                }
             }
+
+            // 4. Mint from reward collection (if configured)
+            _mintCollectionRewardIfConfigured(user, achievementId, ps);
 
             emit AchievementClaimed(user, achievementId, tokenId, totalTokens, totalResources);
         }
     }
-    
+
     // ==================== VIEW FUNCTIONS ====================
 
     /**
@@ -525,17 +778,15 @@ contract AchievementRewardFacet is AccessControlBase {
         bool configured
     ) {
         LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
-        LibPremiumStorage.AchievementRewardConfig storage config = ps.achievementRewardConfigs[achievementId];
 
-        return (
-            config.tokenReward,
-            config.resourceReward,
-            config.resourceType,
-            config.nftMintEnabled,
-            config.minTier,
-            config.maxTier,
-            config.configured
-        );
+        // Direct access to avoid stack too deep
+        tokenReward = ps.achievementRewardConfigs[achievementId].tokenReward;
+        resourceReward = ps.achievementRewardConfigs[achievementId].resourceReward;
+        resourceType = ps.achievementRewardConfigs[achievementId].resourceType;
+        nftEnabled = ps.achievementRewardConfigs[achievementId].nftMintEnabled;
+        minTier = ps.achievementRewardConfigs[achievementId].minTier;
+        maxTier = ps.achievementMaxTiers[achievementId];
+        configured = ps.achievementRewardConfigs[achievementId].configured;
     }
 
     /**
@@ -622,7 +873,72 @@ contract AchievementRewardFacet is AccessControlBase {
             ps.totalResourcesDistributed
         );
     }
-    
+
+    // ==================== REWARD COLLECTIONS VIEW ====================
+
+    /**
+     * @notice Get reward collection configuration
+     * @param collectionId Collection ID
+     * @return config Collection configuration
+     */
+    function getRewardCollection(uint256 collectionId) external view returns (
+        LibPremiumStorage.RewardCollectionConfig memory config
+    ) {
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+        return ps.rewardCollections[collectionId];
+    }
+
+    /**
+     * @notice Get all registered reward collections
+     * @return ids Array of collection IDs
+     * @return configs Array of collection configurations
+     */
+    function getRegisteredCollections() external view returns (
+        uint256[] memory ids,
+        LibPremiumStorage.RewardCollectionConfig[] memory configs
+    ) {
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+
+        uint256 count = ps.registeredCollectionIds.length;
+        ids = new uint256[](count);
+        configs = new LibPremiumStorage.RewardCollectionConfig[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            uint256 collId = ps.registeredCollectionIds[i];
+            ids[i] = collId;
+            configs[i] = ps.rewardCollections[collId];
+        }
+    }
+
+    /**
+     * @notice Get achievement collection reward configuration
+     * @param achievementId Achievement ID
+     * @return collectionId Collection ID (0 = none)
+     * @return tierId Tier ID (interpreted by collection)
+     * @return amount Multiplier/count
+     */
+    function getAchievementCollectionReward(uint256 achievementId) external view returns (
+        uint256 collectionId,
+        uint256 tierId,
+        uint256 amount
+    ) {
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+        LibPremiumStorage.AchievementCollectionReward memory reward =
+            ps.achievementCollectionRewards[achievementId];
+
+        return (reward.collectionId, reward.tierId, reward.amount);
+    }
+
+    /**
+     * @notice Check if a collection is registered
+     * @param collectionId Collection ID
+     * @return isRegistered Whether collection is registered
+     */
+    function isCollectionRegistered(uint256 collectionId) external view returns (bool) {
+        LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+        return ps.isCollectionRegistered[collectionId];
+    }
+
     // ==================== INTERNAL HELPERS ====================
     
     /**
@@ -656,6 +972,47 @@ contract AchievementRewardFacet is AccessControlBase {
         } else {
             // Fallback: Mint new tokens
             IRewardToken(rewardToken).mint(recipient, amount, "achievement_reward");
+        }
+    }
+
+    /**
+     * @notice Internal: Mint reward from collection if configured for achievement
+     * @param user Recipient address
+     * @param achievementId Achievement ID
+     * @param ps Premium storage reference
+     */
+    function _mintCollectionRewardIfConfigured(
+        address user,
+        uint256 achievementId,
+        LibPremiumStorage.PremiumStorage storage ps
+    ) internal {
+        LibPremiumStorage.AchievementCollectionReward memory collReward =
+            ps.achievementCollectionRewards[achievementId];
+
+        // Skip if no collection reward configured
+        if (collReward.collectionId == 0) {
+            return;
+        }
+
+        // Get collection config
+        LibPremiumStorage.RewardCollectionConfig memory collConfig =
+            ps.rewardCollections[collReward.collectionId];
+
+        // Skip if collection disabled
+        if (!collConfig.enabled) {
+            return;
+        }
+
+        // Mint reward from collection - collection interprets tierId/amount according to its own logic
+        try IRewardRedeemable(collConfig.collectionAddress).mintReward(
+            collReward.collectionId,
+            collReward.tierId,
+            user,
+            collReward.amount
+        ) returns (uint256 tokenId) {
+            emit CollectionRewardMinted(user, achievementId, collReward.collectionId, tokenId);
+        } catch {
+            // Log failure but don't revert - other rewards already distributed
         }
     }
 }

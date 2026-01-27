@@ -2,11 +2,12 @@
 pragma solidity ^0.8.27;
 
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
+import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
+import {ColonyHelper} from "../libraries/ColonyHelper.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
 
 /**
  * @title ColonyHealthFacet
@@ -18,6 +19,10 @@ contract ColonyHealthFacet is AccessControlBase {
     event ColonyHealthRestored(bytes32 indexed colonyId, address indexed restorer, uint8 newHealth);
     event ColonyHealthDecayed(bytes32 indexed colonyId, uint8 healthLevel, uint32 daysSinceActivity);
     event ColonyPenaltyApplied(bytes32 indexed colonyId, uint8 penaltySeverity, uint256 membersAffected);
+    event ColonyHealedWithBio(bytes32 indexed colonyId, address indexed healer, uint256 bioSpent, uint8 healthRestored);
+
+    error InsufficientBioResources(uint256 required, uint256 available);
+    error ColonyAlreadyHealthy();
 
     struct ColonyHealthSummary {
         bytes32 colonyId;
@@ -92,6 +97,111 @@ contract ColonyHealthFacet is AccessControlBase {
         }
         
         emit ColonyHealthRestored(colonyId, LibMeta.msgSender(), newHealth);
+    }
+
+    /**
+     * @notice Heal colony using Bio resources instead of payment
+     * @dev UNIQUE RESOURCE USE-CASE: Bio → Colony Healing
+     *      Consumes Bio Compounds (resourceType=2) to restore colony health
+     *      100 Bio = 10 health points restored
+     * @param colonyId Colony to heal
+     * @param bioAmount Amount of Bio resources to spend
+     * @return healthRestored Amount of health points restored
+     */
+    function healColonyWithBio(
+        bytes32 colonyId,
+        uint256 bioAmount
+    ) external nonReentrant whenNotPaused returns (uint8 healthRestored) {
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        if (bytes(hs.colonyNamesById[colonyId]).length == 0) {
+            revert ColonyHelper.ColonyDoesNotExist(colonyId);
+        }
+
+        if (!ColonyHelper.isAuthorizedForColony(colonyId, hs.stakingSystemAddress)) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not authorized");
+        }
+
+        (uint8 currentHealth,) = ColonyHelper.calculateColonyHealth(colonyId);
+
+        if (currentHealth >= 100) {
+            revert ColonyAlreadyHealthy();
+        }
+
+        address user = LibMeta.msgSender();
+
+        // Apply resource decay before checking balance
+        LibResourceStorage.applyResourceDecay(user);
+
+        // Check user has enough Bio (resourceType = 2)
+        uint256 availableBio = rs.userResources[user][LibResourceStorage.BIO_COMPOUNDS];
+        if (availableBio < bioAmount) {
+            revert InsufficientBioResources(bioAmount, availableBio);
+        }
+
+        // Calculate health restoration: 100 Bio = 10 health points
+        // Formula: healthRestored = bioAmount / 10
+        healthRestored = uint8(bioAmount / 10);
+        if (healthRestored == 0) {
+            revert InsufficientBioResources(10, bioAmount); // Minimum 10 Bio needed
+        }
+
+        // Cap to maximum possible restoration
+        uint8 maxRestoration = 100 - currentHealth;
+        if (healthRestored > maxRestoration) {
+            healthRestored = maxRestoration;
+            // Adjust bio spent to match actual restoration
+            bioAmount = uint256(healthRestored) * 10;
+        }
+
+        // Consume Bio resources
+        rs.userResources[user][LibResourceStorage.BIO_COMPOUNDS] -= bioAmount;
+
+        // Apply health restoration
+        LibHenomorphsStorage.ColonyHealth storage health = hs.colonyHealth[colonyId];
+        uint8 newHealth = currentHealth + healthRestored;
+        health.healthLevel = newHealth;
+        health.lastActivityDay = uint32(block.timestamp / 86400);
+
+        emit ColonyHealedWithBio(colonyId, user, bioAmount, healthRestored);
+        emit ColonyHealthRestored(colonyId, user, newHealth);
+
+        return healthRestored;
+    }
+
+    /**
+     * @notice Estimate Bio healing cost
+     * @param colonyId Colony to check
+     * @param targetHealth Target health level (1-100)
+     * @return bioCost Amount of Bio needed
+     * @return actualHealthGain Actual health that would be restored
+     */
+    function estimateBioHealingCost(
+        bytes32 colonyId,
+        uint8 targetHealth
+    ) external view returns (uint256 bioCost, uint8 actualHealthGain) {
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        if (bytes(hs.colonyNamesById[colonyId]).length == 0) {
+            return (0, 0);
+        }
+
+        (uint8 currentHealth,) = ColonyHelper.calculateColonyHealth(colonyId);
+
+        if (currentHealth >= 100 || targetHealth <= currentHealth) {
+            return (0, 0);
+        }
+
+        // Cap target health to 100
+        if (targetHealth > 100) {
+            targetHealth = 100;
+        }
+
+        actualHealthGain = targetHealth - currentHealth;
+        bioCost = uint256(actualHealthGain) * 10; // 10 Bio per health point
+
+        return (bioCost, actualHealthGain);
     }
 
     /**

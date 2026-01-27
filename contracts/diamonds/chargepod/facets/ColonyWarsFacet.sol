@@ -4,13 +4,13 @@ pragma solidity ^0.8.27;
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
-import {PodsUtils} from "../../../libraries/PodsUtils.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {ColonyHelper} from "../libraries/ColonyHelper.sol";
+import {PodsUtils} from "../../libraries/PodsUtils.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
-import {SpecimenCollection, PowerMatrix} from "../../../libraries/HenomorphsModel.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {SpecimenCollection, PowerMatrix} from "../../libraries/HenomorphsModel.sol";
 import {WarfareHelper, TokenStats, IAccessoryFacet, IAllianceWarsFacet} from "../libraries/WarfareHelper.sol";
 import {LibAchievementTrigger} from "../libraries/LibAchievementTrigger.sol";
 
@@ -32,20 +32,12 @@ contract ColonyWarsFacet is AccessControlBase {
     // Events
     event BattleCreated(bytes32 indexed battleId, bytes32 indexed attacker, bytes32 indexed defender, uint256 stake);
     event BattleResolved(bytes32 indexed battleId, bytes32 indexed winner, uint256 prize);
-    event ColonyRegisteredForSeason(bytes32 indexed colonyId, uint32 indexed seasonId);
     event BattleStatsSnapshot(bytes32 indexed battleId, uint256 attackerTotalPower, uint256 defenderTotalPower);
     event RaidBonusPaid(bytes32 indexed battleId, bytes32 indexed winner, uint256 bonusAmount);
     event BattleCancelled(
         bytes32 indexed battleId, 
         bytes32 indexed attackerColony, 
         string reason, 
-        uint256 refundAmount, 
-        uint256 penaltyAmount
-    );
-    event StakeChanged(bytes32 indexed colonyId, uint256 newTotal, bool increased, uint256 amount);
-    event ColonyUnregisteredFromSeason(
-        bytes32 indexed colonyId, 
-        uint32 indexed seasonId, 
         uint256 refundAmount, 
         uint256 penaltyAmount
     );
@@ -76,14 +68,10 @@ contract ColonyWarsFacet is AccessControlBase {
     error InvalidBattleState();
     error InvalidTokenCount();
     error SeasonNotActive();
-    error RegistrationClosed();
     error BattleAlreadyResolved();
     error TokenNotInColony();
     error RateLimitExceeded();
     error CannotAttackOwnColony();
-    error CannotUnregisterDuringBattle();
-    error UnregistrationNotAllowed();
-    error ColonyNotRegistered();
     error WarfareNotStarted();
     error WarfareEnded();
     
@@ -104,18 +92,6 @@ contract ColonyWarsFacet is AccessControlBase {
     }
 
     /**
-     * @dev Verifies current season is in registration period
-     */
-    modifier duringRegistrationPeriod() {
-        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        LibColonyWarsStorage.Season storage season = cws.seasons[cws.currentSeason];
-        if (!season.active || block.timestamp < season.startTime || block.timestamp > season.registrationEnd) {
-            revert RegistrationClosed();
-        }
-        _;
-    }
-
-    /**
      * @dev Verifies current season is in warfare period
      */
     modifier duringWarfarePeriod() {
@@ -130,173 +106,7 @@ contract ColonyWarsFacet is AccessControlBase {
         _;
     }
     
-    /**
-     * @notice Register colony for current warfare season
-     * @param colonyId Colony identifier to register
-     * @param stake ZICO amount to stake for defensive purposes
-     */
-    function registerForSeason(bytes32 colonyId, uint256 stake)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyColonyCreator(colonyId)
-        duringRegistrationPeriod
-    {
-        LibColonyWarsStorage.requireInitialized();
-        LibColonyWarsStorage.requireFeatureNotPaused("registration");
-
-        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
-
-        // Rate limiting to prevent spam registrations
-        if (!LibColonyWarsStorage.checkRateLimit(LibMeta.msgSender(), this.registerForSeason.selector, 3600)) {
-            revert RateLimitExceeded();
-        }
-
-        uint32 currentSeason = cws.currentSeason;
-        LibColonyWarsStorage.Season storage season = cws.seasons[currentSeason];
-        
-        // Validate stake amount within configured bounds
-        if (stake < cws.config.minStakeAmount || stake > cws.config.maxStakeAmount) {
-            revert InvalidStake();
-        }
-        
-        // Prevent duplicate registrations
-        if (cws.colonyWarProfiles[colonyId].registered) {
-            revert InvalidBattleState();
-        }
-        
-        // Transfer defensive stake to treasury
-        address currency = hs.chargeTreasury.treasuryCurrency;
-        LibFeeCollection.collectFee(
-            IERC20(currency),
-            LibMeta.msgSender(),
-            hs.chargeTreasury.treasuryAddress,
-            stake,
-            "season_registration"
-        );
-
-        season.prizePool += stake / 20; 
-        
-        // Initialize war profile with defensive capabilities
-        LibColonyWarsStorage.ColonyWarProfile storage profile = cws.colonyWarProfiles[colonyId];
-        profile.defensiveStake = stake;
-        profile.acceptingChallenges = true;
-        profile.reputation = 0; // Start with honorable reputation
-        profile.registered = true;
-        
-        // Add to season tracking
-        season.registeredColonies.push(colonyId);
-        LibColonyWarsStorage.setColonyScore(currentSeason, colonyId, 0);
-
-        // Track user's colony - set as primary if user doesn't have one yet
-        if (LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender()) == bytes32(0)) {
-            LibColonyWarsStorage.setUserPrimaryColony(LibMeta.msgSender(), colonyId);
-        }
-        cws.userToColony[LibMeta.msgSender()] = colonyId;
-        LibColonyWarsStorage.addUserSeasonColony(currentSeason, LibMeta.msgSender(), colonyId);
-
-        emit ColonyRegisteredForSeason(colonyId, currentSeason);
-    }
-
-    /**
-     * @notice Unregister colony from current season with refund
-     * @param colonyId Colony to unregister
-     */
-    function unregisterFromSeason(bytes32 colonyId)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyColonyCreator(colonyId)
-    {
-        LibColonyWarsStorage.requireInitialized();
-        LibColonyWarsStorage.requireFeatureNotPaused("registration");
-
-        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-
-        // Rate limiting - once per hour to prevent spam
-        if (!LibColonyWarsStorage.checkRateLimit(LibMeta.msgSender(), this.unregisterFromSeason.selector, 3600)) {
-            revert RateLimitExceeded();
-        }
-
-        uint32 currentSeason = cws.currentSeason;
-        LibColonyWarsStorage.Season storage season = cws.seasons[currentSeason];
-        LibColonyWarsStorage.ColonyWarProfile storage profile = cws.colonyWarProfiles[colonyId];
-        
-        // Verify colony is registered
-        if (!profile.registered) {
-            revert ColonyNotRegistered();
-        }
-        
-        // Check if unregistration is allowed (only during registration period or early warfare)
-        uint32 unregistrationDeadline = season.registrationEnd + 3 days; // 3 days grace period
-        if (block.timestamp > unregistrationDeadline) {
-            revert UnregistrationNotAllowed();
-        }
-        
-        // Check if colony has active battles
-        if (_hasActiveBattles(colonyId, cws, currentSeason)) {
-            revert CannotUnregisterDuringBattle();
-        }
-        
-        // Check if colony is in alliance - require leaving first
-        if (LibColonyWarsStorage.isUserInAlliance(LibMeta.msgSender())) {
-            bytes32 _userPrimary = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
-            if (_userPrimary == colonyId) {
-                revert InvalidBattleState(); // Cannot unregister primary colony while in alliance
-            }
-        }
-        
-        // Calculate refund with penalty
-        uint256 originalStake = profile.defensiveStake;
-        uint256 penalty = _calculateUnregistrationPenalty(originalStake, season, block.timestamp);
-        uint256 refundAmount = originalStake - penalty;
-        
-        // Remove from season tracking
-        _removeColonyFromSeason(colonyId, currentSeason, cws);
-        
-        // Reset colony profile
-        profile.defensiveStake = 0;
-        profile.acceptingChallenges = false;
-        profile.registered = false;
-        
-        // Remove from user's primary colony if it was primary
-        bytes32 userPrimary = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
-        if (userPrimary == colonyId) {
-            // Set new primary from remaining colonies
-            bytes32[] memory userColonies = LibColonyWarsStorage.getUserSeasonColonies(currentSeason, LibMeta.msgSender());
-            bytes32 newPrimary = bytes32(0);
-            
-            for (uint256 i = 0; i < userColonies.length; i++) {
-                if (userColonies[i] != colonyId && cws.colonyWarProfiles[userColonies[i]].registered) {
-                    newPrimary = userColonies[i];
-                    break;
-                }
-            }
-            
-            LibColonyWarsStorage.setUserPrimaryColony(LibMeta.msgSender(), newPrimary);
-            cws.userToColony[LibMeta.msgSender()] = newPrimary;
-        }
-        
-        // Remove from user's season colonies array
-        _removeFromUserSeasonColonies(colonyId, currentSeason, LibMeta.msgSender(), cws);
-        
-        // Process refund
-        if (refundAmount > 0) {
-            LibFeeCollection.transferFromTreasury(
-                LibMeta.msgSender(), 
-                refundAmount, 
-                "colony_unregistration_refund"
-            );
-        }
-        
-        // Penalty goes to season prize pool
-        if (penalty > 0) {
-            season.prizePool += penalty;
-        }
-        
-        emit ColonyUnregisteredFromSeason(colonyId, currentSeason, refundAmount, penalty);
-    }
+    // ============ BATTLE FUNCTIONS ============
 
     /**
      * @notice Initiate attack on another colony with reduced entry barriers
@@ -377,8 +187,12 @@ contract ColonyWarsFacet is AccessControlBase {
         // Verify both colonies are registered for current season
         LibColonyWarsStorage.ColonyWarProfile storage attackerProfile = cws.colonyWarProfiles[attackerColony];
         LibColonyWarsStorage.ColonyWarProfile storage defenderProfile = cws.colonyWarProfiles[defenderColony];
-        
-        if (!attackerProfile.registered || !defenderProfile.registered) {
+
+        // Both must be registered AND for the current season (not pre-registered for future)
+        if (!attackerProfile.registered || attackerProfile.registeredSeasonId != cws.currentSeason) {
+            revert SeasonNotActive();
+        }
+        if (!defenderProfile.registered || defenderProfile.registeredSeasonId != cws.currentSeason) {
             revert SeasonNotActive();
         }
         
@@ -834,120 +648,6 @@ contract ColonyWarsFacet is AccessControlBase {
     }
 
     /**
-     * @notice Increase defensive stake for current season
-     * @param colonyId Colony to increase stake for
-     * @param additionalAmount ZICO amount to add to stake
-     */
-    function increaseDefensiveStake(bytes32 colonyId, uint256 additionalAmount)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyColonyCreator(colonyId)
-        duringRegistrationPeriod
-    {
-        LibColonyWarsStorage.requireInitialized();
-
-        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
-        LibColonyWarsStorage.Season storage season = cws.seasons[cws.currentSeason];
-        LibColonyWarsStorage.ColonyWarProfile storage profile = cws.colonyWarProfiles[colonyId];
-        if (!profile.registered) {
-            revert SeasonNotActive();
-        }
-        
-        // Validate new total doesn't exceed maximum
-        uint256 newTotal = profile.defensiveStake + additionalAmount;
-        if (newTotal > cws.config.maxStakeAmount) {
-            revert InvalidStake();
-        }
-        
-        if (additionalAmount == 0) {
-            revert InvalidStake();
-        }
-        
-        // Transfer additional stake
-        address currency = hs.chargeTreasury.treasuryCurrency;
-        LibFeeCollection.collectFee(
-            IERC20(currency),
-            LibMeta.msgSender(),
-            hs.chargeTreasury.treasuryAddress,
-            additionalAmount,
-            "stake_increase"
-        );
-        
-        // Update profile
-        profile.defensiveStake = newTotal;
-        
-        // Add to season prize pool (5% of increase)
-        season.prizePool += additionalAmount / 20;
-        emit StakeChanged(colonyId, newTotal, true, additionalAmount);
-    }
-
-    /**
-     * @notice Decrease defensive stake (with limitations)
-     * @param colonyId Colony to decrease stake for
-     * @param reductionAmount ZICO amount to remove from stake
-     */
-    function decreaseDefensiveStake(bytes32 colonyId, uint256 reductionAmount)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyColonyCreator(colonyId)
-        duringRegistrationPeriod
-    {
-        LibColonyWarsStorage.requireInitialized();
-
-        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        LibColonyWarsStorage.Season storage season = cws.seasons[cws.currentSeason];
-
-        // Rate limiting - once per day to prevent manipulation
-        if (!LibColonyWarsStorage.checkRateLimit(LibMeta.msgSender(), this.decreaseDefensiveStake.selector, 86400)) {
-            revert RateLimitExceeded();
-        }
-
-        LibColonyWarsStorage.ColonyWarProfile storage profile = cws.colonyWarProfiles[colonyId];
-        if (!profile.registered) {
-            revert SeasonNotActive();
-        }
-        
-        if (reductionAmount == 0 || reductionAmount > profile.defensiveStake) {
-            revert InvalidStake();
-        }
-        
-        // Validate new total meets minimum requirements
-        uint256 newTotal = profile.defensiveStake - reductionAmount;
-        if (newTotal < cws.config.minStakeAmount) {
-            revert InvalidStake();
-        }
-        
-        // Check if colony has active battles - cannot reduce during active battles
-        bytes32[] storage seasonBattles = cws.seasonBattles[season.seasonId];
-        
-        for (uint256 i = 0; i < seasonBattles.length; i++) {
-            LibColonyWarsStorage.BattleInstance storage battle = cws.battles[seasonBattles[i]];
-            if ((battle.attackerColony == colonyId || battle.defenderColony == colonyId) && 
-                battle.battleState < 2 && !cws.battleResolved[seasonBattles[i]]) {
-                revert InvalidBattleState();
-            }
-        }
-        
-        // Apply penalty for stake reduction (10% penalty)
-        uint256 penalty = reductionAmount / 10;
-        uint256 refundAmount = reductionAmount - penalty;
-        
-        // Update profile
-        profile.defensiveStake = newTotal;
-        
-        // Transfer refund to colony owner
-        LibFeeCollection.transferFromTreasury(LibMeta.msgSender(), refundAmount, "stake_reduction");
-        
-        // Penalty goes to season prize pool
-        season.prizePool += penalty;
-        
-        emit StakeChanged(colonyId, newTotal, false, reductionAmount);
-    }
-
-    /**
      * @notice Check if tokens are available for battles (public view function)
      * @param collectionIds Array of collection IDs
      * @param tokenIds Array of token IDs
@@ -990,69 +690,7 @@ contract ColonyWarsFacet is AccessControlBase {
         return (snapshot.attackerPowers, snapshot.defenderPowers);
     }
 
-    /**
-     * @notice Get current stake information for colony
-     * @param colonyId Colony to check
-     * @return currentStake Current defensive stake amount
-     * @return canIncrease Whether stake can be increased
-     * @return canDecrease Whether stake can be decreased
-     * @return maxIncrease Maximum amount that can be added
-     * @return maxDecrease Maximum amount that can be removed
-     */
-    function getDefensiveStakeInfo(bytes32 colonyId) 
-        external 
-        view 
-        returns (
-            uint256 currentStake,
-            bool canIncrease,
-            bool canDecrease,
-            uint256 maxIncrease,
-            uint256 maxDecrease
-        ) 
-    {
-        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        LibColonyWarsStorage.ColonyWarProfile storage profile = cws.colonyWarProfiles[colonyId];
-        
-        currentStake = profile.defensiveStake;
-        
-        if (!profile.registered) {
-            return (currentStake, false, false, 0, 0);
-        }
-        
-        // Check increase capability
-        maxIncrease = cws.config.maxStakeAmount > currentStake ? 
-            cws.config.maxStakeAmount - currentStake : 0;
-        canIncrease = maxIncrease > 0;
-        
-        // Check decrease capability
-        maxDecrease = currentStake > cws.config.minStakeAmount ? 
-            currentStake - cws.config.minStakeAmount : 0;
-        canDecrease = maxDecrease > 0 && !_hasActiveBattles(colonyId, cws, cws.currentSeason);
-        
-        return (currentStake, canIncrease, canDecrease, maxIncrease, maxDecrease);
-    }
-  
-    // Internal functions
-
-    function _hasActiveBattles(bytes32 colonyId, LibColonyWarsStorage.ColonyWarsStorage storage cws, uint32 seasonId) 
-        internal 
-        view 
-        returns (bool) 
-    {
-        bytes32[] storage seasonBattles = cws.seasonBattles[seasonId];
-        
-        for (uint256 i = 0; i < seasonBattles.length; i++) {
-            LibColonyWarsStorage.BattleInstance storage battle = cws.battles[seasonBattles[i]];
-            
-            // Check if colony is involved and battle is not resolved
-            if ((battle.attackerColony == colonyId || battle.defenderColony == colonyId) && 
-                battle.battleState < 2 && !cws.battleResolved[seasonBattles[i]]) {
-                return true;
-            }
-        }
-        
-        return false;
-    }
+    // ============ INTERNAL FUNCTIONS ============
 
     function _getTopColony(uint32 seasonId) internal view returns (bytes32 top) {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
@@ -1439,77 +1077,6 @@ contract ColonyWarsFacet is AccessControlBase {
     }
 
     /**
-     * @notice Calculate unregistration penalty based on timing
-     */
-    function _calculateUnregistrationPenalty(
-        uint256 originalStake, 
-        LibColonyWarsStorage.Season storage season, 
-        uint256 currentTime
-    ) internal view returns (uint256 penalty) {
-        // No penalty during registration period
-        if (currentTime <= season.registrationEnd) {
-            return 0;
-        }
-        
-        // Progressive penalty after registration ends
-        uint256 timeAfterRegistration = currentTime - season.registrationEnd;
-        
-        if (timeAfterRegistration <= 1 days) {
-            penalty = originalStake * 5 / 100;  // 5% penalty first day
-        } else if (timeAfterRegistration <= 2 days) {
-            penalty = originalStake * 10 / 100; // 10% penalty second day
-        } else {
-            penalty = originalStake * 15 / 100; // 15% penalty third day
-        }
-        
-        return penalty;
-    }
-
-    /**
-     * @notice Remove colony from season registered colonies array
-     */
-    function _removeColonyFromSeason(
-        bytes32 colonyId, 
-        uint32 seasonId, 
-        LibColonyWarsStorage.ColonyWarsStorage storage cws
-    ) internal {
-        LibColonyWarsStorage.Season storage season = cws.seasons[seasonId];
-        
-        // Find and remove colony from season.registeredColonies
-        for (uint256 i = 0; i < season.registeredColonies.length; i++) {
-            if (season.registeredColonies[i] == colonyId) {
-                season.registeredColonies[i] = season.registeredColonies[season.registeredColonies.length - 1];
-                season.registeredColonies.pop();
-                break;
-            }
-        }
-        
-        // Reset colony score
-        LibColonyWarsStorage.setColonyScore(seasonId, colonyId, 0);
-    }
-
-    /**
-     * @notice Remove colony from user's season colonies array
-     */
-    function _removeFromUserSeasonColonies(
-        bytes32 colonyId,
-        uint32 seasonId,
-        address user,
-        LibColonyWarsStorage.ColonyWarsStorage storage cws
-    ) internal {
-        bytes32[] storage userColonies = cws.userSeasonColonies[seasonId][user];
-        
-        // Find and remove colony from user's season colonies
-        for (uint256 i = 0; i < userColonies.length; i++) {
-            if (userColonies[i] == colonyId) {
-                userColonies[i] = userColonies[userColonies.length - 1];
-                userColonies.pop();
-                break;
-            }
-        }
-    }
-
-    /**
      * @notice Unified defender power calculation with primary colony auto-defense
      * @dev Auto-defense only works with defending user's registered primary colony
      * @param defenderColony Colony being defended
@@ -1754,13 +1321,10 @@ contract ColonyWarsFacet is AccessControlBase {
         
         uint256 activityWindow = 48 * 3600; // 48 hours
         
-        // Check recent Colony Wars actions
-        bytes4[7] memory selectors = [
-            this.registerForSeason.selector,
+        // Check recent Colony Wars battle actions
+        bytes4[4] memory selectors = [
             this.initiateAttack.selector,
             this.defendBattle.selector,
-            this.increaseDefensiveStake.selector,
-            this.decreaseDefensiveStake.selector,
             this.resolveBattle.selector,
             this.cancelAttack.selector
         ];

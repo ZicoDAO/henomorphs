@@ -4,13 +4,14 @@ pragma solidity ^0.8.27;
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
 import {ResourceHelper} from "../libraries/ResourceHelper.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {ColonyHelper} from "../libraries/ColonyHelper.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
 import {WarfareHelper} from "../libraries/WarfareHelper.sol";
+import {ColonyEvaluator} from "../libraries/ColonyEvaluator.sol";
 
 /**
  * @title ITerritoryCards
@@ -145,7 +146,20 @@ contract TerritoryManagementFacet is AccessControlBase {
         bytes32 indexed colonyId
     );
 
-    
+    event TerritoryTakeoverSuccessful(
+        uint256 indexed territoryId,
+        uint256 indexed cardTokenId,
+        bytes32 previousColony,
+        bytes32 newColony,
+        address newOwner
+    );
+    event TerritoryTakeoverFailed(
+        uint256 indexed territoryId,
+        uint256 indexed cardTokenId,
+        address newOwner,
+        string reason
+    );
+
     // Custom errors
     error TerritoryNotFound();
     error TerritoryNotAvailable();
@@ -217,7 +231,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         territory.name = name;
         
         // Mint Territory Card if contract is configured
-        if (cws.contractAddresses.territoryCards != address(0) && withCard) {
+        if (cws.cardContracts.territoryCards != address(0) && withCard) {
             uint256 cardTokenId = _mintTerritoryCard(
                 territoryId, 
                 territoryType, 
@@ -299,7 +313,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         
         // Unbind card if present
         uint256 cardTokenId = cws.territoryToCard[territoryId];
-        if (cardTokenId > 0 && cws.contractAddresses.territoryCards != address(0)) {
+        if (cardTokenId > 0 && cws.cardContracts.territoryCards != address(0)) {
             _deactivateTerritoryCard(territoryId, cardTokenId, cws);
             delete cws.territoryToCard[territoryId];
             delete cws.cardToTerritory[cardTokenId];
@@ -376,7 +390,7 @@ contract TerritoryManagementFacet is AccessControlBase {
             _removeTerritoryFromColony(territoryId, previousColony, cws);
             
             // Deactivate card if present
-            if (cws.contractAddresses.territoryCards != address(0) && !skipCardActivation) {
+            if (cws.cardContracts.territoryCards != address(0) && !skipCardActivation) {
                 uint256 cardTokenId = cws.territoryToCard[territoryId];
                 if (cardTokenId > 0) {
                     _deactivateTerritoryCard(territoryId, cardTokenId, cws);
@@ -398,7 +412,7 @@ contract TerritoryManagementFacet is AccessControlBase {
             cws.colonyTerritories[colonyId].push(territoryId);
             
             // Activate Territory Card if present
-            if (cws.contractAddresses.territoryCards != address(0) && !skipCardActivation) {
+            if (cws.cardContracts.territoryCards != address(0) && !skipCardActivation) {
                 uint256 cardTokenId = cws.territoryToCard[territoryId];
                 if (cardTokenId > 0) {
                     _activateTerritoryCard(territoryId, cardTokenId, colonyId, cws);
@@ -413,133 +427,10 @@ contract TerritoryManagementFacet is AccessControlBase {
         }
     }
 
-    /**
-     * @notice Capture a territory
-     */
-    function captureTerritory(uint256 territoryId, bytes32 colonyId) 
-        external 
-        whenNotPaused 
-        nonReentrant 
-    {
-        LibColonyWarsStorage.requireInitialized();
-        LibColonyWarsStorage.requireFeatureNotPaused("territories");
-
-        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
-        
-        // Rate limiting
-        if (!LibColonyWarsStorage.checkRateLimit(LibMeta.msgSender(), this.captureTerritory.selector, 3600)) {
-            revert RateLimitExceeded();
-        }
-        
-        if (!ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress) && !AccessHelper.isAuthorized()) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not colony controller");
-        }
-        
-        LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
-        if (!territory.active) {
-            revert TerritoryNotFound();
-        }
-
-        uint32 currentSeason = cws.currentSeason;
-        LibColonyWarsStorage.Season storage season = cws.seasons[currentSeason];
-        
-        // Determine season phase
-        bool isSeasonActive = season.active;
-        bool isOffSeason = !isSeasonActive || block.timestamp > season.resolutionEnd;
-        
-        // Validate registration - required both in-season and off-season
-        if (!cws.colonyWarProfiles[colonyId].registered) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Colony not registered for season");
-        }
-        
-        // Check availability - territory can be captured if:
-        // 1. Uncontrolled (no owner)
-        // 2. Fully damaged from siege (damageLevel >= 100)
-        // 3. Abandoned (3+ days without maintenance)
-        if (territory.controllingColony != bytes32(0)) {
-            bool isFullyDamaged = territory.damageLevel >= 100;
-            uint32 daysSincePayment = (uint32(block.timestamp) - territory.lastMaintenancePayment) / 86400;
-            bool isAbandoned = daysSincePayment >= 3;
-
-            if (!isFullyDamaged && !isAbandoned) {
-                revert TerritoryNotAvailable();
-            }
-
-            // If fully damaged, check destroyer priority (1 hour exclusive capture window)
-            if (isFullyDamaged) {
-                bytes32 destroyingSiegeId = cws.lastDestroyingSiegeId[territoryId];
-                if (destroyingSiegeId != bytes32(0)) {
-                    LibColonyWarsStorage.TerritorySiege storage destroyingSiege = cws.territorySieges[destroyingSiegeId];
-                    // siegeEndTime is when the siege was resolved (damage applied)
-                    uint32 timeSinceDestruction = uint32(block.timestamp) - destroyingSiege.siegeEndTime;
-                    // Within 1 hour, only the destroyer colony can capture
-                    if (timeSinceDestruction < 3600 && colonyId != destroyingSiege.attackerColony) {
-                        revert CaptureNotYetAllowed();
-                    }
-                }
-            }
-        }
-
-        // Check territory limit
-        uint256 currentTerritories = _countActiveColonyTerritories(colonyId, cws);
-        uint256 maxTerritories = cws.config.maxTerritoriesPerColony;
-        if (maxTerritories == 0) {
-            maxTerritories = DEFAULT_MAX_TERRITORY_PER_COLONY;
-        }
-
-        if (currentTerritories >= maxTerritories) {
-            revert TerritoryLimitExceeded();
-        }
-        
-        // Calculate cost with off-season penalty
-        uint256 captureCost = cws.config.territoryCaptureCost;
-        if (isOffSeason) {
-            captureCost = (captureCost * 150) / 100; // +50% off-season penalty
-        }
-        
-        // Transfer capture cost
-        if (!AccessHelper.isAuthorized()) {
-            ResourceHelper.collectPrimaryFee(
-                LibMeta.msgSender(),
-                captureCost,
-                "territory_capture"
-            );
-        }
-        
-        // Remove from previous owner
-        if (territory.controllingColony != bytes32(0)) {
-            _removeTerritoryFromColony(territoryId, territory.controllingColony, cws);
-            emit TerritoryLost(territoryId, territory.controllingColony, "Captured");
-        }
-        
-        // Assign to new colony
-        territory.controllingColony = colonyId;
-        territory.lastMaintenancePayment = uint32(block.timestamp);
-
-        // Reset damage and capture priority after capture
-        if (territory.damageLevel > 0) {
-            territory.damageLevel = 0;
-        }
-        // Clear the destroying siege reference
-        if (cws.lastDestroyingSiegeId[territoryId] != bytes32(0)) {
-            delete cws.lastDestroyingSiegeId[territoryId];
-        }
-
-        // Add to colony's territory list
-        cws.colonyTerritories[colonyId].push(territoryId);
-        
-        // PHASE 6 INTEGRATION: Activate Territory Card
-        if (cws.contractAddresses.territoryCards != address(0)) {
-            uint256 cardTokenId = cws.territoryToCard[territoryId];
-            if (cardTokenId > 0) {
-                _activateTerritoryCard(territoryId, cardTokenId, colonyId, cws);
-                emit TerritoryCardActivated(territoryId, cardTokenId, colonyId);
-            }
-        }
-        
-        emit TerritoryCaptured(territoryId, colonyId, captureCost);
-    }
+    // ============================================================================
+    // NOTE: captureTerritory() has been moved to TerritorySiegeFacet.sol
+    // Do NOT duplicate this function here - it causes Diamond selector conflicts.
+    // ============================================================================
 
     // ============================================================================
     // NOTE: repairTerritory() is implemented in TerritoryWarsFacet.sol
@@ -622,79 +513,10 @@ contract TerritoryManagementFacet is AccessControlBase {
         emit MaintenancePaid(territoryId, territory.controllingColony, actualCost);
     }
 
-    /**
-     * @notice Fortify territory with ZICO investment
-     * @param territoryId Territory to fortify
-     * @param fortificationAmount ZICO amount (must be multiple of 100)
-     */
-    function fortifyTerritory(uint256 territoryId, uint256 fortificationAmount) 
-        external 
-        whenNotPaused 
-        nonReentrant 
-    {
-        LibColonyWarsStorage.requireInitialized();
-        
-        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
-        
-        // Rate limiting - 7 days
-        if (!LibColonyWarsStorage.checkActionCooldown(territoryId, "fortify", 604800)) { // 7 days
-            revert RateLimitExceeded();
-        }
-
-        LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
-        if (!territory.active || territory.controllingColony == bytes32(0)) {
-            revert TerritoryNotFound();
-        }
-        
-        if (!ColonyHelper.isColonyCreator(territory.controllingColony, hs.stakingSystemAddress)) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not territory controller");
-        }
-        
-        if (fortificationAmount % 100 ether != 0 || fortificationAmount == 0) {
-            revert InvalidFortificationAmount();
-        }
-        
-        // Check defense stake limit and cap fortification
-        LibColonyWarsStorage.ColonyWarProfile storage profile = cws.colonyWarProfiles[territory.controllingColony];
-        uint256 maxFortificationAllowed = profile.defensiveStake;
-        uint256 currentFortificationValue = uint256(territory.fortificationLevel) * 100 ether;
-        
-        // Cap fortification amount to not exceed defensive stake
-        uint256 remainingCapacity = maxFortificationAllowed > currentFortificationValue 
-            ? maxFortificationAllowed - currentFortificationValue 
-            : 0;
-        
-        if (remainingCapacity == 0) {
-            revert FortificationLimitExceeded();
-        }
-        
-        // Limit fortification to available capacity
-        if (fortificationAmount > remainingCapacity) {
-            fortificationAmount = remainingCapacity;
-            // Round down to nearest 100 ZICO
-            fortificationAmount = (fortificationAmount / 100 ether) * 100 ether;
-            
-            if (fortificationAmount == 0) {
-                revert FortificationLimitExceeded();
-            }
-        }
-        
-        uint16 levelsToAdd = uint16(fortificationAmount / 100 ether);
-
-        // Transfer ZICO
-        ResourceHelper.collectPrimaryFee(
-            LibMeta.msgSender(),
-            fortificationAmount,
-            "territory_fortification"
-        );
-
-        // Update territory and award points
-        territory.fortificationLevel += levelsToAdd;
-        LibColonyWarsStorage.addColonyScore(cws.currentSeason, territory.controllingColony, levelsToAdd * 10);
-        
-        emit TerritoryFortified(territoryId, territory.controllingColony, fortificationAmount);
-    }
+    // ============================================================================
+    // NOTE: fortifyTerritory() has been moved to TerritorySiegeFacet.sol
+    // Do NOT duplicate this function here - it causes Diamond selector conflicts.
+    // ============================================================================
 
     /**
      * @notice Abandon territory
@@ -726,7 +548,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         territory.lastMaintenancePayment = 0;
         
         // PHASE 6 INTEGRATION: Deactivate Territory Card
-        if (cws.contractAddresses.territoryCards != address(0)) {
+        if (cws.cardContracts.territoryCards != address(0)) {
             uint256 cardTokenId = cws.territoryToCard[territoryId];
             if (cardTokenId > 0) {
                 _deactivateTerritoryCard(territoryId, cardTokenId, cws);
@@ -793,14 +615,14 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibColonyWarsStorage.requireInitialized();
         
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
-        cws.contractAddresses.territoryCards = cardContract;
+        cws.cardContracts.territoryCards = cardContract;
     }
 
     /**
      * @notice Get Territory Cards contract address
      */
     function getTerritoryCardsContract() external view returns (address) {
-        return LibColonyWarsStorage.colonyWarsStorage().contractAddresses.territoryCards;
+        return LibColonyWarsStorage.colonyWarsStorage().cardContracts.territoryCards;
     }
 
     // ============================================================================
@@ -857,13 +679,13 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         
         nftTokenId = cws.territoryToCard[territoryId];
-        exists = (nftTokenId != 0 && cws.contractAddresses.territoryCards != address(0));
+        exists = (nftTokenId != 0 && cws.cardContracts.territoryCards != address(0));
         
         if (!exists) {
             return (false, 0, address(0), false, 0);
         }
         
-        ITerritoryCards cardContract = ITerritoryCards(cws.contractAddresses.territoryCards);
+        ITerritoryCards cardContract = ITerritoryCards(cws.cardContracts.territoryCards);
         
         // Get card owner
         owner = cardContract.ownerOf(nftTokenId);
@@ -897,12 +719,12 @@ contract TerritoryManagementFacet is AccessControlBase {
         
         // Check if territory has associated card
         uint256 cardTokenId = cws.territoryToCard[territoryId];
-        if (cardTokenId == 0 || cws.contractAddresses.territoryCards == address(0)) {
+        if (cardTokenId == 0 || cws.cardContracts.territoryCards == address(0)) {
             return baseAmount; // No card, no bonus
         }
         
         // Check if card is active
-        ITerritoryCards cardContract = ITerritoryCards(cws.contractAddresses.territoryCards);
+        ITerritoryCards cardContract = ITerritoryCards(cws.cardContracts.territoryCards);
         if (!cardContract.isTerritoryActive(cardTokenId)) {
             return baseAmount; // Inactive card, no bonus
         }
@@ -947,13 +769,13 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         
         uint256 cardTokenId = cws.territoryToCard[territoryId];
-        hasCard = (cardTokenId > 0 && cws.contractAddresses.territoryCards != address(0));
+        hasCard = (cardTokenId > 0 && cws.cardContracts.territoryCards != address(0));
         
         if (!hasCard) {
             return (false, false, 0, 0, 0);
         }
         
-        ITerritoryCards cardContract = ITerritoryCards(cws.contractAddresses.territoryCards);
+        ITerritoryCards cardContract = ITerritoryCards(cws.cardContracts.territoryCards);
         isActive = cardContract.isTerritoryActive(cardTokenId);
         
         LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
@@ -991,7 +813,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         
         // Verify card exists
         uint256 cardTokenId = cws.territoryToCard[territoryId];
-        if (cardTokenId == 0 || cws.contractAddresses.territoryCards == address(0)) {
+        if (cardTokenId == 0 || cws.cardContracts.territoryCards == address(0)) {
             revert TerritoryCardsNotConfigured();
         }
         
@@ -1023,12 +845,12 @@ contract TerritoryManagementFacet is AccessControlBase {
             
             // Check if territory has active card
             uint256 cardTokenId = cws.territoryToCard[territoryId];
-            if (cardTokenId == 0 || cws.contractAddresses.territoryCards == address(0)) {
+            if (cardTokenId == 0 || cws.cardContracts.territoryCards == address(0)) {
                 boostedAmounts[i] = baseAmount;
                 continue;
             }
 
-            ITerritoryCards cardContract = ITerritoryCards(cws.contractAddresses.territoryCards);
+            ITerritoryCards cardContract = ITerritoryCards(cws.cardContracts.territoryCards);
             if (!cardContract.isTerritoryActive(cardTokenId)) {
                 boostedAmounts[i] = baseAmount;
                 continue;
@@ -1070,7 +892,7 @@ contract TerritoryManagementFacet is AccessControlBase {
 
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             revert TerritoryCardsNotConfigured();
         }
 
@@ -1103,7 +925,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         uint16 chickenPopulation = _calculateChickenPopulation(territoryType, bonusValue);
         
         // Mint card to user (unbound - no territory)
-        cardTokenId = ITerritoryCards(cws.contractAddresses.territoryCards).mintTerritory(
+        cardTokenId = ITerritoryCards(cws.cardContracts.territoryCards).mintTerritory(
             LibMeta.msgSender(),
             territoryType,
             rarity,
@@ -1138,7 +960,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
         
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             revert TerritoryCardsNotConfigured();
         }
         
@@ -1233,11 +1055,11 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
         
         // 0. Validate Territory Cards contract is configured
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             revert TerritoryCardsNotConfigured();
         }
         
-        ITerritoryCards cardContract = ITerritoryCards(cws.contractAddresses.territoryCards);
+        ITerritoryCards cardContract = ITerritoryCards(cws.cardContracts.territoryCards);
         
         // 1. Validate territory exists and is active
         LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
@@ -1310,7 +1132,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
         
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             revert TerritoryCardsNotConfigured();
         }
         
@@ -1356,11 +1178,11 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
         
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             revert TerritoryCardsNotConfigured();
         }
         
-        ITerritoryCards cardContract = ITerritoryCards(cws.contractAddresses.territoryCards);
+        ITerritoryCards cardContract = ITerritoryCards(cws.cardContracts.territoryCards);
         
         // 1. Validate territory exists and is controlled
         LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
@@ -1439,7 +1261,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
         
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             revert TerritoryCardsNotConfigured();
         }
         
@@ -1476,7 +1298,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         }
         
         // Approve transfer on card contract
-        ITerritoryCards(cws.contractAddresses.territoryCards).approveTransfer(cardTokenId, newOwner);
+        ITerritoryCards(cws.cardContracts.territoryCards).approveTransfer(cardTokenId, newOwner);
         
         emit TerritoryCardTransferApproved(territoryId, cardTokenId, newOwner);
     }
@@ -1492,7 +1314,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
         
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             revert TerritoryCardsNotConfigured();
         }
         
@@ -1514,7 +1336,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         }
         
         // Check current card owner
-        ITerritoryCards cardContract = ITerritoryCards(cws.contractAddresses.territoryCards);
+        ITerritoryCards cardContract = ITerritoryCards(cws.cardContracts.territoryCards);
         address currentOwner = cardContract.ownerOf(cardTokenId);
         
         // Verify card is still in treasury
@@ -1548,7 +1370,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
         
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             revert TerritoryCardsNotConfigured();
         }
         
@@ -1568,9 +1390,154 @@ contract TerritoryManagementFacet is AccessControlBase {
         }
         
         // Reject transfer on card contract
-        ITerritoryCards(cws.contractAddresses.territoryCards).rejectTransfer(cardTokenId, rejectedAddress, reason);
+        ITerritoryCards(cws.cardContracts.territoryCards).rejectTransfer(cardTokenId, rejectedAddress, reason);
         
         emit TerritoryCardTransferRejected(territoryId, cardTokenId, rejectedAddress, reason);
+    }
+
+    // ============================================================================
+    // TERRITORY CARDS INTEGRATION - AUTOMATIC TAKEOVER ON TRANSFER
+    // ============================================================================
+
+    /**
+     * @notice Handle territory card transfer - attempt automatic takeover
+     * @dev Called by ColonyTerritoryCards after successful transfer
+     * @param cardTokenId Card token ID that was transferred
+     * @param from Previous owner
+     * @param to New owner
+     */
+    function onCardTransferred(
+        uint256 cardTokenId,
+        address from,
+        address to
+    ) external whenNotPaused {
+        // NOTE: No nonReentrant modifier here intentionally!
+        // This function can be called during claimTerritoryCard() which already holds
+        // the reentrancy lock. Security is ensured by the msg.sender check below.
+
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        // Verify caller is the territory cards contract
+        if (msg.sender != cws.cardContracts.territoryCards) {
+            revert AccessHelper.Unauthorized(msg.sender, "Only territory cards contract");
+        }
+
+        // Find territory ID by card token ID (reverse lookup)
+        uint256 territoryId = cws.cardToTerritory[cardTokenId];
+        if (territoryId == 0) {
+            // Card not bound to any territory - nothing to do
+            return;
+        }
+
+        LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
+        if (!territory.active) {
+            return;
+        }
+
+        bytes32 currentColony = territory.controllingColony;
+        if (currentColony == bytes32(0)) {
+            // Territory not controlled - nothing to takeover
+            return;
+        }
+
+        // Get new owner's best colony
+        (bytes32 newColonyId, bool hasColony) = _getUserBestColony(to, hs);
+
+        if (!hasColony || newColonyId == bytes32(0)) {
+            emit TerritoryTakeoverFailed(
+                territoryId,
+                cardTokenId,
+                to,
+                "Recipient has no colony"
+            );
+            return;
+        }
+
+        // Check if colony is active (exists)
+        if (bytes(hs.colonyNamesById[newColonyId]).length == 0) {
+            emit TerritoryTakeoverFailed(
+                territoryId,
+                cardTokenId,
+                to,
+                "Recipient colony does not exist"
+            );
+            return;
+        }
+
+        // Execute takeover
+        bytes32 previousColony = territory.controllingColony;
+
+        // Remove from previous colony's territory list
+        _removeTerritoryFromColony(territoryId, previousColony, cws);
+
+        // Assign to new colony
+        territory.controllingColony = newColonyId;
+        territory.lastMaintenancePayment = uint32(block.timestamp);
+
+        // Add to new colony's territory list
+        cws.colonyTerritories[newColonyId].push(territoryId);
+
+        emit TerritoryTakeoverSuccessful(
+            territoryId,
+            cardTokenId,
+            previousColony,
+            newColonyId,
+            to
+        );
+
+        // Also emit standard territory events
+        emit TerritoryLost(territoryId, previousColony, "Card transferred");
+        emit TerritoryCaptured(territoryId, newColonyId, 0);
+    }
+
+    /**
+     * @notice Get user's best colony by ranking value
+     * @dev Returns the colony with highest dynamic bonus + member count bonus
+     * @param user User address
+     * @param hs Henomorphs storage reference
+     * @return bestColonyId Best colony ID
+     * @return hasColony Whether user has any colony
+     */
+    function _getUserBestColony(
+        address user,
+        LibHenomorphsStorage.HenomorphsStorage storage hs
+    ) internal view returns (bytes32 bestColonyId, bool hasColony) {
+        bytes32[] storage userColonies = hs.userColonies[user];
+
+        if (userColonies.length == 0) {
+            return (bytes32(0), false);
+        }
+
+        if (userColonies.length == 1) {
+            return (userColonies[0], true);
+        }
+
+        // Find colony with highest ranking value
+        uint256 bestRankingValue = 0;
+
+        for (uint256 i = 0; i < userColonies.length; i++) {
+            bytes32 colonyId = userColonies[i];
+
+            // Skip if colony doesn't exist
+            if (bytes(hs.colonyNamesById[colonyId]).length == 0) {
+                continue;
+            }
+
+            // Calculate ranking value using ColonyEvaluator
+            uint256 rankingValue = ColonyEvaluator.calculateColonyDynamicBonus(colonyId);
+
+            // Add member count bonus
+            uint256 memberCount = hs.colonies[colonyId].length;
+            rankingValue += memberCount * 10;
+
+            if (rankingValue > bestRankingValue) {
+                bestRankingValue = rankingValue;
+                bestColonyId = colonyId;
+            }
+        }
+
+        hasColony = bestColonyId != bytes32(0);
     }
 
     /**
@@ -2118,11 +2085,11 @@ contract TerritoryManagementFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
         // Check if Territory Cards contract is configured
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             return (false, address(0), false, 0, 0, 0, 0, 0, 0, 0, 0);
         }
 
-        ITerritoryCards cardContract = ITerritoryCards(cws.contractAddresses.territoryCards);
+        ITerritoryCards cardContract = ITerritoryCards(cws.cardContracts.territoryCards);
 
         // Try to get owner - if this fails, card doesn't exist
         try cardContract.ownerOf(cardTokenId) returns (address cardOwner) {
@@ -2173,11 +2140,11 @@ contract TerritoryManagementFacet is AccessControlBase {
 
         cardTokenId = cws.territoryToCard[territoryId];
 
-        if (cardTokenId == 0 || cws.contractAddresses.territoryCards == address(0)) {
+        if (cardTokenId == 0 || cws.cardContracts.territoryCards == address(0)) {
             return (0, false, address(0), traits);
         }
 
-        ITerritoryCards cardContract = ITerritoryCards(cws.contractAddresses.territoryCards);
+        ITerritoryCards cardContract = ITerritoryCards(cws.cardContracts.territoryCards);
 
         try cardContract.ownerOf(cardTokenId) returns (address cardOwner) {
             exists = true;
@@ -2339,7 +2306,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         uint16 chickenPopulation = _calculateChickenPopulation(territoryType, bonusValue);
         
         // Mint card
-        cardTokenId = ITerritoryCards(cws.contractAddresses.territoryCards).mintTerritory(
+        cardTokenId = ITerritoryCards(cws.cardContracts.territoryCards).mintTerritory(
             recipient,
             territoryType,
             rarity,
@@ -2372,7 +2339,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         uint256 colonyIdUint = uint256(colonyId);
         
         // Activate card
-        ITerritoryCards(cws.contractAddresses.territoryCards).assignToColony(cardTokenId, colonyIdUint);
+        ITerritoryCards(cws.cardContracts.territoryCards).assignToColony(cardTokenId, colonyIdUint);
     }
 
     /**
@@ -2385,7 +2352,7 @@ contract TerritoryManagementFacet is AccessControlBase {
         uint256 cardTokenId,
         LibColonyWarsStorage.ColonyWarsStorage storage cws
     ) internal {
-        ITerritoryCards(cws.contractAddresses.territoryCards).deactivateTerritory(cardTokenId);
+        ITerritoryCards(cws.cardContracts.territoryCards).deactivateTerritory(cardTokenId);
     }
 
     // ============================================================================
