@@ -3,8 +3,8 @@ pragma solidity ^0.8.27;
 
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import { LibColonyWarsStorage } from "../libraries/LibColonyWarsStorage.sol";
-import { AccessControlBase } from "../../common/facets/AccessControlBase.sol";
-import { IColonyInfrastructureCards } from "../../staking/interfaces/IColonyInfrastructureCards.sol";
+import { AccessControlBase } from "./AccessControlBase.sol";
+import { IColonyInfrastructureCards } from "../interfaces/IColonyInfrastructureCards.sol";
 import { ResourceHelper } from "../libraries/ResourceHelper.sol";
 
 /**
@@ -72,7 +72,7 @@ contract TerritoryEquipmentFacet is AccessControlBase {
     function mintInfraCard(uint8 infraType) external payable whenNotPaused nonReentrant returns (uint256 tokenId) {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
-        address infraAddr = cws.contractAddresses.infrastructureCards;
+        address infraAddr = cws.cardContracts.infrastructureCards;
         if (infraAddr == address(0)) revert InfraContractNotSet();
         if (infraType > 5) revert InvalidInfrastructureType();
 
@@ -107,7 +107,7 @@ contract TerritoryEquipmentFacet is AccessControlBase {
     function mintInfraCardFor(uint8 infraType, uint256 territoryId) external payable whenNotPaused nonReentrant returns (uint256 tokenId) {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
-        address infraAddr = cws.contractAddresses.infrastructureCards;
+        address infraAddr = cws.cardContracts.infrastructureCards;
         if (infraAddr == address(0)) revert InfraContractNotSet();
         if (infraType > 5) revert InvalidInfrastructureType();
 
@@ -115,7 +115,7 @@ contract TerritoryEquipmentFacet is AccessControlBase {
         LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
         if (!territory.active) revert TerritoryNotActive();
 
-        bytes32 colonyId = cws.userToColony[LibMeta.msgSender()];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
         if (territory.controllingColony != colonyId) revert TerritoryNotOwned();
 
         // Check equipment slots
@@ -174,7 +174,7 @@ contract TerritoryEquipmentFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         
         // Get infrastructure contract
-        address infraAddr = cws.contractAddresses.infrastructureCards;
+        address infraAddr = cws.cardContracts.infrastructureCards;
         if (infraAddr == address(0)) revert InfraContractNotSet();
         IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(infraAddr);
         
@@ -182,7 +182,7 @@ contract TerritoryEquipmentFacet is AccessControlBase {
         LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
         if (!territory.active) revert TerritoryNotActive();
         
-        bytes32 colonyId = cws.userToColony[LibMeta.msgSender()];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
         if (territory.controllingColony != colonyId) revert TerritoryNotOwned();
         
         // Verify infrastructure ownership
@@ -223,7 +223,7 @@ contract TerritoryEquipmentFacet is AccessControlBase {
     ) internal {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[territoryId];
-        IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(cws.contractAddresses.infrastructureCards);
+        IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(cws.cardContracts.infrastructureCards);
 
         // Mark infrastructure as equipped on NFT contract (blocks transfers)
         infraContract.equipToColony(infraTokenId, territoryId);
@@ -251,13 +251,13 @@ contract TerritoryEquipmentFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
         // Verify ownership
-        bytes32 colonyId = cws.userToColony[LibMeta.msgSender()];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
         if (cws.territories[territoryId].controllingColony != colonyId) revert TerritoryNotOwned();
 
         // Verify equipped
         if (cws.infraEquippedToTerritory[infraTokenId] != territoryId) revert InfrastructureNotEquipped();
 
-        IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(cws.contractAddresses.infrastructureCards);
+        IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(cws.cardContracts.infrastructureCards);
 
         // Unequip from colony on NFT contract (unblocks transfers)
         infraContract.unequipFromColony(infraTokenId);
@@ -329,7 +329,7 @@ contract TerritoryEquipmentFacet is AccessControlBase {
         equipment.totalTechBonus = 0;
         
         // Recalculate
-        IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(cws.contractAddresses.infrastructureCards);
+        IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(cws.cardContracts.infrastructureCards);
         
         for (uint256 i = 0; i < equipment.equippedInfraIds.length; i++) {
             _addInfraBonuses(equipment, infraContract, equipment.equippedInfraIds[i], territoryType);
@@ -480,14 +480,14 @@ contract TerritoryEquipmentFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
         // Verify territory ownership
-        bytes32 colonyId = cws.userToColony[LibMeta.msgSender()];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
         if (cws.territories[territoryId].controllingColony != colonyId) revert TerritoryNotOwned();
 
         // Verify infrastructure is equipped to this territory
         if (cws.infraEquippedToTerritory[infraTokenId] != territoryId) revert InfrastructureNotEquipped();
 
         // Get infrastructure contract and call useInfrastructure
-        address infraAddr = cws.contractAddresses.infrastructureCards;
+        address infraAddr = cws.cardContracts.infrastructureCards;
         if (infraAddr == address(0)) revert InfraContractNotSet();
 
         IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(infraAddr);
@@ -522,14 +522,14 @@ contract TerritoryEquipmentFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
         // Verify territory ownership
-        bytes32 colonyId = cws.userToColony[LibMeta.msgSender()];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
         if (cws.territories[territoryId].controllingColony != colonyId) revert TerritoryNotOwned();
 
         // Verify infrastructure is equipped to this territory
         if (cws.infraEquippedToTerritory[infraTokenId] != territoryId) revert InfrastructureNotEquipped();
 
         // Get infrastructure contract
-        address infraAddr = cws.contractAddresses.infrastructureCards;
+        address infraAddr = cws.cardContracts.infrastructureCards;
         if (infraAddr == address(0)) revert InfraContractNotSet();
 
         IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(infraAddr);
@@ -543,6 +543,121 @@ contract TerritoryEquipmentFacet is AccessControlBase {
         }
 
         emit InfrastructureRepaired(territoryId, infraTokenId, durabilityToRestore, cost);
+    }
+
+    // ==================== INFRASTRUCTURE UPGRADE ====================
+
+    // Default upgrade costs in YLW (used when not configured via ColonyWarsConfigFacet)
+    uint256 constant DEFAULT_UPGRADE_COST_COMMON = 500 ether;      // Common → Uncommon
+    uint256 constant DEFAULT_UPGRADE_COST_UNCOMMON = 1500 ether;   // Uncommon → Rare
+    uint256 constant DEFAULT_UPGRADE_COST_RARE = 4000 ether;       // Rare → Epic
+    uint256 constant DEFAULT_UPGRADE_COST_EPIC = 10000 ether;      // Epic → Legendary
+
+    event InfrastructureUpgradedByUser(
+        uint256 indexed infraTokenId,
+        address indexed owner,
+        uint8 oldRarity,
+        uint8 newRarity,
+        uint256 costPaid
+    );
+
+    error AlreadyMaxRarity();
+    error AuxiliaryTokenNotConfigured();
+
+    /**
+     * @notice Upgrade infrastructure rarity
+     * @param infraTokenId Infrastructure NFT token ID
+     * @return newRarity The new rarity after upgrade
+     * @dev Costs YLW (auxiliary token). Preserves durability.
+     *      If equipped, territory bonuses are recalculated automatically.
+     */
+    function upgradeInfrastructure(uint256 infraTokenId) external whenNotPaused nonReentrant returns (uint8 newRarity) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+
+        address infraAddr = cws.cardContracts.infrastructureCards;
+        if (infraAddr == address(0)) revert InfraContractNotSet();
+
+        IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(infraAddr);
+
+        // Verify ownership
+        if (infraContract.ownerOf(infraTokenId) != LibMeta.msgSender()) revert InfrastructureNotOwned();
+
+        // Get current traits and calculate cost
+        IColonyInfrastructureCards.InfrastructureTraits memory traits = infraContract.getTraits(infraTokenId);
+        uint8 currentRarity = uint8(traits.rarity);
+
+        if (currentRarity >= 4) revert AlreadyMaxRarity();
+
+        uint256 cost = _getUpgradeCostByRarity(currentRarity);
+
+        // Collect YLW payment
+        ResourceHelper.collectAuxiliaryFee(LibMeta.msgSender(), cost, "infra_upgrade");
+
+        // Call upgrade on NFT contract
+        newRarity = infraContract.upgradeRarity(infraTokenId);
+
+        // If equipped to territory, recalculate bonuses
+        uint256 territoryId = cws.infraEquippedToTerritory[infraTokenId];
+        if (territoryId != 0) {
+            _recalculateTerritoryBonuses(territoryId);
+        }
+
+        emit InfrastructureUpgradedByUser(infraTokenId, LibMeta.msgSender(), currentRarity, newRarity, cost);
+    }
+
+    /**
+     * @notice Get upgrade cost for infrastructure
+     * @param infraTokenId Infrastructure NFT token ID
+     * @return cost Cost in YLW to upgrade
+     */
+    function getUpgradeCost(uint256 infraTokenId) external view returns (uint256 cost) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+
+        address infraAddr = cws.cardContracts.infrastructureCards;
+        if (infraAddr == address(0)) return 0;
+
+        IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(infraAddr);
+        IColonyInfrastructureCards.InfrastructureTraits memory traits = infraContract.getTraits(infraTokenId);
+
+        uint8 currentRarity = uint8(traits.rarity);
+        if (currentRarity >= 4) return 0; // Cannot upgrade Legendary
+
+        return _getUpgradeCostByRarity(currentRarity);
+    }
+
+    /**
+     * @notice Internal: Get upgrade cost by rarity level
+     * @dev Uses operationFees if configured, otherwise falls back to defaults.
+     *      Configure via ColonyWarsConfigFacet.configureOperationFee("infraUpgradeCommon", ...)
+     */
+    function _getUpgradeCostByRarity(uint8 rarity) internal view returns (uint256) {
+        bytes32 feeKey;
+        uint256 defaultCost;
+
+        if (rarity == 0) {
+            feeKey = LibColonyWarsStorage.FEE_INFRA_UPGRADE_COMMON;
+            defaultCost = DEFAULT_UPGRADE_COST_COMMON;
+        } else if (rarity == 1) {
+            feeKey = LibColonyWarsStorage.FEE_INFRA_UPGRADE_UNCOMMON;
+            defaultCost = DEFAULT_UPGRADE_COST_UNCOMMON;
+        } else if (rarity == 2) {
+            feeKey = LibColonyWarsStorage.FEE_INFRA_UPGRADE_RARE;
+            defaultCost = DEFAULT_UPGRADE_COST_RARE;
+        } else if (rarity == 3) {
+            feeKey = LibColonyWarsStorage.FEE_INFRA_UPGRADE_EPIC;
+            defaultCost = DEFAULT_UPGRADE_COST_EPIC;
+        } else {
+            return 0;
+        }
+
+        LibColonyWarsStorage.OperationFee storage fee = LibColonyWarsStorage.getOperationFee(feeKey);
+
+        // Use configured fee if enabled, otherwise fallback to default
+        if (fee.enabled && fee.baseAmount > 0) {
+            return (fee.baseAmount * fee.multiplier) / 100;
+        }
+
+        return defaultCost;
     }
 
     /**
@@ -559,7 +674,7 @@ contract TerritoryEquipmentFacet is AccessControlBase {
     ) {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
-        address infraAddr = cws.contractAddresses.infrastructureCards;
+        address infraAddr = cws.cardContracts.infrastructureCards;
         if (infraAddr == address(0)) return (0, 100, true);
 
         IColonyInfrastructureCards infraContract = IColonyInfrastructureCards(infraAddr);

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
-import {LibHenomorphsStorage} from "../../chargepod/libraries/LibHenomorphsStorage.sol";
-import {StakedSpecimen} from "../../../libraries/StakingModel.sol";
-import {Calibration, ChargeAccessory, PowerMatrix, ColonyCriteria, TraitPackEquipment, ChargeSeason} from "../../../libraries/HenomorphsModel.sol";
-import {RankingConfig, RankingEntry} from "../../../libraries/GamingModel.sol";
+import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
+import {StakedSpecimen} from "../../libraries/StakingModel.sol";
+import {Calibration, ChargeAccessory, PowerMatrix, ColonyCriteria, TraitPackEquipment, ChargeSeason} from "../../libraries/HenomorphsModel.sol";
+import {RankingConfig, RankingEntry} from "../../libraries/GamingModel.sol";
 
 /**
  * @title IStakingWearFacet
@@ -448,7 +448,7 @@ interface IRankingFacet {
 * @dev Minimal interface containing only methods needed for facet integration
 */
 interface ISpecializationEvolution {
-   
+
    /**
     * @notice Award specialization XP for performing actions
     * @dev Called by ChargeFacet after successful action execution
@@ -464,4 +464,42 @@ interface ISpecializationEvolution {
        uint256 reward
    ) external;
 
+}
+
+/**
+ * @title IResourcePodFacet
+ * @notice Interface for centralized resource generation system
+ * @dev Called by ChargeFacet and BiopodFacet for unified resource generation
+ *      Uses collectionConfig for resource type and multiplier settings
+ */
+interface IResourcePodFacet {
+    /**
+     * @notice Generate resources based on token activity
+     * @dev Only callable by authorized system facets (ChargeFacet, BiopodFacet)
+     * @param collectionId Collection ID of the token
+     * @param tokenId Token ID
+     * @param actionType Type of action performed (from existing systems)
+     * @param baseAmount Base amount from existing calculation
+     * @return resourceAmount Amount of resources generated
+     */
+    function generateResources(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint8 actionType,
+        uint256 baseAmount
+    ) external returns (uint256 resourceAmount);
+
+    /**
+     * @notice Award resources directly to a user (without token context)
+     * @dev Used by TerritoryResourceFacet and other systems that don't use collectionConfig
+     * @param user User address to receive resources
+     * @param resourceType Type of resource (0-3)
+     * @param amount Amount of resources to award
+     * @return success Whether the operation succeeded
+     */
+    function awardResourcesDirect(
+        address user,
+        uint8 resourceType,
+        uint256 amount
+    ) external returns (bool success);
 }

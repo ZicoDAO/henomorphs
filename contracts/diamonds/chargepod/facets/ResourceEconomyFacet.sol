@@ -11,6 +11,7 @@ import {ColonyHelper} from "../libraries/ColonyHelper.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IColonyResourceCards} from "../interfaces/IColonyResourceCards.sol";
+import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 
 /**
  * @notice Interface for mintable reward token (YLW)
@@ -53,6 +54,7 @@ contract ResourceEconomyFacet is AccessControlBase {
     error ResourceCardsNotSet();
     error InvalidResourceType();
     error ResourceMaxSupplyReached();
+    error NodeHasStakedCards(uint256 nodeId, uint256 cardCount);
 
     // Events
     event ResourceNodeCreated(
@@ -85,6 +87,8 @@ contract ResourceEconomyFacet is AccessControlBase {
         uint256 decayAmount
     );
     event ResourceCardMinted(uint256 indexed tokenId, address indexed recipient, uint8 resourceType, uint8 rarity);
+    event EconomyNodeRemoved(uint256 indexed nodeId, uint256 indexed territoryId, bytes32 indexed colonyId, uint8 nodeLevel, uint256 unharvestedResources);
+    event EconomyNodeForceRemoved(uint256 indexed nodeId, address indexed admin, string reason);
 
     // Constants - Resource Economics
     uint256 constant DAILY_MAINTENANCE_COST_AUX = 10 ether; // 10 YLW per day per node
@@ -122,7 +126,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         
         // Verify territory ownership
         LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
-        bytes32 colonyId = cws.userToColony[LibMeta.msgSender()];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
         
         if (territory.controllingColony != colonyId) revert TerritoryNotControlled();
         
@@ -174,7 +178,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         
         // Verify territory ownership
         LibColonyWarsStorage.Territory storage territory = cws.territories[node.territoryId];
-        bytes32 colonyId = cws.userToColony[LibMeta.msgSender()];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
         
         if (territory.controllingColony != colonyId) revert TerritoryNotControlled();
         
@@ -219,33 +223,57 @@ contract ResourceEconomyFacet is AccessControlBase {
         
         // Verify territory ownership
         LibColonyWarsStorage.Territory storage territory = cws.territories[node.territoryId];
-        bytes32 colonyId = cws.userToColony[LibMeta.msgSender()];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
         
         if (territory.controllingColony != colonyId) revert TerritoryNotControlled();
         
-        // Check harvest cooldown
-        if (block.timestamp < node.lastHarvestTime + HARVEST_COOLDOWN) {
-            revert HarvestCooldownActive();
+        // Check harvest cooldown - safe arithmetic
+        unchecked {
+            if (node.lastHarvestTime > 0 && node.lastHarvestTime <= block.timestamp) {
+                uint256 timeSinceHarvest = block.timestamp - node.lastHarvestTime;
+                if (timeSinceHarvest < HARVEST_COOLDOWN) {
+                    revert HarvestCooldownActive();
+                }
+            }
+            // If lastHarvestTime > block.timestamp (corrupted), allow harvest to fix it
         }
-        
-        // Check maintenance status
-        uint32 daysSinceMaintenance = uint32((block.timestamp - node.lastMaintenancePaid) / 1 days);
+
+        // Check maintenance status - safe arithmetic
+        uint32 daysSinceMaintenance = 0;
+        unchecked {
+            if (node.lastMaintenancePaid > 0 && node.lastMaintenancePaid <= block.timestamp) {
+                daysSinceMaintenance = uint32((block.timestamp - node.lastMaintenancePaid) / 1 days);
+            }
+        }
         if (daysSinceMaintenance > 0) {
             revert NodeMaintenanceRequired();
         }
-        
-        // Calculate accumulated resources
-        uint256 hoursSinceHarvest = (block.timestamp - node.lastHarvestTime) / 1 hours;
-        uint256 production = BASE_PRODUCTION_RATE * node.nodeLevel * hoursSinceHarvest;
+
+        // Calculate accumulated resources - safe arithmetic
+        uint256 hoursSinceHarvest = 0;
+        unchecked {
+            if (node.lastHarvestTime > 0 && node.lastHarvestTime <= block.timestamp) {
+                hoursSinceHarvest = (block.timestamp - node.lastHarvestTime) / 1 hours;
+            }
+        }
+        uint256 production = uint256(BASE_PRODUCTION_RATE) * uint256(node.nodeLevel) * hoursSinceHarvest;
         
         // Apply territory equipment bonus
         LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[node.territoryId];
         production = (production * (100 + equipment.totalProductionBonus)) / 100;
-        
-        // Add to colony balance using ResourceHelper
+
+        // Award resources to USER (primary reward - 100%)
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        address user = LibMeta.msgSender();
+        LibResourceStorage.applyResourceDecay(user);
+        rs.userResources[user][uint8(node.resourceType)] += production;
+        rs.userResourcesLastUpdate[user] = uint32(block.timestamp);
+
+        // Also add 20% bonus to colony treasury (for processing)
         node.accumulatedResources += production;
+        uint256 colonyBonus = production * 20 / 100;
         LibColonyWarsStorage.ResourceBalance storage balance = cws.colonyResources[colonyId];
-        ResourceHelper.addResources(balance, node.resourceType, production);
+        ResourceHelper.addResources(balance, node.resourceType, colonyBonus);
 
         node.lastHarvestTime = uint32(block.timestamp);
 
@@ -277,12 +305,17 @@ contract ResourceEconomyFacet is AccessControlBase {
 
         // Verify territory ownership
         LibColonyWarsStorage.Territory storage territory = cws.territories[node.territoryId];
-        bytes32 colonyId = cws.userToColony[LibMeta.msgSender()];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
 
         if (territory.controllingColony != colonyId) revert TerritoryNotControlled();
 
-        // Calculate days of maintenance owed
-        uint32 daysSinceMaintenance = uint32((block.timestamp - node.lastMaintenancePaid) / 1 days);
+        // Calculate days of maintenance owed - safe arithmetic
+        uint32 daysSinceMaintenance = 0;
+        unchecked {
+            if (node.lastMaintenancePaid > 0 && node.lastMaintenancePaid <= block.timestamp) {
+                daysSinceMaintenance = uint32((block.timestamp - node.lastMaintenancePaid) / 1 days);
+            }
+        }
         if (daysSinceMaintenance == 0) return;
 
         // Calculate YLW cost
@@ -311,12 +344,12 @@ contract ResourceEconomyFacet is AccessControlBase {
      * @param nodeId Node to query
      * @return Resource node struct
      */
-    function getResourceNode(uint256 nodeId) 
-        external 
-        view 
-        returns (LibColonyWarsStorage.ResourceNode memory) 
+    function getResourceNode(uint256 nodeId)
+        external
+        view
+        returns (LibColonyWarsStorage.ResourceNode memory)
     {
-        return LibColonyWarsStorage.colonyWarsStorage().resourceNodes[nodeId];
+        return LibColonyWarsStorage.colonyWarsStorage().economyResourceNodes[nodeId];
     }
 
     /**
@@ -368,13 +401,13 @@ contract ResourceEconomyFacet is AccessControlBase {
      * @return maintanaceCost YLW cost for outstanding maintenance
      * @return daysOwed Days of maintenance owed
      */
-    function getMaintenanceCost(uint256 nodeId) 
-        external 
-        view 
-        returns (uint256 maintanaceCost, uint32 daysOwed) 
+    function getMaintenanceCost(uint256 nodeId)
+        external
+        view
+        returns (uint256 maintanaceCost, uint32 daysOwed)
     {
-        LibColonyWarsStorage.ResourceNode storage node = 
-            LibColonyWarsStorage.colonyWarsStorage().resourceNodes[nodeId];
+        LibColonyWarsStorage.ResourceNode storage node =
+            LibColonyWarsStorage.colonyWarsStorage().economyResourceNodes[nodeId];
         
         if (!node.active) return (0, 0);
         
@@ -403,16 +436,172 @@ contract ResourceEconomyFacet is AccessControlBase {
      * @param nodeId Node to query
      * @return zicoCost ZICO cost for upgrade
      */
-    function getNodeUpgradeCost(uint256 nodeId) 
-        external 
-        view 
-        returns (uint256 zicoCost) 
+    function getNodeUpgradeCost(uint256 nodeId)
+        external
+        view
+        returns (uint256 zicoCost)
     {
-        LibColonyWarsStorage.ResourceNode storage node = 
-            LibColonyWarsStorage.colonyWarsStorage().resourceNodes[nodeId];
-        
+        LibColonyWarsStorage.ResourceNode storage node =
+            LibColonyWarsStorage.colonyWarsStorage().economyResourceNodes[nodeId];
+
         if (!node.active || node.nodeLevel >= MAX_NODE_LEVEL) return 0;
         return uint256(node.nodeLevel) * NODE_UPGRADE_COST_MULTIPLIER;
+    }
+
+    /**
+     * @notice Get comprehensive economy node info (similar to TerritoryResourceFacet.getResourceNodeInfo)
+     * @param nodeId Node to query
+     * @return exists Whether node exists and is active
+     * @return territoryId Territory where node is placed
+     * @return resourceType Type of resource (0-3)
+     * @return nodeLevel Current node level (1-10)
+     * @return lastHarvest Timestamp of last harvest
+     * @return nextHarvestTime Timestamp when harvest is available (8h cooldown)
+     * @return lastMaintenancePaid Timestamp of last maintenance payment
+     * @return maintenanceOverdue Whether maintenance payment is overdue
+     * @return estimatedProduction Estimated resources per harvest (with bonuses)
+     * @return upgradeCostZico ZICO cost for next upgrade (0 if max level)
+     */
+    function getEconomyNodeInfo(uint256 nodeId) external view returns (
+        bool exists,
+        uint256 territoryId,
+        uint8 resourceType,
+        uint8 nodeLevel,
+        uint32 lastHarvest,
+        uint32 nextHarvestTime,
+        uint32 lastMaintenancePaid,
+        bool maintenanceOverdue,
+        uint256 estimatedProduction,
+        uint256 upgradeCostZico
+    ) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
+
+        exists = node.active;
+
+        if (exists) {
+            territoryId = node.territoryId;
+            resourceType = uint8(node.resourceType);
+            nodeLevel = node.nodeLevel;
+            lastHarvest = node.lastHarvestTime;
+            lastMaintenancePaid = node.lastMaintenancePaid;
+
+            // Safe arithmetic using unchecked
+            unchecked {
+                // nextHarvestTime - safe overflow check
+                uint32 maxSafeHarvestTime = type(uint32).max - HARVEST_COOLDOWN;
+                if (node.lastHarvestTime <= maxSafeHarvestTime) {
+                    nextHarvestTime = node.lastHarvestTime + HARVEST_COOLDOWN;
+                } else {
+                    nextHarvestTime = type(uint32).max;
+                }
+
+                // maintenanceOverdue - safe overflow check
+                uint256 maxSafeMaintenanceTime = type(uint256).max - 1 days;
+                if (node.lastMaintenancePaid <= maxSafeMaintenanceTime) {
+                    maintenanceOverdue = block.timestamp > node.lastMaintenancePaid + 1 days;
+                } else {
+                    maintenanceOverdue = false;
+                }
+
+                // hoursSinceHarvest - safe underflow check
+                uint256 hoursSinceHarvest = 0;
+                if (node.lastHarvestTime > 0 && node.lastHarvestTime <= block.timestamp) {
+                    hoursSinceHarvest = (block.timestamp - node.lastHarvestTime) / 1 hours;
+                }
+                estimatedProduction = uint256(BASE_PRODUCTION_RATE) * uint256(node.nodeLevel) * hoursSinceHarvest;
+            }
+
+            LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[node.territoryId];
+            estimatedProduction = (estimatedProduction * (100 + equipment.totalProductionBonus)) / 100;
+
+            // Upgrade cost (0 if already max level)
+            if (node.nodeLevel < MAX_NODE_LEVEL) {
+                upgradeCostZico = uint256(node.nodeLevel) * NODE_UPGRADE_COST_MULTIPLIER;
+            }
+        }
+    }
+
+    /**
+     * @notice Get batch economy nodes info
+     * @param nodeIds Array of node IDs to query
+     * @return exists Array of whether each node exists and is active
+     * @return territoryIds Array of territory IDs where nodes are placed
+     * @return resourceTypes Array of resource types (0-3)
+     * @return nodeLevels Array of node levels (1-10)
+     * @return nextHarvestTimes Array of timestamps when harvest is available
+     * @return maintenanceOverdue Array of whether maintenance is overdue
+     * @return estimatedProductions Array of estimated resources per harvest
+     * @return upgradeCostsZico Array of ZICO costs for next upgrade
+     */
+    function getEconomyNodesInfoBatch(uint256[] calldata nodeIds) external view returns (
+        bool[] memory exists,
+        uint256[] memory territoryIds,
+        uint8[] memory resourceTypes,
+        uint8[] memory nodeLevels,
+        uint32[] memory nextHarvestTimes,
+        bool[] memory maintenanceOverdue,
+        uint256[] memory estimatedProductions,
+        uint256[] memory upgradeCostsZico
+    ) {
+        uint256 length = nodeIds.length;
+
+        exists = new bool[](length);
+        territoryIds = new uint256[](length);
+        resourceTypes = new uint8[](length);
+        nodeLevels = new uint8[](length);
+        nextHarvestTimes = new uint32[](length);
+        maintenanceOverdue = new bool[](length);
+        estimatedProductions = new uint256[](length);
+        upgradeCostsZico = new uint256[](length);
+
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+
+        for (uint256 i = 0; i < length; i++) {
+            LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeIds[i]];
+
+            exists[i] = node.active;
+
+            if (node.active) {
+                territoryIds[i] = node.territoryId;
+                resourceTypes[i] = uint8(node.resourceType);
+                nodeLevels[i] = node.nodeLevel;
+
+                // Safe arithmetic using unchecked
+                unchecked {
+                    // nextHarvestTime - safe overflow check
+                    uint32 maxSafeHarvestTime = type(uint32).max - HARVEST_COOLDOWN;
+                    if (node.lastHarvestTime <= maxSafeHarvestTime) {
+                        nextHarvestTimes[i] = node.lastHarvestTime + HARVEST_COOLDOWN;
+                    } else {
+                        nextHarvestTimes[i] = type(uint32).max;
+                    }
+
+                    // maintenanceOverdue - safe overflow check
+                    uint256 maxSafeMaintenanceTime = type(uint256).max - 1 days;
+                    if (node.lastMaintenancePaid <= maxSafeMaintenanceTime) {
+                        maintenanceOverdue[i] = block.timestamp > node.lastMaintenancePaid + 1 days;
+                    } else {
+                        maintenanceOverdue[i] = false;
+                    }
+
+                    // hoursSinceHarvest - safe underflow check
+                    uint256 hoursSinceHarvest = 0;
+                    if (node.lastHarvestTime > 0 && node.lastHarvestTime <= block.timestamp) {
+                        hoursSinceHarvest = (block.timestamp - node.lastHarvestTime) / 1 hours;
+                    }
+                    uint256 production = uint256(BASE_PRODUCTION_RATE) * uint256(node.nodeLevel) * hoursSinceHarvest;
+
+                    LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[node.territoryId];
+                    estimatedProductions[i] = (production * (100 + equipment.totalProductionBonus)) / 100;
+                }
+
+                // Upgrade cost (0 if already max level)
+                if (node.nodeLevel < MAX_NODE_LEVEL) {
+                    upgradeCostsZico[i] = uint256(node.nodeLevel) * NODE_UPGRADE_COST_MULTIPLIER;
+                }
+            }
+        }
     }
 
     // ============================================================================
@@ -515,7 +704,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         if (!node.active) revert ResourceNodeNotFound();
 
         LibColonyWarsStorage.Territory storage territory = cws.territories[node.territoryId];
-        bytes32 colonyId = cws.userToColony[LibMeta.msgSender()];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
         if (territory.controllingColony != colonyId) revert TerritoryNotControlled();
 
         IColonyResourceCards resourceContract = IColonyResourceCards(resourceAddr);
@@ -788,5 +977,469 @@ contract ResourceEconomyFacet is AccessControlBase {
         }
 
         emit NodesMigrated(ids, toEconomy, migratedCount);
+    }
+
+    // ============================================================================
+    // NODE REMOVAL
+    // ============================================================================
+
+    /**
+     * @notice Remove economy resource node (owner action)
+     * @param nodeId Node ID to remove
+     * @dev Requires territory control. Unharvested resources are lost.
+     *      Use harvestResources() before removing to collect pending resources and YLW rewards.
+     */
+    function removeEconomyNode(uint256 nodeId) external whenNotPaused nonReentrant {
+        LibColonyWarsStorage.requireInitialized();
+
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
+
+        if (!node.active) revert ResourceNodeNotFound();
+
+        // Verify territory ownership
+        LibColonyWarsStorage.Territory storage territory = cws.territories[node.territoryId];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
+
+        if (territory.controllingColony != colonyId) revert TerritoryNotControlled();
+
+        // Verify colony ownership
+        if (!ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress)) {
+            revert TerritoryNotControlled();
+        }
+
+        // Store for event
+        uint8 nodeLevel = node.nodeLevel;
+        uint256 territoryId = node.territoryId;
+        uint256 unharvestedResources = _calculatePendingEconomyResources(node);
+
+        // Deactivate node
+        node.active = false;
+        node.nodeLevel = 0;
+        node.accumulatedResources = 0;
+        node.lastHarvestTime = 0;
+        node.lastMaintenancePaid = 0;
+        node.territoryId = 0;
+
+        emit EconomyNodeRemoved(nodeId, territoryId, colonyId, nodeLevel, unharvestedResources);
+    }
+
+    /**
+     * @notice Admin force remove economy node (emergency use)
+     * @param nodeId Node ID to remove
+     * @param reason Reason for forced removal (for audit trail)
+     * @dev ADMIN ONLY. Use for stuck nodes, exploits, or maintenance.
+     */
+    function forceRemoveEconomyNode(
+        uint256 nodeId,
+        string calldata reason
+    ) external onlyAuthorized {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
+
+        if (!node.active) revert ResourceNodeNotFound();
+
+        // Deactivate node
+        node.active = false;
+        node.nodeLevel = 0;
+        node.accumulatedResources = 0;
+        node.lastHarvestTime = 0;
+        node.lastMaintenancePaid = 0;
+        node.territoryId = 0;
+
+        emit EconomyNodeForceRemoved(nodeId, LibMeta.msgSender(), reason);
+    }
+
+    /**
+     * @notice Check if economy node can be removed and get removal info
+     * @param nodeId Node ID
+     * @return canRemove Whether node can be removed
+     * @return territoryId Territory where node is placed
+     * @return nodeLevel Current node level (0 if no node)
+     * @return pendingResources Resources that would be lost
+     * @return pendingYlwReward YLW reward that would be lost
+     */
+    function getEconomyNodeRemovalInfo(uint256 nodeId) external view returns (
+        bool canRemove,
+        uint256 territoryId,
+        uint8 nodeLevel,
+        uint256 pendingResources,
+        uint256 pendingYlwReward
+    ) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
+
+        if (!node.active) {
+            return (false, 0, 0, 0, 0);
+        }
+
+        canRemove = true;
+        territoryId = node.territoryId;
+        nodeLevel = node.nodeLevel;
+        pendingResources = _calculatePendingEconomyResources(node);
+        pendingYlwReward = TOKEN_HARVEST_REWARD_BASE + (uint256(node.nodeLevel) * 1 ether);
+    }
+
+    /**
+     * @notice Calculate pending resources for an economy node
+     * @param node Resource node storage reference
+     * @return pending Pending unharvested resources
+     */
+    function _calculatePendingEconomyResources(
+        LibColonyWarsStorage.ResourceNode storage node
+    ) internal view returns (uint256 pending) {
+        if (!node.active) return 0;
+
+        uint256 hoursSinceHarvest = (block.timestamp - node.lastHarvestTime) / 1 hours;
+        pending = BASE_PRODUCTION_RATE * node.nodeLevel * hoursSinceHarvest;
+    }
+
+    // ============================================================================
+    // RESOURCE-BASED CARD CRAFTING
+    // ============================================================================
+
+    event ResourceCardCrafted(
+        uint256 indexed tokenId,
+        address indexed crafter,
+        uint8 resourceType,
+        uint256 resourcesConsumed,
+        uint8 rarity
+    );
+
+    error CardCraftingNotEnabled();
+    error InsufficientResourcesForCrafting(uint8 resourceType, uint256 required, uint256 available);
+    error CraftingCooldownActive(uint32 remainingSeconds);
+    error CraftingAmountBelowMinimum(uint256 provided, uint256 minimum);
+
+    /**
+     * @notice Craft Resource Card NFT by consuming game resources
+     * @dev RESOURCE SINK: Major sink for accumulated resources
+     *      Tiers (default):
+     *      - 5,000 resources = Common guaranteed
+     *      - 10,000 resources = up to Uncommon
+     *      - 25,000 resources = up to Rare
+     *      - 50,000 resources = up to Epic
+     *      - 100,000 resources = chance at Legendary
+     * @param resourceType Type of resource to consume (0-3)
+     * @param amount Amount of resources to use
+     * @return tokenId Minted card token ID
+     * @return rarity Achieved rarity (0-4)
+     */
+    function craftResourceCardFromResources(
+        uint8 resourceType,
+        uint256 amount
+    ) external whenNotPaused nonReentrant returns (uint256 tokenId, uint8 rarity) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        LibResourceStorage.CardCraftingConfig storage config = rs.cardCraftingConfig;
+
+        // Check if enabled
+        if (!config.enabled) revert CardCraftingNotEnabled();
+
+        // Check minimum amount
+        if (amount < config.minResourceAmount) {
+            revert CraftingAmountBelowMinimum(amount, config.minResourceAmount);
+        }
+
+        // Validate resource type
+        if (resourceType > 3) revert InvalidResourceType();
+
+        address user = LibMeta.msgSender();
+
+        // Check cooldown
+        uint32 lastCraft = rs.lastResourceCraftTime[user];
+        if (lastCraft > 0 && block.timestamp < lastCraft + config.cooldownSeconds) {
+            uint32 remaining = (lastCraft + config.cooldownSeconds) - uint32(block.timestamp);
+            revert CraftingCooldownActive(remaining);
+        }
+
+        // Apply decay before checking balance
+        LibResourceStorage.applyResourceDecay(user);
+
+        // Check user has enough resources
+        uint256 available = rs.userResources[user][resourceType];
+        if (available < amount) {
+            revert InsufficientResourcesForCrafting(resourceType, amount, available);
+        }
+
+        // Determine max achievable rarity based on amount
+        uint8 maxRarity = _getCraftingMaxRarity(amount, rs);
+
+        // Calculate rarity with randomness
+        rarity = _calculateCraftingRarity(amount, maxRarity, user, resourceType);
+
+        // Consume resources
+        rs.userResources[user][resourceType] -= amount;
+
+        // Update cooldown
+        rs.lastResourceCraftTime[user] = uint32(block.timestamp);
+
+        // Mint the card
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        address resourceAddr = cws.cardContracts.resourceCards;
+        if (resourceAddr == address(0)) revert ResourceCardsNotSet();
+
+        IColonyResourceCards resourceContract = IColonyResourceCards(resourceAddr);
+
+        // Check supply
+        if (resourceContract.totalSupply() >= resourceContract.maxSupply()) revert ResourceMaxSupplyReached();
+
+        // Mint to user
+        tokenId = resourceContract.mintResource(
+            user,
+            IColonyResourceCards.ResourceType(resourceType),
+            IColonyResourceCards.Rarity(rarity)
+        );
+
+        // Update stats
+        rs.totalCardsCrafted++;
+        rs.totalResourcesConsumedByBoosts += amount;
+
+        emit ResourceCardCrafted(tokenId, user, resourceType, amount, rarity);
+    }
+
+    /**
+     * @notice Get max achievable rarity based on resource amount
+     */
+    function _getCraftingMaxRarity(
+        uint256 amount,
+        LibResourceStorage.ResourceStorage storage rs
+    ) internal view returns (uint8 maxRarity) {
+        // Check tiers from highest to lowest
+        for (uint8 i = 4; i > 0; i--) {
+            if (rs.craftingTiers[i].resourceAmount > 0 && amount >= rs.craftingTiers[i].resourceAmount) {
+                return rs.craftingTiers[i].maxRarity;
+            }
+        }
+        // Default to Common if below all tiers or tiers not set
+        return 0;
+    }
+
+    /**
+     * @notice Calculate crafting rarity with randomness
+     */
+    function _calculateCraftingRarity(
+        uint256 amount,
+        uint8 maxRarity,
+        address user,
+        uint8 resourceType
+    ) internal view returns (uint8 rarity) {
+        // Generate pseudo-random value
+        uint256 random = uint256(keccak256(abi.encodePacked(
+            block.timestamp,
+            block.prevrandao,
+            user,
+            resourceType,
+            amount
+        ))) % 10000;
+
+        // Base chances (out of 10000):
+        // Common: guaranteed base
+        // Higher rarities scale with amount spent
+        // More resources = better chance at higher rarity
+
+        if (maxRarity == 0) return 0; // Only Common possible
+
+        // Scale chances based on amount
+        // Using similar thresholds to mintResourceCard but affected by amount
+        uint256 scaleFactor = amount / 1000; // Scale factor based on resources
+        if (scaleFactor > 100) scaleFactor = 100; // Cap at 100
+
+        if (maxRarity >= 4 && random < (LEGENDARY_THRESHOLD * scaleFactor / 10)) {
+            return 4; // Legendary
+        }
+        if (maxRarity >= 3 && random < (EPIC_THRESHOLD * scaleFactor / 10)) {
+            return 3; // Epic
+        }
+        if (maxRarity >= 2 && random < (RARE_THRESHOLD * scaleFactor / 10)) {
+            return 2; // Rare
+        }
+        if (maxRarity >= 1 && random < (UNCOMMON_THRESHOLD * scaleFactor / 10)) {
+            return 1; // Uncommon
+        }
+        return 0; // Common
+    }
+
+    /**
+     * @notice Preview card crafting
+     * @param user User address
+     * @param resourceType Resource type to use
+     * @param amount Amount to spend
+     * @return canCraft Whether crafting is possible
+     * @return reason Failure reason
+     * @return maxRarity Maximum achievable rarity
+     * @return cooldownRemaining Seconds until cooldown ends
+     */
+    function previewCardCrafting(
+        address user,
+        uint8 resourceType,
+        uint256 amount
+    ) external view returns (
+        bool canCraft,
+        string memory reason,
+        uint8 maxRarity,
+        uint32 cooldownRemaining
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        LibResourceStorage.CardCraftingConfig storage config = rs.cardCraftingConfig;
+
+        if (!config.enabled) {
+            return (false, "Card crafting not enabled", 0, 0);
+        }
+
+        if (resourceType > 3) {
+            return (false, "Invalid resource type", 0, 0);
+        }
+
+        if (amount < config.minResourceAmount) {
+            return (false, "Amount below minimum", 0, 0);
+        }
+
+        // Check cooldown
+        uint32 lastCraft = rs.lastResourceCraftTime[user];
+        if (lastCraft > 0 && block.timestamp < lastCraft + config.cooldownSeconds) {
+            cooldownRemaining = (lastCraft + config.cooldownSeconds) - uint32(block.timestamp);
+            return (false, "Cooldown active", 0, cooldownRemaining);
+        }
+
+        // Check resources
+        uint256 available = rs.userResources[user][resourceType];
+        if (available < amount) {
+            return (false, "Insufficient resources", 0, 0);
+        }
+
+        // Check supply
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        address resourceAddr = cws.cardContracts.resourceCards;
+        if (resourceAddr == address(0)) {
+            return (false, "Resource cards not configured", 0, 0);
+        }
+
+        IColonyResourceCards resourceContract = IColonyResourceCards(resourceAddr);
+        if (resourceContract.totalSupply() >= resourceContract.maxSupply()) {
+            return (false, "Max supply reached", 0, 0);
+        }
+
+        maxRarity = _getCraftingMaxRarity(amount, rs);
+        canCraft = true;
+        reason = "";
+    }
+
+    /**
+     * @notice Get card crafting configuration
+     */
+    function getCardCraftingConfig() external view returns (
+        uint32 cooldownSeconds,
+        uint256 minResourceAmount,
+        bool enabled
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        return (
+            rs.cardCraftingConfig.cooldownSeconds,
+            rs.cardCraftingConfig.minResourceAmount,
+            rs.cardCraftingConfig.enabled
+        );
+    }
+
+    /**
+     * @notice Get crafting tier thresholds
+     * @return tierAmounts Array of resource amounts for each tier
+     * @return tierMaxRarities Array of max rarities for each tier
+     */
+    function getCraftingTiers() external view returns (
+        uint256[5] memory tierAmounts,
+        uint8[5] memory tierMaxRarities
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        for (uint8 i = 0; i < 5; i++) {
+            tierAmounts[i] = rs.craftingTiers[i].resourceAmount;
+            tierMaxRarities[i] = rs.craftingTiers[i].maxRarity;
+        }
+    }
+
+    /**
+     * @notice Configure card crafting (ADMIN ONLY)
+     */
+    function configureCardCrafting(
+        uint32 cooldownSeconds,
+        uint256 minResourceAmount,
+        bool enabled
+    ) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        rs.cardCraftingConfig = LibResourceStorage.CardCraftingConfig({
+            cooldownSeconds: cooldownSeconds,
+            minResourceAmount: minResourceAmount,
+            enabled: enabled
+        });
+    }
+
+    /**
+     * @notice Set crafting tier (ADMIN ONLY)
+     * @param tierIndex Tier index (0-4)
+     * @param resourceAmount Resources needed for this tier
+     * @param maxRarity Max achievable rarity (0-4)
+     * @param rarityBoostBps Bonus chance for higher rarity
+     */
+    function setCraftingTier(
+        uint8 tierIndex,
+        uint256 resourceAmount,
+        uint8 maxRarity,
+        uint16 rarityBoostBps
+    ) external onlyAuthorized {
+        require(tierIndex <= 4, "Invalid tier index");
+        require(maxRarity <= 4, "Invalid max rarity");
+
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        rs.craftingTiers[tierIndex] = LibResourceStorage.CardCraftingTier({
+            resourceAmount: resourceAmount,
+            maxRarity: maxRarity,
+            rarityBoostBps: rarityBoostBps
+        });
+    }
+
+    /**
+     * @notice Initialize default crafting tiers (ADMIN ONLY)
+     * @dev Sets default tier thresholds:
+     *      - Tier 0: 5,000 → Common
+     *      - Tier 1: 10,000 → Uncommon
+     *      - Tier 2: 25,000 → Rare
+     *      - Tier 3: 50,000 → Epic
+     *      - Tier 4: 100,000 → Legendary
+     */
+    function initializeCraftingTiers() external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        rs.craftingTiers[0] = LibResourceStorage.CardCraftingTier({
+            resourceAmount: 5000 ether,
+            maxRarity: 0,
+            rarityBoostBps: 0
+        });
+        rs.craftingTiers[1] = LibResourceStorage.CardCraftingTier({
+            resourceAmount: 10000 ether,
+            maxRarity: 1,
+            rarityBoostBps: 1000
+        });
+        rs.craftingTiers[2] = LibResourceStorage.CardCraftingTier({
+            resourceAmount: 25000 ether,
+            maxRarity: 2,
+            rarityBoostBps: 1500
+        });
+        rs.craftingTiers[3] = LibResourceStorage.CardCraftingTier({
+            resourceAmount: 50000 ether,
+            maxRarity: 3,
+            rarityBoostBps: 2000
+        });
+        rs.craftingTiers[4] = LibResourceStorage.CardCraftingTier({
+            resourceAmount: 100000 ether,
+            maxRarity: 4,
+            rarityBoostBps: 2500
+        });
+
+        // Also set default config
+        rs.cardCraftingConfig = LibResourceStorage.CardCraftingConfig({
+            cooldownSeconds: 6 hours,
+            minResourceAmount: 5000 ether,
+            enabled: true
+        });
     }
 }

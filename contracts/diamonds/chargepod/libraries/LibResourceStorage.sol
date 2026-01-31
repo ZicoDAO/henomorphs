@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
-import {ControlFee} from "../../../libraries/HenomorphsModel.sol";
+import {ControlFee} from "../../libraries/HenomorphsModel.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
  * @title LibResourceStorage
@@ -9,6 +10,7 @@ import {ControlFee} from "../../../libraries/HenomorphsModel.sol";
  * @dev Uses Diamond storage pattern for isolation
  */
 library LibResourceStorage {
+    using Math for uint256;
     bytes32 constant RESOURCE_STORAGE_POSITION = keccak256("henomorphs.resource.storage");
     
     // Resource types enumeration
@@ -117,8 +119,39 @@ library LibResourceStorage {
         uint16 generationMultiplier;     // Multiplier for resource generation
         bool enablesResourceGeneration;
         bool enablesProjectParticipation;
+        uint8 secondaryResourceType;     // Secondary resource type (0-3)
+        uint8 secondaryResourceChance;   // Chance for secondary (0-100%), 0 = disabled
     }
-    
+
+    // === BOOST SYSTEM CONFIGS ===
+
+    struct BoostConfig {
+        uint256 resourcePerBasisPoint;   // Resources needed per 1 basis point (0.01%) bonus
+        uint256 durationPerResource;     // Seconds of duration per resource unit
+        uint16 maxMultiplier;            // Max bonus in basis points (e.g., 5000 = +50%)
+        uint256 minResourceAmount;       // Minimum resources to activate
+        bool enabled;
+    }
+
+    struct ResourceRepairConfig {
+        uint256 bioPerWearPoint;         // Bio required per wear point
+        uint256 basicPerWearPoint;       // Basic required per wear point
+        uint16 discountBasisPoints;      // Discount vs token repair (e.g., 2000 = 20% cheaper)
+        bool enabled;
+    }
+
+    struct CardCraftingTier {
+        uint256 resourceAmount;          // Resources needed for this tier
+        uint8 maxRarity;                 // Max rarity achievable (0=Common, 4=Legendary)
+        uint16 rarityBoostBps;           // Bonus chance for higher rarity in basis points
+    }
+
+    struct CardCraftingConfig {
+        uint32 cooldownSeconds;          // Cooldown between crafts
+        uint256 minResourceAmount;       // Minimum resources to craft
+        bool enabled;
+    }
+
     struct ResourceStorage {
         // Configuration
         ResourceConfig config;
@@ -181,9 +214,35 @@ library LibResourceStorage {
         uint256 totalResourcesGenerated;
         uint256 totalProjectsCompleted;
         uint256 totalInfrastructureBuilt;
-        
+
         // Version for future upgrades
         uint256 storageVersion;
+
+        // === RESOURCE BOOST SYSTEM (v2) ===
+        // Harvest boost (Rare Catalyst) - per user
+        mapping(address => uint32) harvestBoostEndTime;
+        mapping(address => uint16) harvestBoostMultiplier;  // basis points (e.g., 5000 = +50%)
+
+        // Production boost (Energy Surge) - per user
+        mapping(address => uint32) productionBoostEndTime;
+        mapping(address => uint16) productionBoostMultiplier;  // basis points
+
+        // Resource-based crafting/repair cooldowns
+        mapping(address => uint32) lastResourceCraftTime;
+
+        // Boost configuration
+        BoostConfig rareCatalystConfig;
+        BoostConfig energySurgeConfig;
+        ResourceRepairConfig resourceRepairConfig;
+
+        // Card crafting configuration
+        CardCraftingConfig cardCraftingConfig;
+        CardCraftingTier[5] craftingTiers;  // 5 tiers: Common, Uncommon, Rare, Epic, Legendary
+
+        // Stats for boosts
+        uint256 totalBoostsActivated;
+        uint256 totalResourcesConsumedByBoosts;
+        uint256 totalCardsCrafted;
     }
     
     /**
@@ -198,41 +257,67 @@ library LibResourceStorage {
     
     /**
      * @notice Apply resource decay to user's resources
+     * @dev Uses SQRT-BASED DECAY FORMULA for balanced economics
+     *      - Linear decay punishes large balances too harshly
+     *      - Sqrt decay: decayAmount = sqrt(currentAmount) * rate * days / scaleFactor
+     *      - This makes decay proportionally smaller for larger balances
+     *      - Example at 1% rate: 100 resources → 1 decay, 10000 resources → 10 decay (not 100)
      * @param user User address
      */
     function applyResourceDecay(address user) internal {
         ResourceStorage storage rs = resourceStorage();
-        
+
         if (!rs.config.resourceDecayEnabled || rs.config.baseResourceDecayRate == 0) {
             return;
         }
-        
+
         uint32 currentTime = uint32(block.timestamp);
         uint32 lastUpdate = rs.lastDecayUpdate[user];
-        
+
         if (lastUpdate == 0) {
             rs.lastDecayUpdate[user] = currentTime;
             return;
         }
-        
+
+        // Prevent underflow if lastUpdate is somehow in the future (data corruption)
+        if (currentTime <= lastUpdate) {
+            return;
+        }
+
         uint32 timePassed = currentTime - lastUpdate;
         if (timePassed < 86400) return; // Skip if less than 1 day
-        
+
         uint32 daysPassed = timePassed / 86400;
-        
-        // Apply decay to each resource type
-        for (uint8 i = 0; i < 4; i++) {
-            uint256 currentAmount = rs.userResources[user][i];
-            if (currentAmount > 0) {
-                uint256 decayAmount = (currentAmount * rs.config.baseResourceDecayRate * daysPassed) / 10000;
-                if (decayAmount > currentAmount) {
-                    rs.userResources[user][i] = 0;
-                } else {
-                    rs.userResources[user][i] = currentAmount - decayAmount;
+
+        // Apply SQRT-based decay to each resource type
+        // Formula: decayAmount = sqrt(currentAmount) * baseResourceDecayRate * daysPassed / 100
+        // This creates diminishing decay percentage for larger balances
+        unchecked {
+            for (uint8 i = 0; i < 4; i++) {
+                uint256 currentAmount = rs.userResources[user][i];
+                if (currentAmount > 0) {
+                    // Calculate sqrt of current amount (using OpenZeppelin Math.sqrt)
+                    uint256 sqrtAmount = currentAmount.sqrt();
+
+                    // Calculate decay: sqrt(amount) * rate * days / 100
+                    // baseResourceDecayRate is in basis points (100 = 1%)
+                    // We divide by 100 to scale sqrt properly
+                    uint256 decayAmount = (sqrtAmount * rs.config.baseResourceDecayRate * daysPassed) / 100;
+
+                    // Minimum decay of 1 if user has resources and decay rate is > 0
+                    if (decayAmount == 0 && currentAmount > 0) {
+                        decayAmount = 1;
+                    }
+
+                    if (decayAmount > currentAmount) {
+                        rs.userResources[user][i] = 0;
+                    } else {
+                        rs.userResources[user][i] = currentAmount - decayAmount;
+                    }
                 }
-            }
+            }          
         }
-        
+
         rs.lastDecayUpdate[user] = currentTime;
     }
     
@@ -365,5 +450,95 @@ library LibResourceStorage {
         defenseCost.resourceRequirements.push(ResourceRequirement(BASIC_MATERIALS, 2000));
         defenseCost.resourceRequirements.push(ResourceRequirement(ENERGY_CRYSTALS, 1000));
         defenseCost.resourceRequirements.push(ResourceRequirement(RARE_ELEMENTS, 200));
+    }
+
+    // === BOOST HELPER FUNCTIONS ===
+
+    /**
+     * @notice Get active harvest boost for user (Rare Catalyst)
+     * @param user User address
+     * @return multiplier Active boost multiplier in basis points (0 if expired/none)
+     */
+    function getActiveHarvestBoost(address user) internal view returns (uint16 multiplier) {
+        ResourceStorage storage rs = resourceStorage();
+        if (rs.harvestBoostEndTime[user] > uint32(block.timestamp)) {
+            return rs.harvestBoostMultiplier[user];
+        }
+        return 0;
+    }
+
+    /**
+     * @notice Get active production boost for user (Energy Surge)
+     * @param user User address
+     * @return multiplier Active boost multiplier in basis points (0 if expired/none)
+     */
+    function getActiveProductionBoost(address user) internal view returns (uint16 multiplier) {
+        ResourceStorage storage rs = resourceStorage();
+        if (rs.productionBoostEndTime[user] > uint32(block.timestamp)) {
+            return rs.productionBoostMultiplier[user];
+        }
+        return 0;
+    }
+
+    /**
+     * @notice Apply harvest boost to amount
+     * @param user User address
+     * @param baseAmount Base amount before boost
+     * @return boostedAmount Amount after applying boost
+     */
+    function applyHarvestBoost(address user, uint256 baseAmount) internal view returns (uint256 boostedAmount) {
+        uint16 boost = getActiveHarvestBoost(user);
+        if (boost > 0) {
+            return baseAmount + (baseAmount * boost) / 10000;
+        }
+        return baseAmount;
+    }
+
+    /**
+     * @notice Apply production boost to amount
+     * @param user User address
+     * @param baseAmount Base amount before boost
+     * @return boostedAmount Amount after applying boost
+     */
+    function applyProductionBoost(address user, uint256 baseAmount) internal view returns (uint256 boostedAmount) {
+        uint16 boost = getActiveProductionBoost(user);
+        if (boost > 0) {
+            return baseAmount + (baseAmount * boost) / 10000;
+        }
+        return baseAmount;
+    }
+
+    /**
+     * @notice Initialize default boost configs
+     * @dev Called during storage initialization or upgrade
+     */
+    function initializeBoostConfigs() internal {
+        ResourceStorage storage rs = resourceStorage();
+
+        // Rare Catalyst config: 2 Rare = +1 basis point, max +50%
+        rs.rareCatalystConfig = BoostConfig({
+            resourcePerBasisPoint: 2,      // 2 Rare per 0.01%
+            durationPerResource: 432,      // ~12h per 100 Rare (432s * 100 = 43200s = 12h)
+            maxMultiplier: 5000,           // Max +50%
+            minResourceAmount: 50,         // Min 50 Rare
+            enabled: true
+        });
+
+        // Energy Surge config: 20 Energy = +1 basis point, max +50%
+        rs.energySurgeConfig = BoostConfig({
+            resourcePerBasisPoint: 20,     // 20 Energy per 0.01%
+            durationPerResource: 173,      // ~24h per 500 Energy (173s * 500 = 86400s = 24h)
+            maxMultiplier: 5000,           // Max +50%
+            minResourceAmount: 100,        // Min 100 Energy
+            enabled: true
+        });
+
+        // Resource repair config: Bio + Basic for wear
+        rs.resourceRepairConfig = ResourceRepairConfig({
+            bioPerWearPoint: 15,           // 15 Bio per wear point
+            basicPerWearPoint: 10,         // 10 Basic per wear point
+            discountBasisPoints: 2000,     // 20% cheaper than token repair
+            enabled: true
+        });
     }
 }

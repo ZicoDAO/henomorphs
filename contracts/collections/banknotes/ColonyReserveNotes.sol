@@ -3,16 +3,17 @@ pragma solidity ^0.8.27;
 
 import {ERC721Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
 import {ERC721EnumerableUpgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721EnumerableUpgradeable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
-import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
 
-import {IColonyReserveNotes} from "./IColonyReserveNotes.sol";
+import {IColonyReserveNotes, IRewardRedeemable} from "./IColonyReserveNotes.sol";
+import {INotesMetadataDescriptor, INotesDataProvider} from "./INotesMetadataDescriptor.sol";
 
 /**
  * @title IYellowToken
@@ -25,13 +26,16 @@ interface IYellowToken is IERC20 {
 /**
  * @title ColonyReserveNotes
  * @notice ERC-721 NFT collection representing YLW-backed banknotes
- * @dev Features:
- *   - Configurable collection metadata
- *   - Multiple series with individual base image URIs
- *   - Configurable denominations with YLW values
- *   - Configurable rarity variants with probability weights
- *   - On-chain metadata generation (tokenURI, contractURI)
- *   - Treasury + Mint fallback for YLW redemption
+ * @dev OpenZeppelin v5+ contracts-upgradeable with UUPS proxy pattern
+ *      Features:
+ *      - Configurable collection metadata
+ *      - Multiple series with individual base image URIs
+ *      - Configurable denominations with YLW values
+ *      - Configurable rarity variants with probability weights
+ *      - On-chain metadata generation (tokenURI, contractURI)
+ *      - Treasury + Mint fallback for YLW redemption
+ *      - IRewardRedeemable integration for CollaborativeCraftingFacet
+ *
  * @author rutilicus.eth (ArchXS)
  * @custom:security-contact contact@archxs.com
  */
@@ -39,78 +43,88 @@ contract ColonyReserveNotes is
     Initializable,
     ERC721Upgradeable,
     ERC721EnumerableUpgradeable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
     ReentrancyGuardUpgradeable,
-    OwnableUpgradeable,
     UUPSUpgradeable,
-    IColonyReserveNotes
+    IColonyReserveNotes,
+    IRewardRedeemable,
+    INotesDataProvider
 {
     using SafeERC20 for IERC20;
     using Strings for uint256;
     using Strings for uint32;
 
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTANTS - Roles
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // STORAGE
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
 
-    /// @notice Collection configuration
-    CollectionConfig public collectionConfig;
+    /// @notice Collection metadata configuration (includes ylwToken, treasury)
+    CollectionConfig private _collectionConfig;
 
-    /// @notice Series configurations by series ID
-    mapping(bytes1 => SeriesConfig) private _series;
+    /// @notice Reward system configuration
+    RewardConfig private _rewardConfig;
 
-    /// @notice List of all series IDs
-    bytes1[] private _seriesIds;
+    /// @notice Next token ID counter
+    uint256 private _nextTokenId;
 
-    /// @notice Denomination configurations by denomination ID
+    /// @notice Series configurations: seriesId => config
+    mapping(bytes2 => SeriesConfig) private _series;
+
+    /// @notice List of all series IDs ("AA"=0x4141, "AB"=0x4142, etc.)
+    bytes2[] private _seriesIds;
+
+    /// @notice Denomination configurations: denominationId => config
     mapping(uint8 => DenominationConfig) private _denominations;
 
     /// @notice List of all denomination IDs
     uint8[] private _denominationIds;
 
-    /// @notice Rarity configurations
+    /// @notice Denomination IDs sorted by value descending (for greedy decomposition)
+    uint8[] private _sortedDenomIdsByValue;
+
+    /// @notice Rarity configurations: rarity => config
     mapping(Rarity => RarityConfig) private _rarityConfigs;
 
-    /// @notice Note data per token
+    /// @notice Note data per token: tokenId => NoteData
     mapping(uint256 => NoteData) private _notes;
 
     /// @notice Serial counters: seriesId => denominationId => counter
-    mapping(bytes1 => mapping(uint8 => uint32)) public serialCounters;
+    mapping(bytes2 => mapping(uint8 => uint32)) public serialCounters;
 
-    /// @notice Next token ID
-    uint256 private _nextTokenId;
+    // === Reward System (IRewardRedeemable) ===
 
-    /// @notice Authorized minters
-    mapping(address => bool) public minters;
+    /// @notice Tier to reward value mapping: tierId => YLW value in wei
+    mapping(uint256 => uint256) public tierToRewardValue;
 
-    /// @notice YLW token address
-    address public ylwToken;
+    /// @notice Reward supply limits per denomination: denominationId => max supply
+    mapping(uint8 => uint32) public rewardSupplyLimits;
 
-    /// @notice Treasury address for YLW transfers
-    address public treasury;
+    /// @notice Reward mint counts per denomination: denominationId => minted count
+    mapping(uint8 => uint32) public rewardMintCounts;
 
-    /// @notice Total rarity weight (should be 10000)
-    uint16 public totalRarityWeight;
+    /// @notice External metadata descriptor contract
+    INotesMetadataDescriptor public metadataDescriptor;
 
-    /// @notice Storage gap for upgrades
-    uint256[40] private __gap;
-
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
     // MODIFIERS
-    // ============================================
-
-    modifier onlyMinter() {
-        if (!minters[msg.sender]) revert NotMinter();
-        _;
-    }
+    // ═══════════════════════════════════════════════════════════════════════════
 
     modifier tokenExists(uint256 tokenId) {
         if (_ownerOf(tokenId) == address(0)) revert TokenDoesNotExist(tokenId);
         _;
     }
 
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
     // INITIALIZER
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -123,78 +137,71 @@ contract ColonyReserveNotes is
      * @param symbol_ Token symbol
      * @param ylwToken_ YLW token address
      * @param treasury_ Treasury address
-     * @param owner_ Contract owner
+     * @param admin_ Default admin address
      */
     function initialize(
         string memory name_,
         string memory symbol_,
         address ylwToken_,
         address treasury_,
-        address owner_
+        address admin_
     ) external initializer {
         if (ylwToken_ == address(0)) revert InvalidAddress();
         if (treasury_ == address(0)) revert InvalidAddress();
-        if (owner_ == address(0)) revert InvalidAddress();
+        if (admin_ == address(0)) revert InvalidAddress();
 
         __ERC721_init(name_, symbol_);
         __ERC721Enumerable_init();
+        __AccessControl_init();
+        __Pausable_init();
         __ReentrancyGuard_init();
-        __Ownable_init(owner_);
         __UUPSUpgradeable_init();
 
-        ylwToken = ylwToken_;
-        treasury = treasury_;
-        _nextTokenId = 1;
+        // Setup roles
+        _grantRole(DEFAULT_ADMIN_ROLE, admin_);
+        _grantRole(ADMIN_ROLE, admin_);
 
-        collectionConfig.name = name_;
-        collectionConfig.symbol = symbol_;
+        // Initialize storage
+        _collectionConfig.name = name_;
+        _collectionConfig.symbol = symbol_;
+        _collectionConfig.ylwToken = ylwToken_;
+        _collectionConfig.treasury = treasury_;
+        _nextTokenId = 1;
 
         // Initialize default rarity configs
         _initializeDefaultRarities();
     }
 
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
     // ADMIN: COLLECTION CONFIG
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
      * @notice Configure collection metadata
      */
-    function configureCollection(CollectionConfig calldata config) external onlyOwner {
-        collectionConfig = config;
+    function configureCollection(CollectionConfig calldata config) external onlyRole(ADMIN_ROLE) {
+        _collectionConfig = config;
         emit CollectionConfigured(config.name, config.symbol);
     }
 
     /**
-     * @notice Set collection description
+     * @notice Set metadata descriptor contract
      */
-    function setCollectionDescription(string calldata description) external onlyOwner {
-        collectionConfig.description = description;
+    function setMetadataDescriptor(address descriptor) external onlyRole(ADMIN_ROLE) {
+        if (descriptor == address(0)) revert InvalidAddress();
+        metadataDescriptor = INotesMetadataDescriptor(descriptor);
     }
 
-    /**
-     * @notice Set collection external link
-     */
-    function setCollectionExternalLink(string calldata externalLink) external onlyOwner {
-        collectionConfig.externalLink = externalLink;
-    }
-
-    /**
-     * @notice Set collection banner image
-     */
-    function setCollectionBannerImage(string calldata bannerImage) external onlyOwner {
-        collectionConfig.bannerImage = bannerImage;
-    }
-
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
     // ADMIN: SERIES CONFIG
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
      * @notice Configure a series
+     * @dev seriesId is bytes2 encoding two ASCII chars: "AA"=0x4141, "AB"=0x4142, "BA"=0x4241
      */
-    function configureSeries(SeriesConfig calldata config) external onlyOwner {
-        bytes1 seriesId = config.seriesId;
+    function configureSeries(SeriesConfig calldata config) external onlyRole(ADMIN_ROLE) {
+        bytes2 seriesId = config.seriesId;
 
         // Track new series
         if (_series[seriesId].seriesId == 0) {
@@ -208,7 +215,7 @@ contract ColonyReserveNotes is
     /**
      * @notice Set series active status
      */
-    function setSeriesActive(bytes1 seriesId, bool active) external onlyOwner {
+    function setSeriesActive(bytes2 seriesId, bool active) external onlyRole(ADMIN_ROLE) {
         if (_series[seriesId].seriesId == 0) revert SeriesNotFound(seriesId);
         _series[seriesId].active = active;
         emit SeriesActiveChanged(seriesId, active);
@@ -217,20 +224,20 @@ contract ColonyReserveNotes is
     /**
      * @notice Update series base image URI
      */
-    function setSeriesBaseImageUri(bytes1 seriesId, string calldata baseImageUri) external onlyOwner {
+    function setSeriesBaseImageUri(bytes2 seriesId, string calldata baseImageUri) external onlyRole(ADMIN_ROLE) {
         if (_series[seriesId].seriesId == 0) revert SeriesNotFound(seriesId);
         _series[seriesId].baseImageUri = baseImageUri;
         emit SeriesConfigured(seriesId, _series[seriesId].name, baseImageUri);
     }
 
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
     // ADMIN: DENOMINATION CONFIG
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
      * @notice Configure a denomination
      */
-    function configureDenomination(DenominationConfig calldata config) external onlyOwner {
+    function configureDenomination(DenominationConfig calldata config) external onlyRole(ADMIN_ROLE) {
         uint8 denomId = config.denominationId;
 
         // Track new denomination
@@ -246,40 +253,42 @@ contract ColonyReserveNotes is
         }
 
         _denominations[denomId] = config;
+
+        // Rebuild sorted array (only done during configuration, not at runtime)
+        _rebuildSortedDenominations();
+
         emit DenominationConfigured(denomId, config.name, config.ylwValue);
     }
 
     /**
      * @notice Set denomination active status
      */
-    function setDenominationActive(uint8 denominationId, bool active) external onlyOwner {
-        if (bytes(_denominations[denominationId].name).length == 0) {
+    function setDenominationActive(uint8 denominationId, bool active) external onlyRole(ADMIN_ROLE) {
+                if (bytes(_denominations[denominationId].name).length == 0) {
             revert DenominationNotFound(denominationId);
         }
         _denominations[denominationId].active = active;
         emit DenominationActiveChanged(denominationId, active);
     }
 
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
     // ADMIN: RARITY CONFIG
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
      * @notice Configure a rarity level
      * @dev Sum of all weights should equal 10000 for proper probability distribution
      */
-    function configureRarity(RarityConfig calldata config) external onlyOwner {
-        // Update total weight
-        totalRarityWeight = totalRarityWeight - _rarityConfigs[config.rarity].weightBps + config.weightBps;
-
+    function configureRarity(RarityConfig calldata config) external onlyRole(ADMIN_ROLE) {
         _rarityConfigs[config.rarity] = config;
         emit RarityConfigured(config.rarity, config.name, config.weightBps, config.bonusMultiplierBps);
     }
 
     /**
      * @notice Batch configure all rarities
+     * @dev Validates that total weight equals 10000
      */
-    function configureRarities(RarityConfig[] calldata configs) external onlyOwner {
+    function configureRarities(RarityConfig[] calldata configs) external onlyRole(ADMIN_ROLE) {
         uint16 newTotalWeight = 0;
 
         for (uint256 i = 0; i < configs.length; i++) {
@@ -293,47 +302,142 @@ contract ColonyReserveNotes is
             );
         }
 
-        totalRarityWeight = newTotalWeight;
-
         if (newTotalWeight != 10000) revert InvalidRarityWeights();
     }
 
-    // ============================================
-    // ADMIN: ACCESS CONTROL
-    // ============================================
-
-    /**
-     * @notice Set minter authorization
-     */
-    function setMinter(address minter, bool authorized) external onlyOwner {
-        if (minter == address(0)) revert InvalidAddress();
-        minters[minter] = authorized;
-        emit MinterUpdated(minter, authorized);
-    }
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADMIN: TREASURY & TOKEN CONFIG
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
      * @notice Set treasury address
      */
-    function setTreasury(address newTreasury) external onlyOwner {
+    function setTreasuryAddress(address newTreasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newTreasury == address(0)) revert InvalidAddress();
-        address oldTreasury = treasury;
-        treasury = newTreasury;
+        address oldTreasury = _collectionConfig.treasury;
+        _collectionConfig.treasury = newTreasury;
         emit TreasuryUpdated(oldTreasury, newTreasury);
     }
 
     /**
      * @notice Set YLW token address
      */
-    function setYlwToken(address newYlwToken) external onlyOwner {
+    function setYlwTokenAddress(address newYlwToken) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newYlwToken == address(0)) revert InvalidAddress();
-        address oldToken = ylwToken;
-        ylwToken = newYlwToken;
+        address oldToken = _collectionConfig.ylwToken;
+        _collectionConfig.ylwToken = newYlwToken;
         emit YlwTokenUpdated(oldToken, newYlwToken);
     }
 
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADMIN: REWARD SYSTEM CONFIG (IRewardRedeemable)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Configure a reward tier
+     * @param tierId Tier ID from CollaborativeCraftingFacet (1-4)
+     * @param rewardValue Total YLW value for this tier
+     */
+    function configureRewardTier(uint256 tierId, uint256 rewardValue) external onlyRole(ADMIN_ROLE) {
+        if (tierId == 0) revert InvalidTier();
+        tierToRewardValue[tierId] = rewardValue;
+        emit RewardTierConfigured(tierId, rewardValue);
+    }
+
+    /**
+     * @notice Batch configure reward tiers
+     */
+    function configureRewardTiersBatch(
+        uint256[] calldata tierIds,
+        uint256[] calldata rewardValues
+    ) external onlyRole(ADMIN_ROLE) {
+        if (tierIds.length != rewardValues.length) revert ArrayLengthMismatch();
+
+                for (uint256 i = 0; i < tierIds.length; i++) {
+            if (tierIds[i] == 0) revert InvalidTier();
+            tierToRewardValue[tierIds[i]] = rewardValues[i];
+            emit RewardTierConfigured(tierIds[i], rewardValues[i]);
+        }
+    }
+
+    /**
+     * @notice Set the series used for reward minting
+     */
+    function setRewardSeries(bytes2 seriesId) external onlyRole(ADMIN_ROLE) {
+        if (_series[seriesId].seriesId == 0) revert SeriesNotFound(seriesId);
+        _rewardConfig.rewardSeries = seriesId;
+        emit RewardSystemConfigured(seriesId, _rewardConfig.enabled);
+    }
+
+    /**
+     * @notice Set supply limit for a denomination in reward system
+     * @param denominationId Denomination ID
+     * @param limit Max supply (0 = unlimited)
+     */
+    function setRewardSupplyLimit(uint8 denominationId, uint32 limit) external onlyRole(ADMIN_ROLE) {
+        rewardSupplyLimits[denominationId] = limit;
+        emit RewardSupplyLimitSet(denominationId, limit);
+    }
+
+    /**
+     * @notice Enable/disable reward system
+     */
+    function setRewardSystemEnabled(bool enabled) external onlyRole(ADMIN_ROLE) {
+        _rewardConfig.enabled = enabled;
+        emit RewardSystemConfigured(_rewardConfig.rewardSeries, enabled);
+    }
+
+    /**
+     * @notice Reset reward mint counts (new season)
+     */
+    function resetRewardMintCounts() external onlyRole(ADMIN_ROLE) {
+        for (uint256 i = 0; i < _denominationIds.length; i++) {
+            rewardMintCounts[_denominationIds[i]] = 0;
+        }
+    }
+
+    /**
+     * @notice Correct serial number for an existing note (migration/fix)
+     * @param tokenId Token ID to correct
+     * @param newSerialNumber New serial number to set
+     */
+    function correctNoteSerialNumber(uint256 tokenId, uint32 newSerialNumber) external onlyRole(ADMIN_ROLE) {
+        if (_ownerOf(tokenId) == address(0)) revert TokenDoesNotExist(tokenId);
+        _notes[tokenId].serialNumber = newSerialNumber;
+    }
+
+    /**
+     * @notice Batch correct serial numbers for multiple notes
+     * @param tokenIds Array of token IDs
+     * @param newSerialNumbers Array of new serial numbers
+     */
+    function correctNoteSerialNumbers(
+        uint256[] calldata tokenIds,
+        uint32[] calldata newSerialNumbers
+    ) external onlyRole(ADMIN_ROLE) {
+        if (tokenIds.length != newSerialNumbers.length) revert ArrayLengthMismatch();
+
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            if (_ownerOf(tokenIds[i]) == address(0)) revert TokenDoesNotExist(tokenIds[i]);
+            _notes[tokenIds[i]].serialNumber = newSerialNumbers[i];
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADMIN: PAUSABLE
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // MINTING
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
      * @inheritdoc IColonyReserveNotes
@@ -341,8 +445,8 @@ contract ColonyReserveNotes is
     function mintNote(
         address to,
         uint8 denominationId,
-        bytes1 seriesId
-    ) external onlyMinter returns (uint256 tokenId) {
+        bytes2 seriesId
+    ) external onlyRole(MINTER_ROLE) whenNotPaused returns (uint256 tokenId) {
         _validateMintParams(denominationId, seriesId);
 
         uint256 seed = _generateSeed(to, _nextTokenId);
@@ -357,9 +461,9 @@ contract ColonyReserveNotes is
     function mintNoteWithRarity(
         address to,
         uint8 denominationId,
-        bytes1 seriesId,
+        bytes2 seriesId,
         Rarity rarity
-    ) external onlyMinter returns (uint256 tokenId) {
+    ) external onlyRole(MINTER_ROLE) whenNotPaused returns (uint256 tokenId) {
         _validateMintParams(denominationId, seriesId);
         if (_rarityConfigs[rarity].weightBps == 0) revert RarityNotConfigured(rarity);
 
@@ -371,34 +475,179 @@ contract ColonyReserveNotes is
      */
     function mintNoteBatch(
         address to,
-        uint8[] calldata denominationIds,
-        bytes1 seriesId
-    ) external onlyMinter returns (uint256[] memory tokenIds) {
-        tokenIds = new uint256[](denominationIds.length);
+        uint8 denominationId,
+        bytes2 seriesId,
+        uint32 count
+    ) external onlyRole(MINTER_ROLE) whenNotPaused returns (uint256[] memory tokenIds) {
+        if (count == 0) revert InvalidAmount();
+        _validateMintParams(denominationId, seriesId);
 
-        for (uint256 i = 0; i < denominationIds.length; i++) {
-            _validateMintParams(denominationIds[i], seriesId);
+        tokenIds = new uint256[](count);
 
+        for (uint32 i = 0; i < count; i++) {
             uint256 seed = _generateSeed(to, _nextTokenId + i);
             Rarity rarity = _selectRarity(seed);
 
-            tokenIds[i] = _mintNote(to, denominationIds[i], seriesId, rarity);
+            tokenIds[i] = _mintNote(to, denominationId, seriesId, rarity);
         }
 
         return tokenIds;
     }
 
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
+    // IRewardRedeemable IMPLEMENTATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @inheritdoc IRewardRedeemable
+     * @dev Mints banknotes to recipient based on tier reward value
+     *      Decomposes the reward value into optimal banknote denominations
+     */
+    function mintReward(
+        uint256 /* collectionId */,
+        uint256 tierId,
+        address to,
+        uint256 /* amount */
+    ) external onlyRole(MINTER_ROLE) whenNotPaused returns (uint256 tokenId) {
+        if (!_rewardConfig.enabled) revert RewardSystemDisabled();
+        if (tierId == 0) revert InvalidTier();
+
+        uint256 rewardValue = tierToRewardValue[tierId];
+        if (rewardValue == 0) revert TierNotConfigured(tierId);
+
+        // Decompose reward into banknotes
+        (uint8[] memory denomIds, uint32[] memory counts) = _decomposeToNotes(rewardValue);
+
+        // Mint all notes, return first tokenId
+        uint256 firstTokenId = 0;
+        bytes2 seriesId = _rewardConfig.rewardSeries;
+
+        for (uint256 i = 0; i < denomIds.length; i++) {
+            for (uint32 j = 0; j < counts[i]; j++) {
+                uint256 seed = _generateSeed(to, _nextTokenId);
+                Rarity rarity = _selectRarity(seed);
+                uint256 newTokenId = _mintNote(to, denomIds[i], seriesId, rarity);
+
+                // Track reward mint counts
+                rewardMintCounts[denomIds[i]]++;
+
+                if (firstTokenId == 0) {
+                    firstTokenId = newTokenId;
+                }
+            }
+        }
+
+        return firstTokenId;
+    }
+
+    /**
+     * @inheritdoc IRewardRedeemable
+     */
+    function batchMintReward(
+        uint256 collectionId,
+        uint256[] calldata tierIds,
+        address to,
+        uint256[] calldata /* amounts */
+    ) external onlyRole(MINTER_ROLE) whenNotPaused returns (uint256[] memory tokenIds) {
+        tokenIds = new uint256[](tierIds.length);
+
+        for (uint256 i = 0; i < tierIds.length; i++) {
+            tokenIds[i] = this.mintReward(collectionId, tierIds[i], to, 1);
+        }
+
+        return tokenIds;
+    }
+
+    /**
+     * @inheritdoc IRewardRedeemable
+     */
+    function canMintReward(
+        uint256 /* collectionId */,
+        uint256 tierId,
+        uint256 /* amount */
+    ) external view returns (bool canMint) {
+        if (!_rewardConfig.enabled) return false;
+        if (tierId == 0) return false;
+
+        uint256 rewardValue = tierToRewardValue[tierId];
+        if (rewardValue == 0) return false;
+
+        // Check if we can decompose
+        (uint8[] memory denomIds, uint32[] memory counts) = _decomposeToNotes(rewardValue);
+
+        // Check supply limits
+        for (uint256 i = 0; i < denomIds.length; i++) {
+            uint32 limit = rewardSupplyLimits[denomIds[i]];
+            if (limit > 0) {
+                uint32 minted = rewardMintCounts[denomIds[i]];
+                if (minted + counts[i] > limit) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @inheritdoc IRewardRedeemable
+     */
+    function getRemainingSupply(
+        uint256 /* collectionId */,
+        uint256 tierId
+    ) external view returns (uint256 remaining) {
+        
+        uint256 rewardValue = tierToRewardValue[tierId];
+        if (rewardValue == 0) return 0;
+
+        (uint8[] memory denomIds, uint32[] memory counts) = _decomposeToNotes(rewardValue);
+
+        // Find the minimum remaining across all denominations
+        remaining = type(uint256).max;
+        for (uint256 i = 0; i < denomIds.length; i++) {
+            uint32 limit = rewardSupplyLimits[denomIds[i]];
+            if (limit > 0) {
+                uint32 minted = rewardMintCounts[denomIds[i]];
+                uint32 available = minted >= limit ? 0 : limit - minted;
+                uint256 canMintTimes = counts[i] > 0 ? available / counts[i] : type(uint256).max;
+                if (canMintTimes < remaining) {
+                    remaining = canMintTimes;
+                }
+            }
+        }
+
+        if (remaining == type(uint256).max) {
+            remaining = 0; // Indicates unlimited
+        }
+
+        return remaining;
+    }
+
+    /**
+     * @notice Preview how a reward value will be decomposed into notes
+     * @param rewardValue Total YLW value to decompose
+     * @return denomIds Denomination IDs
+     * @return counts Number of each denomination
+     */
+    function previewDecomposeReward(uint256 rewardValue)
+        external
+        view
+        returns (uint8[] memory denomIds, uint32[] memory counts)
+    {
+        return _decomposeToNotes(rewardValue);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // REDEMPTION
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
      * @inheritdoc IColonyReserveNotes
      */
-    function redeemNote(uint256 tokenId) external nonReentrant tokenExists(tokenId) {
+    function redeemNote(uint256 tokenId) external nonReentrant whenNotPaused tokenExists(tokenId) {
         if (ownerOf(tokenId) != msg.sender) revert NotOwner();
 
-        NoteData memory note = _notes[tokenId];
+                NoteData memory note = _notes[tokenId];
         uint256 ylwAmount = _calculateNoteValue(note);
 
         // Burn NFT first
@@ -411,9 +660,45 @@ contract ColonyReserveNotes is
         emit NoteRedeemed(tokenId, msg.sender, ylwAmount, note.rarity);
     }
 
-    // ============================================
+    /**
+     * @notice Redeem a note on behalf of the owner (for facet delegation)
+     * @dev Called by AchievementRewardFacet via Diamond. Recipient must be the token owner.
+     * @param tokenId Token to redeem
+     * @param recipient Address to receive YLW (must be token owner)
+     * @return ylwAmount Amount of YLW sent
+     */
+    function redeemReward(
+        uint256 tokenId,
+        address recipient
+    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused tokenExists(tokenId) returns (uint256 ylwAmount) {
+        // Verify recipient is the owner
+        if (ownerOf(tokenId) != recipient) revert NotOwner();
+
+        NoteData memory note = _notes[tokenId];
+        ylwAmount = _calculateNoteValue(note);
+
+        // Burn NFT first
+        _burn(tokenId);
+        delete _notes[tokenId];
+
+        // Send YLW to recipient
+        _sendYlwWithFallback(recipient, ylwAmount);
+
+        emit NoteRedeemed(tokenId, recipient, ylwAmount, note.rarity);
+    }
+
+    /**
+     * @notice Get the YLW value of a reward token (alias for getNoteValue)
+     * @param tokenId Token to query
+     * @return ylwAmount YLW value in wei
+     */
+    function getRewardValue(uint256 tokenId) external view tokenExists(tokenId) returns (uint256 ylwAmount) {
+        return _calculateNoteValue(_notes[tokenId]);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // VIEW FUNCTIONS
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
      * @inheritdoc IColonyReserveNotes
@@ -425,7 +710,13 @@ contract ColonyReserveNotes is
     /**
      * @inheritdoc IColonyReserveNotes
      */
-    function getNoteData(uint256 tokenId) external view tokenExists(tokenId) returns (NoteData memory data) {
+    function getNoteData(uint256 tokenId)
+        external
+        view
+        override(IColonyReserveNotes, INotesDataProvider)
+        tokenExists(tokenId)
+        returns (NoteData memory data)
+    {
         return _notes[tokenId];
     }
 
@@ -439,34 +730,49 @@ contract ColonyReserveNotes is
     /**
      * @inheritdoc IColonyReserveNotes
      */
-    function getSeriesConfig(bytes1 seriesId) external view returns (SeriesConfig memory config) {
+    function getSeriesConfig(bytes2 seriesId)
+        external
+        view
+        override(IColonyReserveNotes, INotesDataProvider)
+        returns (SeriesConfig memory config)
+    {
         return _series[seriesId];
     }
 
     /**
      * @inheritdoc IColonyReserveNotes
      */
-    function getDenominationConfig(uint8 denominationId) external view returns (DenominationConfig memory config) {
+    function getDenominationConfig(uint8 denominationId)
+        external
+        view
+        override(IColonyReserveNotes, INotesDataProvider)
+        returns (DenominationConfig memory config)
+    {
         return _denominations[denominationId];
     }
 
     /**
      * @inheritdoc IColonyReserveNotes
      */
-    function getRarityConfig(Rarity rarity) external view returns (RarityConfig memory config) {
+    function getRarityConfig(Rarity rarity)
+        external
+        view
+        override(IColonyReserveNotes, INotesDataProvider)
+        returns (RarityConfig memory config)
+    {
         return _rarityConfigs[rarity];
     }
 
     /**
      * @inheritdoc IColonyReserveNotes
      */
-    function getActiveSeriesIds() external view returns (bytes1[] memory seriesIds) {
+    function getActiveSeriesIds() external view returns (bytes2[] memory seriesIds) {
         uint256 activeCount = 0;
         for (uint256 i = 0; i < _seriesIds.length; i++) {
             if (_series[_seriesIds[i]].active) activeCount++;
         }
 
-        seriesIds = new bytes1[](activeCount);
+        seriesIds = new bytes2[](activeCount);
         uint256 index = 0;
         for (uint256 i = 0; i < _seriesIds.length; i++) {
             if (_series[_seriesIds[i]].active) {
@@ -479,7 +785,7 @@ contract ColonyReserveNotes is
      * @inheritdoc IColonyReserveNotes
      */
     function getActiveDenominationIds() external view returns (uint8[] memory denominationIds) {
-        uint256 activeCount = 0;
+                uint256 activeCount = 0;
         for (uint256 i = 0; i < _denominationIds.length; i++) {
             if (_denominations[_denominationIds[i]].active) activeCount++;
         }
@@ -493,163 +799,88 @@ contract ColonyReserveNotes is
         }
     }
 
-    /**
-     * @notice Get all series IDs
-     */
-    function getAllSeriesIds() external view returns (bytes1[] memory) {
-        return _seriesIds;
+    /// @notice Get collection configuration
+    function getCollectionConfig() external view override(INotesDataProvider) returns (CollectionConfig memory) {
+        return _collectionConfig;
     }
 
-    /**
-     * @notice Get all denomination IDs
-     */
-    function getAllDenominationIds() external view returns (uint8[] memory) {
-        return _denominationIds;
+    /// @notice Get reward system configuration
+    function getRewardConfig() external view returns (RewardConfig memory) {
+        return _rewardConfig;
     }
 
-    // ============================================
-    // METADATA (ON-CHAIN)
-    // ============================================
+    /// @notice Get tier reward value
+    function getTierRewardValue(uint256 tierId) external view returns (uint256) {
+        return tierToRewardValue[tierId];
+    }
+
+    /// @notice Get reward supply info for denomination
+    function getRewardSupplyInfo(uint8 denominationId) external view returns (uint32 limit, uint32 minted) {
+                return (rewardSupplyLimits[denominationId], rewardMintCounts[denominationId]);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // METADATA (DELEGATED TO NotesMetadataDescriptor)
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * @notice Generate token metadata URI on-chain
+     * @notice Generate token metadata URI
+     * @dev Delegates to external metadata descriptor using callback pattern
      */
     function tokenURI(uint256 tokenId)
         public
         view
-        override(ERC721Upgradeable)
+        override(ERC721Upgradeable, IColonyReserveNotes)
         tokenExists(tokenId)
         returns (string memory)
     {
-        return string(abi.encodePacked(
-            "data:application/json;base64,",
-            Base64.encode(bytes(_buildTokenJsonForId(tokenId)))
-        ));
-    }
-
-    function _buildTokenJsonForId(uint256 tokenId) internal view returns (string memory) {
-        NoteData memory note = _notes[tokenId];
-        DenominationConfig memory denomConf = _denominations[note.denominationId];
-        RarityConfig memory rarityConf = _rarityConfigs[note.rarity];
-        uint256 finalValue = (denomConf.ylwValue * rarityConf.bonusMultiplierBps) / 10000;
-        string memory serialNum = _formatSerialNumber(note);
-
-        return string(abi.encodePacked(
-            '{"name":"', collectionConfig.name, ' #', serialNum, '",',
-            '"description":"', denomConf.name, ' - ', _formatYlw(finalValue), ' YLW Note",',
-            '"image":"', _buildImageUrlForNote(note), '",',
-            '"attributes":', _buildAttributesForNote(note, finalValue, serialNum), '}'
-        ));
-    }
-
-    function _buildImageUrlForNote(NoteData memory note) internal view returns (string memory) {
-        SeriesConfig memory seriesConf = _series[note.seriesId];
-        DenominationConfig memory denomConf = _denominations[note.denominationId];
-        RarityConfig memory rarityConf = _rarityConfigs[note.rarity];
-
-        return string(abi.encodePacked(
-            seriesConf.baseImageUri,
-            denomConf.imageSubpath,
-            rarityConf.imageSuffix,
-            ".png"
-        ));
-    }
-
-    function _buildAttributesForNote(
-        NoteData memory note,
-        uint256 finalValue,
-        string memory serialNum
-    ) internal view returns (string memory) {
-        DenominationConfig memory denomConf = _denominations[note.denominationId];
-        SeriesConfig memory seriesConf = _series[note.seriesId];
-        RarityConfig memory rarityConf = _rarityConfigs[note.rarity];
-
-        return string(abi.encodePacked(
-            '[{"trait_type":"Denomination","value":"', denomConf.name, '"},',
-            '{"trait_type":"Value","value":"', _formatYlw(finalValue), ' YLW"},',
-            '{"trait_type":"Series","value":"', seriesConf.name, '"},',
-            '{"trait_type":"Rarity","value":"', rarityConf.name, '"},',
-            '{"trait_type":"Serial Number","value":"', serialNum, '"},',
-            '{"display_type":"date","trait_type":"Minted","value":', uint256(note.mintedAt).toString(), '}]'
-        ));
+        require(address(metadataDescriptor) != address(0), "Metadata descriptor not set");
+        return metadataDescriptor.tokenURI(address(this), tokenId);
     }
 
     /**
-     * @inheritdoc IColonyReserveNotes
+     * @notice Generate collection metadata URI
+     * @dev Delegates to external metadata descriptor using callback pattern
      */
-    function contractURI() external view returns (string memory uri) {
-        return string(abi.encodePacked(
-            "data:application/json;base64,",
-            Base64.encode(bytes(abi.encodePacked(
-                '{"name":"', collectionConfig.name, '",',
-                '"description":"', collectionConfig.description, '",',
-                '"image":"', collectionConfig.bannerImage, '",',
-                '"external_link":"', collectionConfig.externalLink, '",',
-                '"seller_fee_basis_points":0,',
-                '"fee_recipient":"0x0000000000000000000000000000000000000000"}'
-            )))
-        ));
+    function contractURI() external view returns (string memory) {
+        require(address(metadataDescriptor) != address(0), "Metadata descriptor not set");
+        return metadataDescriptor.contractURI(address(this));
     }
 
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
     // INTERNAL FUNCTIONS
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
 
     function _initializeDefaultRarities() internal {
-        _rarityConfigs[Rarity.Common] = RarityConfig({
-            rarity: Rarity.Common,
-            name: "Common",
-            imageSuffix: "-common",
-            weightBps: 6000,
-            bonusMultiplierBps: 10000
-        });
-        _rarityConfigs[Rarity.Uncommon] = RarityConfig({
-            rarity: Rarity.Uncommon,
-            name: "Uncommon",
-            imageSuffix: "-uncommon",
-            weightBps: 2500,
-            bonusMultiplierBps: 10000
-        });
-        _rarityConfigs[Rarity.Rare] = RarityConfig({
-            rarity: Rarity.Rare,
-            name: "Rare",
-            imageSuffix: "-rare",
-            weightBps: 1000,
-            bonusMultiplierBps: 10250
-        });
-        _rarityConfigs[Rarity.Epic] = RarityConfig({
-            rarity: Rarity.Epic,
-            name: "Epic",
-            imageSuffix: "-epic",
-            weightBps: 400,
-            bonusMultiplierBps: 10500
-        });
-        _rarityConfigs[Rarity.Legendary] = RarityConfig({
-            rarity: Rarity.Legendary,
-            name: "Legendary",
-            imageSuffix: "-legendary",
-            weightBps: 100,
-            bonusMultiplierBps: 11000
-        });
-
-        totalRarityWeight = 10000;
+        _rarityConfigs[Rarity.Common] = RarityConfig(Rarity.Common, "Common", "-common", 6000, 10000);
+        _rarityConfigs[Rarity.Uncommon] = RarityConfig(Rarity.Uncommon, "Uncommon", "-uncommon", 2500, 10000);
+        _rarityConfigs[Rarity.Rare] = RarityConfig(Rarity.Rare, "Rare", "-rare", 1000, 10250);
+        _rarityConfigs[Rarity.Epic] = RarityConfig(Rarity.Epic, "Epic", "-epic", 400, 10500);
+        _rarityConfigs[Rarity.Legendary] = RarityConfig(Rarity.Legendary, "Legendary", "-legendary", 100, 11000);
     }
 
-    function _validateMintParams(uint8 denominationId, bytes1 seriesId) internal view {
-        SeriesConfig storage seriesConf = _series[seriesId];
+    function _validateMintParams(
+        uint8 denominationId,
+        bytes2 seriesId
+    ) internal view {
+        SeriesConfig memory seriesConf = _series[seriesId];
         if (seriesConf.seriesId == 0) revert SeriesNotFound(seriesId);
         if (!seriesConf.active) revert SeriesNotActive(seriesId);
+
+        // Check series timing
+        if (seriesConf.startTime > 0 && block.timestamp < seriesConf.startTime) {
+            revert SeriesNotActive(seriesId);
+        }
+        if (seriesConf.endTime > 0 && block.timestamp > seriesConf.endTime) {
+            revert SeriesNotActive(seriesId);
+        }
+
+        // Check series max supply
         if (seriesConf.maxSupply > 0 && seriesConf.mintedCount >= seriesConf.maxSupply) {
             revert SeriesMaxSupplyReached(seriesId);
         }
-        if (seriesConf.startTime > 0 && block.timestamp < seriesConf.startTime) {
-            revert SeriesNotStarted(seriesId);
-        }
-        if (seriesConf.endTime > 0 && block.timestamp > seriesConf.endTime) {
-            revert SeriesEnded(seriesId);
-        }
 
-        DenominationConfig storage denomConf = _denominations[denominationId];
+        DenominationConfig memory denomConf = _denominations[denominationId];
         if (bytes(denomConf.name).length == 0) revert DenominationNotFound(denominationId);
         if (!denomConf.active) revert DenominationNotActive(denominationId);
     }
@@ -657,14 +888,16 @@ contract ColonyReserveNotes is
     function _mintNote(
         address to,
         uint8 denominationId,
-        bytes1 seriesId,
+        bytes2 seriesId,
         Rarity rarity
     ) internal returns (uint256 tokenId) {
         tokenId = _nextTokenId++;
 
-        // Increment counters
+        // Increment serial counter and apply denomination offset for global serial
+        uint32 serialNumber = _denominations[denominationId].serialOffset + ++serialCounters[seriesId][denominationId];
+
+        // Increment series minted count
         _series[seriesId].mintedCount++;
-        uint32 serialNumber = ++serialCounters[seriesId][denominationId];
 
         // Store note data
         _notes[tokenId] = NoteData({
@@ -678,6 +911,36 @@ contract ColonyReserveNotes is
         _safeMint(to, tokenId);
 
         emit NoteMinted(tokenId, to, denominationId, seriesId, rarity, serialNumber);
+
+        return tokenId;
+    }
+
+    function _calculateNoteValue(
+        NoteData memory note
+    ) internal view returns (uint256) {
+        uint256 baseValue = _denominations[note.denominationId].ylwValue;
+        uint16 bonusMultiplier = _rarityConfigs[note.rarity].bonusMultiplierBps;
+        return (baseValue * bonusMultiplier) / 10000;
+    }
+
+    function _sendYlwWithFallback(
+        address recipient,
+        uint256 amount
+    ) internal {
+        address ylw = _collectionConfig.ylwToken;
+        address treasuryAddr = _collectionConfig.treasury;
+
+        uint256 treasuryBalance = IERC20(ylw).balanceOf(treasuryAddr);
+
+        if (treasuryBalance >= amount) {
+            IERC20(ylw).safeTransferFrom(treasuryAddr, recipient, amount);
+        } else {
+            if (treasuryBalance > 0) {
+                IERC20(ylw).safeTransferFrom(treasuryAddr, recipient, treasuryBalance);
+            }
+            uint256 shortfall = amount - treasuryBalance;
+            IYellowToken(ylw).mint(recipient, shortfall, "note_redeem");
+        }
     }
 
     function _selectRarity(uint256 seed) internal view returns (Rarity) {
@@ -699,73 +962,140 @@ contract ColonyReserveNotes is
             block.timestamp,
             block.prevrandao,
             to,
-            tokenId,
-            _nextTokenId,
-            blockhash(block.number - 1)
+            tokenId
         )));
     }
 
-    function _calculateNoteValue(NoteData memory note) internal view returns (uint256) {
-        DenominationConfig memory denomConf = _denominations[note.denominationId];
-        RarityConfig memory rarityConf = _rarityConfigs[note.rarity];
-        return (denomConf.ylwValue * rarityConf.bonusMultiplierBps) / 10000;
+    /**
+     * @notice Rebuild sorted denomination IDs array (descending by value)
+     * @dev Called only during configuration, not at runtime
+     */
+    function _rebuildSortedDenominations() internal {
+        uint256 numDenoms = _denominationIds.length;
+
+        // Clear and rebuild
+        delete _sortedDenomIdsByValue;
+
+        // Copy to memory for sorting
+        uint8[] memory tempIds = new uint8[](numDenoms);
+        uint256[] memory tempValues = new uint256[](numDenoms);
+
+        for (uint256 i = 0; i < numDenoms; i++) {
+            tempIds[i] = _denominationIds[i];
+            tempValues[i] = _denominations[_denominationIds[i]].ylwValue;
+        }
+
+        // Bubble sort descending by value
+        for (uint256 i = 0; i < numDenoms; i++) {
+            for (uint256 j = i + 1; j < numDenoms; j++) {
+                if (tempValues[j] > tempValues[i]) {
+                    (tempValues[i], tempValues[j]) = (tempValues[j], tempValues[i]);
+                    (tempIds[i], tempIds[j]) = (tempIds[j], tempIds[i]);
+                }
+            }
+        }
+
+        // Store sorted IDs
+        for (uint256 i = 0; i < numDenoms; i++) {
+            _sortedDenomIdsByValue.push(tempIds[i]);
+        }
     }
 
-    function _sendYlwWithFallback(address recipient, uint256 amount) internal {
-        uint256 treasuryBalance = IERC20(ylwToken).balanceOf(treasury);
+    /**
+     * @notice Decompose reward value into optimal banknote denominations
+     * @dev Greedy algorithm using pre-sorted denominations (largest first)
+     */
+    function _decomposeToNotes(
+        uint256 rewardValue
+    ) internal view returns (uint8[] memory denomIds, uint32[] memory counts) {
+        uint256 numDenoms = _sortedDenomIdsByValue.length;
 
-        if (treasuryBalance >= amount) {
-            IERC20(ylwToken).safeTransferFrom(treasury, recipient, amount);
-        } else {
-            if (treasuryBalance > 0) {
-                IERC20(ylwToken).safeTransferFrom(treasury, recipient, treasuryBalance);
+        // Greedy decomposition using pre-sorted array
+        uint256 remaining = rewardValue;
+        uint32[] memory tempCounts = new uint32[](numDenoms);
+
+        for (uint256 i = 0; i < numDenoms && remaining > 0; i++) {
+            uint8 denomId = _sortedDenomIdsByValue[i];
+            DenominationConfig memory denom = _denominations[denomId];
+
+            if (denom.ylwValue == 0 || !denom.active) continue;
+
+            uint32 count = uint32(remaining / denom.ylwValue);
+            if (count > 0) {
+                // Check supply limit
+                uint32 limit = rewardSupplyLimits[denomId];
+                if (limit > 0) {
+                    uint32 minted = rewardMintCounts[denomId];
+                    uint32 available = minted >= limit ? 0 : limit - minted;
+                    if (count > available) {
+                        count = available;
+                    }
+                }
+
+                tempCounts[i] = count;
+                remaining -= uint256(count) * denom.ylwValue;
             }
-            uint256 shortfall = amount - treasuryBalance;
-            IYellowToken(ylwToken).mint(recipient, shortfall, "note_redeem");
         }
+
+        // If we couldn't fully decompose, revert
+        if (remaining > 0) revert CannotDecomposeReward(rewardValue);
+
+        // Count non-zero entries
+        uint256 nonZeroCount = 0;
+        for (uint256 i = 0; i < numDenoms; i++) {
+            if (tempCounts[i] > 0) nonZeroCount++;
+        }
+
+        // Build result arrays
+        denomIds = new uint8[](nonZeroCount);
+        counts = new uint32[](nonZeroCount);
+        uint256 idx = 0;
+        for (uint256 i = 0; i < numDenoms; i++) {
+            if (tempCounts[i] > 0) {
+                denomIds[idx] = _sortedDenomIdsByValue[i];
+                counts[idx] = tempCounts[i];
+                idx++;
+            }
+        }
+
+        return (denomIds, counts);
     }
 
     function _formatSerialNumber(NoteData memory note) internal view returns (string memory) {
-        DenominationConfig memory denomConf = _denominations[note.denominationId];
-
         return string(abi.encodePacked(
-            collectionConfig.symbol,
+            "HCRN-",
+            _bytes2ToString(note.seriesId),
             "-",
-            string(abi.encodePacked(note.seriesId)),
+            _denominations[note.denominationId].imageSubpath,
             "-",
-            denomConf.imageSubpath,
-            "-",
-            _padNumber(note.serialNumber, 6)
+            _padSerialNumber(note.serialNumber)
         ));
     }
 
-    function _padNumber(uint32 num, uint8 length) internal pure returns (string memory) {
-        bytes memory numStr = bytes(uint256(num).toString());
-        if (numStr.length >= length) return string(numStr);
-
-        bytes memory padded = new bytes(length);
-        uint8 padLength = length - uint8(numStr.length);
-
-        for (uint8 i = 0; i < padLength; i++) {
-            padded[i] = "0";
-        }
-        for (uint8 i = 0; i < numStr.length; i++) {
-            padded[padLength + i] = numStr[i];
-        }
-
-        return string(padded);
+    /**
+     * @notice Convert bytes2 to string (e.g., 0x4141 -> "AA")
+     */
+    function _bytes2ToString(bytes2 b) internal pure returns (string memory) {
+        bytes memory result = new bytes(2);
+        result[0] = b[0];
+        result[1] = b[1];
+        return string(result);
     }
 
-    function _formatYlw(uint256 amount) internal pure returns (string memory) {
-        uint256 whole = amount / 1e18;
-        return whole.toString();
+    function _padSerialNumber(uint32 serial) internal pure returns (string memory) {
+        bytes memory buffer = new bytes(6);
+        for (uint256 i = 6; i > 0; i--) {
+            buffer[i - 1] = bytes1(uint8(48 + serial % 10));
+            serial /= 10;
+        }
+        return string(buffer);
     }
 
-    // ============================================
-    // OVERRIDES
-    // ============================================
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REQUIRED OVERRIDES
+    // ═══════════════════════════════════════════════════════════════════════════
 
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(ADMIN_ROLE) {}
 
     function _update(address to, uint256 tokenId, address auth)
         internal
@@ -785,7 +1115,7 @@ contract ColonyReserveNotes is
     function supportsInterface(bytes4 interfaceId)
         public
         view
-        override(ERC721Upgradeable, ERC721EnumerableUpgradeable)
+        override(ERC721Upgradeable, ERC721EnumerableUpgradeable, AccessControlUpgradeable)
         returns (bool)
     {
         return super.supportsInterface(interfaceId);

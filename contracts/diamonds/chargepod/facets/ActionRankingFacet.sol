@@ -3,11 +3,11 @@ pragma solidity ^0.8.27;
 
 import {LibGamingStorage} from "../libraries/LibGamingStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {RankingConfig, RankingEntry, TopPlayersRanking, UserEngagement, DailyChallengeSet, AchievementProgress} from "../../../libraries/GamingModel.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {RankingConfig, RankingEntry, TopPlayersRanking, UserEngagement, DailyChallengeSet, AchievementProgress} from "../../libraries/GamingModel.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {LibAchievementStorage} from "../libraries/LibAchievementStorage.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
 
 /**
  * @title ActionRankingFacet - Complete Fixed & Optimized Production Version
@@ -58,7 +58,7 @@ contract ActionRankingFacet is AccessControlBase {
         uint256 startTime,
         uint256 endTime,
         uint256 qualificationThreshold
-    ) public onlyAuthorized whenNotPaused returns (uint256 rankingId) {
+    ) public onlyAuthorized returns (uint256 rankingId) {
         LibGamingStorage.GamingStorage storage gs = LibGamingStorage.gamingStorage();
         
         if (rankingType == 0 || rankingType > 6) revert InvalidRankingType(rankingType);
@@ -254,12 +254,21 @@ contract ActionRankingFacet is AccessControlBase {
         if (!AccessHelper.isInternalCall() && !AccessHelper.isAuthorized()) {
             revert UnauthorizedAccess(msg.sender);
         }
-        
+
         LibGamingStorage.GamingStorage storage gs = LibGamingStorage.gamingStorage();
-        
-        if (!gs.rankingConfigs[rankingId].active || scoreIncrease == 0) return;
-        if (scoreIncrease > 1000) revert InvalidScoreIncrease(scoreIncrease);
-        
+
+        // Auto-initialize global ranking if needed
+        if (rankingId == 0 || !gs.rankingConfigs[rankingId].active) {
+            if (gs.currentGlobalRankingId == 0) {
+                // This shouldn't happen, but fallback safely
+                return;
+            }
+            rankingId = gs.currentGlobalRankingId;
+        }
+
+        if (scoreIncrease == 0) return;
+        if (scoreIncrease > 10000) revert InvalidScoreIncrease(scoreIncrease);
+
         // Add user to participants tracking if new
         if (!gs.userInRanking[rankingId][user]) {
             gs.rankingParticipants[rankingId].push(user);
@@ -268,15 +277,15 @@ contract ActionRankingFacet is AccessControlBase {
                 ++gs.rankingParticipantCount[rankingId];
             }
         }
-        
+
         _updateSingleUserScoreFixed(rankingId, user, scoreIncrease);
-        
+
         // Update achievement cache for significant score increases
         if (scoreIncrease >= 100) {
             UserEngagement storage engagement = gs.userEngagement[user];
             DailyChallengeSet storage challenges = gs.dailyChallenges[user];
             uint256 socialScore = gs.userSocialScore[user];
-            
+
             LibAchievementStorage.updateReadyAchievementsCache(
                 user,
                 engagement,
@@ -285,20 +294,24 @@ contract ActionRankingFacet is AccessControlBase {
                 challenges
             );
         }
-        
+
         emit UserScoreUpdated(rankingId, user, gs.rankings[rankingId][user].score, scoreIncrease);
     }
 
     /**
      * @notice Rebuild cache from tracked participants
      */
-    function rebuildTopPlayersCache(uint256 rankingId) public onlyAuthorized {
+    function rebuildTopPlayersCache(uint256 rankingId) public {
+        if (!AccessHelper.isAuthorized() && !AccessHelper.isInternalCall()) {
+            revert UnauthorizedAccess(msg.sender);
+        }
+
         LibGamingStorage.GamingStorage storage gs = LibGamingStorage.gamingStorage();
-        
+
         if (!gs.rankingConfigs[rankingId].active) {
             revert RankingNotFound(rankingId);
         }
-        
+
         uint256 playerCount = _rebuildCacheFromParticipantsFixed(rankingId);
         emit RankingCacheRebuilt(rankingId, playerCount);
     }
@@ -354,8 +367,8 @@ contract ActionRankingFacet is AccessControlBase {
         return gs.rankingParticipantCount[rankingId];
     }
 
-    function getRankingParticipants(uint256 rankingId, uint256 offset, uint256 limit) 
-        external view onlyAuthorized returns (
+    function getRankingParticipants(uint256 rankingId, uint256 offset, uint256 limit)
+        external view returns (
             address[] memory participants,
             uint256 totalCount
         ) {
@@ -437,6 +450,7 @@ contract ActionRankingFacet is AccessControlBase {
 
     /**
      * @notice Get season leaderboard with no duplicates
+     * @dev Falls back to global ranking if no season ranking exists
      */
     function getSeasonLeaderboard(uint256 limit) external view returns (
         address[] memory players,
@@ -445,31 +459,40 @@ contract ActionRankingFacet is AccessControlBase {
         uint256 totalParticipants
     ) {
         LibGamingStorage.GamingStorage storage gs = LibGamingStorage.gamingStorage();
-        
+
+        // Try season ranking first
         uint256 seasonRankingId = gs.currentSeasonRankingId;
+
+        // Fallback to global ranking if no season ranking
+        if (seasonRankingId == 0 || !gs.rankingConfigs[seasonRankingId].active) {
+            seasonRankingId = gs.currentGlobalRankingId;
+        }
+
+        // If still no ranking, return empty
         if (seasonRankingId == 0) {
             return (new address[](0), new uint32[](0), new uint256[](0), 0);
         }
-        
-        (address[] memory topPlayers, uint128[] memory topScores, uint256 total) = 
+
+        (address[] memory topPlayers, uint128[] memory topScores, uint256 total) =
             getTopPlayers(seasonRankingId, limit);
-        
+
         uint256 resultCount = topPlayers.length;
         points = new uint32[](resultCount);
         ranks = new uint256[](resultCount);
-        
+
         unchecked {
             for (uint256 i = 0; i < resultCount; ++i) {
                 points[i] = uint32(topScores[i]);
                 ranks[i] = i + 1;
             }
         }
-        
+
         return (topPlayers, points, ranks, total);
     }
 
     /**
      * @notice Get user season ranking with accurate rank calculation
+     * @dev Falls back to global ranking if no season ranking exists
      */
     function getUserSeasonRanking(address user) external view returns (
         uint256 rank,
@@ -478,21 +501,32 @@ contract ActionRankingFacet is AccessControlBase {
     ) {
         LibGamingStorage.GamingStorage storage gs = LibGamingStorage.gamingStorage();
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
-        
+
         points = hs.operatorSeasonPoints[user][hs.seasonCounter];
-        
+
+        // Try season ranking first, fallback to global
         uint256 seasonRankingId = gs.currentSeasonRankingId;
-        if (points == 0 || seasonRankingId == 0) {
+        if (seasonRankingId == 0 || !gs.rankingConfigs[seasonRankingId].active) {
+            seasonRankingId = gs.currentGlobalRankingId;
+        }
+
+        if (seasonRankingId == 0) {
             return (0, points, 0);
         }
-        
+
         RankingEntry storage entry = gs.rankings[seasonRankingId][user];
+
+        // Use stored score as points if season points are 0
+        if (points == 0 && entry.score > 0) {
+            points = uint32(entry.score);
+        }
+
         rank = entry.rank;
-        
+
         // More thorough rank finding
-        if (rank == 0) {
+        if (rank == 0 && entry.score > 0) {
             TopPlayersRanking storage cache = gs.topPlayersCache[seasonRankingId];
-            
+
             unchecked {
                 for (uint256 i = 0; i < 100; ++i) {
                     if (cache.topPlayers[i] == user) {
@@ -501,17 +535,17 @@ contract ActionRankingFacet is AccessControlBase {
                     }
                 }
             }
-            
+
             if (rank == 0) {
                 rank = _estimateUserRank(seasonRankingId, entry.score);
             }
         }
-        
+
         uint256 totalParticipants = gs.rankingParticipantCount[seasonRankingId];
         if (totalParticipants > 0 && rank > 0) {
             percentile = ((totalParticipants - rank + 1) * 100) / totalParticipants;
         }
-        
+
         return (rank, points, percentile);
     }
 
@@ -687,7 +721,7 @@ contract ActionRankingFacet is AccessControlBase {
         uint8[] memory types
     ) {
         LibGamingStorage.GamingStorage storage gs = LibGamingStorage.gamingStorage();
-        
+
         uint256 activeCount = 0;
         unchecked {
             for (uint256 i = 1; i <= gs.rankingConfigCounter && activeCount < limit; ++i) {
@@ -696,11 +730,11 @@ contract ActionRankingFacet is AccessControlBase {
                 }
             }
         }
-        
+
         rankingIds = new uint256[](activeCount);
         names = new string[](activeCount);
         types = new uint8[](activeCount);
-        
+
         uint256 index = 0;
         unchecked {
             for (uint256 i = 1; i <= gs.rankingConfigCounter && index < activeCount; ++i) {
@@ -712,6 +746,29 @@ contract ActionRankingFacet is AccessControlBase {
                 }
             }
         }
+    }
+
+    /**
+     * @notice Diagnostic function to check ranking system state
+     */
+    function getRankingDiagnostics(uint256 rankingId) external view returns (
+        bool exists,
+        bool isActive,
+        uint256 participantCount,
+        uint256 cachePlayerCount,
+        uint256 configCounter,
+        uint256 globalRankingId,
+        uint256 seasonRankingId
+    ) {
+        LibGamingStorage.GamingStorage storage gs = LibGamingStorage.gamingStorage();
+
+        exists = gs.rankingConfigs[rankingId].startTime > 0;
+        isActive = gs.rankingConfigs[rankingId].active;
+        participantCount = gs.rankingParticipantCount[rankingId];
+        cachePlayerCount = gs.topPlayersCache[rankingId].totalPlayers;
+        configCounter = gs.rankingConfigCounter;
+        globalRankingId = gs.currentGlobalRankingId;
+        seasonRankingId = gs.currentSeasonRankingId;
     }
 
     function trackAchievementEarned(address user, uint256 achievementId) external {

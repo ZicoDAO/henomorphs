@@ -4,12 +4,12 @@ pragma solidity ^0.8.27;
 import {LibMissionStorage} from "../libraries/LibMissionStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
-import {PodsUtils} from "../../../libraries/PodsUtils.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
-import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
-import {ControlFee, SpecimenCollection, PowerMatrix} from "../../../libraries/HenomorphsModel.sol";
+import {PodsUtils} from "../../libraries/PodsUtils.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {ColonyHelper} from "../libraries/ColonyHelper.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {ControlFee, SpecimenCollection, PowerMatrix} from "../../libraries/HenomorphsModel.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -1348,6 +1348,13 @@ contract MissionFacet is AccessControlBase {
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
         LibMissionStorage.PackedObjectives storage objectives = ms.sessionObjectives[sessionId];
 
+        // If templates are configured, use template-based generation
+        if (config.objectiveTemplateCount > 0) {
+            _generateObjectivesFromTemplates(sessionId, entropy, config, objectives);
+            return;
+        }
+
+        // Legacy generation (backward compatibility)
         uint8 totalObjectives = config.requiredObjectivesCount + config.bonusObjectivesCount;
 
         for (uint8 i = 0; i < totalObjectives; i++) {
@@ -1384,6 +1391,47 @@ contract MissionFacet is AccessControlBase {
             });
 
             LibMissionStorage.setObjective(objectives, i, obj);
+        }
+    }
+
+    /**
+     * @notice Generate objectives from configured templates
+     * @dev Uses ObjectiveTemplate array to create mission objectives with randomized targets
+     */
+    function _generateObjectivesFromTemplates(
+        bytes32 sessionId,
+        bytes32 entropy,
+        LibMissionStorage.MissionVariantConfig storage config,
+        LibMissionStorage.PackedObjectives storage objectives
+    ) internal {
+        uint8 objectiveIndex = 0;
+
+        for (uint8 i = 0; i < config.objectiveTemplateCount && objectiveIndex < LibMissionStorage.MAX_OBJECTIVES; i++) {
+            LibMissionStorage.ObjectiveTemplate storage template = config.objectiveTemplates[i];
+
+            // Skip disabled templates
+            if (!template.enabled) continue;
+
+            uint256 objEntropy = uint256(keccak256(abi.encodePacked(entropy, "obj_tmpl", i)));
+
+            // Randomize target within configured range
+            uint8 target = template.minTarget;
+            if (template.maxTarget > template.minTarget) {
+                target += uint8(objEntropy % (template.maxTarget - template.minTarget + 1));
+            }
+
+            LibMissionStorage.MissionObjective memory obj = LibMissionStorage.MissionObjective({
+                objectiveId: objectiveIndex,
+                objectiveType: template.objectiveType,
+                targetAmount: target,
+                currentProgress: 0,
+                isRequired: template.isRequired,
+                isCompleted: false,
+                bonusRewardPercent: template.bonusRewardBps
+            });
+
+            LibMissionStorage.setObjective(objectives, objectiveIndex, obj);
+            objectiveIndex++;
         }
     }
 
@@ -1480,6 +1528,8 @@ contract MissionFacet is AccessControlBase {
             result = _processStealthAction(sessionId, state, currentNode);
         } else if (action.actionType == LibMissionStorage.MissionActionType.Hack) {
             result = _processHackAction(sessionId, state, currentNode);
+        } else if (action.actionType == LibMissionStorage.MissionActionType.Rest) {
+            result = _processRestAction(sessionId, state, participant);
         }
     }
 
@@ -1505,6 +1555,8 @@ contract MissionFacet is AccessControlBase {
             return LibMissionStorage.CHARGE_STEALTH;
         } else if (actionType == LibMissionStorage.MissionActionType.Hack) {
             return LibMissionStorage.CHARGE_HACK;
+        } else if (actionType == LibMissionStorage.MissionActionType.Rest) {
+            return 0; // Rest doesn't cost charge, it restores it
         }
         return 0;
     }
@@ -1716,6 +1768,64 @@ contract MissionFacet is AccessControlBase {
         } else {
             result.success = false;
         }
+    }
+
+    /**
+     * @notice Process Rest action - restore charge to a participant
+     * @dev Limited uses per mission, configurable via variant config
+     * @param sessionId Mission session ID
+     * @param state Packed mission state
+     * @param participant Participant performing the rest action
+     * @return result Action result with success status
+     */
+    function _processRestAction(
+        bytes32 sessionId,
+        LibMissionStorage.PackedMissionState storage state,
+        LibMissionStorage.PackedParticipant storage participant
+    ) internal returns (LibMissionStorage.ActionResult memory result) {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        LibMissionStorage.MissionVariantConfig storage config = ms.variantConfigs[state.passCollectionId][state.missionVariant];
+
+        // Check if Rest is enabled for this variant
+        if (config.maxRestUsesPerMission == 0) {
+            result.success = false;
+            return result;
+        }
+
+        // Track rest uses in flags (bits 4-7 for rest counter)
+        uint8 restUsed = (state.flags >> 4) & 0x0F;
+        if (restUsed >= config.maxRestUsesPerMission) {
+            result.success = false;
+            return result;
+        }
+
+        // Calculate charge to restore
+        uint8 restoreAmount = config.restChargeRestore > 0
+            ? config.restChargeRestore
+            : LibMissionStorage.CHARGE_REST_DEFAULT;
+
+        // Restore charge (capped at initial charge)
+        uint32 newCharge = participant.currentCharge + restoreAmount;
+        if (newCharge > participant.initialCharge) {
+            newCharge = participant.initialCharge;
+        }
+        uint8 actualRestored = uint8(newCharge - participant.currentCharge);
+        participant.currentCharge = newCharge;
+
+        // Also update PowerMatrix in main storage
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+        PowerMatrix storage charge = hs.performedCharges[uint256(participant.combinedId)];
+        uint256 newPowerCharge = uint256(charge.currentCharge) + uint256(actualRestored);
+        if (newPowerCharge > uint256(charge.maxCharge)) {
+            newPowerCharge = uint256(charge.maxCharge);
+        }
+        charge.currentCharge = uint128(newPowerCharge);
+
+        // Increment rest counter in flags
+        state.flags = (state.flags & 0x0F) | ((restUsed + 1) << 4);
+
+        result.success = true;
+        result.chargeUsed = 0; // Rest doesn't consume charge
     }
 
     function _shouldTriggerEvent(

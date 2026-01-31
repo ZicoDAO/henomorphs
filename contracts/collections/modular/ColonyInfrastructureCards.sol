@@ -9,10 +9,10 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {ModularSpecimen} from "../../diamonds/modular/base/ModularSpecimen.sol";
-import {ICollectionDiamond} from "../../diamonds/modular/interfaces/ICollectionDiamond.sol";
-import {InfrastructureSVGLib} from "../../diamonds/modular/libraries/InfrastructureSVGLib.sol";
-import {InfrastructureMetadataLib} from "../../diamonds/modular/libraries/InfrastructureMetadataLib.sol";
+import {ModularMerit} from "../base/ModularMerit.sol";
+import {IMeritCollection} from "../interfaces/IMeritCollection.sol";
+import {InfrastructureSVGLib} from "../libraries/InfrastructureSVGLib.sol";
+import {IInfrastructureDescriptor} from "./interfaces/IInfrastructureDescriptor.sol";
 
 /**
  * @title ColonyInfrastructureCards
@@ -41,22 +41,24 @@ contract ColonyInfrastructureCards is
     ReentrancyGuardUpgradeable,
     PausableUpgradeable,
     UUPSUpgradeable,
-    ModularSpecimen
+    ModularMerit,
+    IMeritCollection
 {
     using InfrastructureSVGLib for InfrastructureSVGLib.InfrastructureTraits;
-    using InfrastructureMetadataLib for InfrastructureSVGLib.InfrastructureTraits;
 
-    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
-    bytes32 public constant COLONY_WARS_ROLE = keccak256("COLONY_WARS_ROLE");
-    bytes32 public constant DIAMOND_ROLE = keccak256("DIAMOND_ROLE");
+    // Role definitions inherited from ModularMerit:
+    // ADMIN_ROLE, MINTER_ROLE, COLONY_WARS_ROLE, DIAMOND_ROLE
 
     mapping(uint256 => InfrastructureSVGLib.InfrastructureTraits) private _infrastructureTraits;
     mapping(uint256 => uint256) private _equippedToColony;
     mapping(uint256 => bool) private _isEquipped;
     mapping(uint256 => uint256) private _lastUsedTimestamp;
+
+    // ==================== CONDITIONAL TRANSFER STORAGE ====================
+    // This mapping MUST remain at this exact storage slot for upgrade compatibility
+    // ModularMerit uses virtual _getApprovedTarget/_setApprovedTarget to access it
     mapping(uint256 => address) private _approvedTransferTarget;
-    
+
     uint256 private _tokenIdCounter;
     uint256 public maxSupply;
     string private _contractUri;
@@ -65,30 +67,31 @@ contract ColonyInfrastructureCards is
     mapping(InfrastructureSVGLib.InfrastructureType => uint256) public typeMaxSupply;
     mapping(InfrastructureSVGLib.InfrastructureType => uint256) public typeMinted;
 
+    // NEW STORAGE - appended at end for upgrade compatibility
+    IInfrastructureDescriptor public metadataRenderer;
+
     event InfrastructureMinted(
-        uint256 indexed tokenId, 
-        address indexed recipient, 
-        InfrastructureSVGLib.InfrastructureType infraType, 
+        uint256 indexed tokenId,
+        address indexed recipient,
+        InfrastructureSVGLib.InfrastructureType infraType,
         InfrastructureSVGLib.Rarity rarity
     );
     event InfrastructureEquipped(uint256 indexed tokenId, uint256 indexed colonyId);
     event InfrastructureUnequipped(uint256 indexed tokenId, uint256 indexed colonyId);
     event InfrastructureUsed(uint256 indexed tokenId, uint256 indexed colonyId);
     event InfrastructureRepaired(uint256 indexed tokenId, uint8 durabilityRestored, uint256 costPaid);
-    event TransferRequested(uint256 indexed tokenId, address indexed from, address indexed to);
-    event TransferApproved(uint256 indexed tokenId, address indexed to);
-    event TransferRejected(uint256 indexed tokenId, address indexed to, string reason);
+    // TransferRequested, TransferApproved, TransferRejected inherited from ModularMerit
 
     error MaxSupplyReached();
     error TypeMaxSupplyReached();
+    error InvalidMaxSupply();
     error InvalidInfrastructureType();
     error InvalidRarity();
     error InfrastructureAlreadyEquipped();
     error InfrastructureNotEquipped();
     error CannotEquipToZeroColony();
     error InsufficientDurability();
-    error TransferNotApproved();
-    error NotTokenOwner();
+    // TransferNotApproved, NotTokenOwner inherited from ModularMerit
     error CannotTransferWhileEquipped();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -109,7 +112,7 @@ contract ColonyInfrastructureCards is
         __ReentrancyGuard_init();
         __Pausable_init();
         __UUPSUpgradeable_init();
-        __ModularSpecimen_init(diamondAddress, collectionId_, 1, 1);
+        __ModularMerit_init(diamondAddress, collectionId_);
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
@@ -138,7 +141,7 @@ contract ColonyInfrastructureCards is
         if (_tokenIdCounter >= maxSupply) revert MaxSupplyReached();
         if (typeMinted[infraType] >= typeMaxSupply[infraType]) revert TypeMaxSupplyReached();
         if (uint8(infraType) > 5) revert InvalidInfrastructureType();
-        if (uint8(rarity) > 3) revert InvalidRarity();
+        if (uint8(rarity) > 4) revert InvalidRarity();
 
         uint256 tokenId = ++_tokenIdCounter;
         typeMinted[infraType]++;
@@ -213,11 +216,8 @@ contract ColonyInfrastructureCards is
         
         if (traits.durability == 0) revert InsufficientDurability();
         
-        // Degrade durability
-        uint8 degradation = InfrastructureMetadataLib.calculateDegradation(
-            traits.durability,
-            traits.rarity
-        );
+        // Degrade durability (higher rarity = less degradation)
+        uint8 degradation = _calculateDegradation(traits.rarity);
         
         if (traits.durability > degradation) {
             traits.durability -= degradation;
@@ -248,57 +248,35 @@ contract ColonyInfrastructureCards is
             actualRestore = 100 - traits.durability;
         }
         
-        cost = InfrastructureMetadataLib.calculateRepairCost(actualRestore, traits.rarity);
+        cost = _calculateRepairCost(actualRestore, traits.rarity);
         traits.durability += actualRestore;
         
         emit InfrastructureRepaired(tokenId, actualRestore, cost);
     }
 
-    // ============ CONDITIONAL TRANSFER (Model D) ============
-    function approveTransfer(uint256 tokenId) 
-        external 
-        onlyRole(COLONY_WARS_ROLE) 
-    {
-        address approvedTarget = _approvedTransferTarget[tokenId];
-        require(approvedTarget != address(0), "No transfer requested");
-        
-        emit TransferApproved(tokenId, approvedTarget);
-    }
-
-    function rejectTransfer(uint256 tokenId, string calldata reason)  
-        external 
-        onlyRole(COLONY_WARS_ROLE) 
-    {
-        address approvedTarget = _approvedTransferTarget[tokenId];
-        require(approvedTarget != address(0), "No transfer requested");
-        
-        delete _approvedTransferTarget[tokenId];
-        emit TransferRejected(tokenId, approvedTarget, reason);
-    }
-
-    function completeTransfer(uint256 tokenId) external nonReentrant {
-        address approvedTarget = _approvedTransferTarget[tokenId];
-        if (approvedTarget != msg.sender) revert TransferNotApproved();
-        
-        address from = ownerOf(tokenId);
-        delete _approvedTransferTarget[tokenId];
-        
-        _transfer(from, msg.sender, tokenId);
-    }
-
     // ============ VIEW FUNCTIONS ============
 
-    function tokenURI(uint256 tokenId) 
-        public 
-        view 
-        override 
-        returns (string memory) 
+    function tokenURI(uint256 tokenId)
+        public
+        view
+        override
+        returns (string memory)
     {
         _requireOwned(tokenId);
-        return InfrastructureMetadataLib.generateTokenURI(
-            tokenId,
-            _infrastructureTraits[tokenId]
-        );
+        require(address(metadataRenderer) != address(0), "Metadata renderer not set");
+
+        InfrastructureSVGLib.InfrastructureTraits memory traits = _infrastructureTraits[tokenId];
+        return metadataRenderer.tokenURI(IInfrastructureDescriptor.InfrastructureMetadata({
+            tokenId: tokenId,
+            infraType: traits.infraType,
+            rarity: traits.rarity,
+            efficiencyBonus: traits.efficiencyBonus,
+            capacityBonus: traits.capacityBonus,
+            techLevel: traits.techLevel,
+            durability: traits.durability,
+            isEquipped: _isEquipped[tokenId],
+            equippedToColony: _equippedToColony[tokenId]
+        }));
     }
 
     function contractURI() public view returns (string memory) {
@@ -324,73 +302,70 @@ contract ColonyInfrastructureCards is
 
     function getTotalEfficiency(uint256 tokenId) external view returns (uint256) {
         InfrastructureSVGLib.InfrastructureTraits memory traits = _infrastructureTraits[tokenId];
-        return InfrastructureMetadataLib.calculateTotalEfficiency(
-            traits.efficiencyBonus,
-            traits.rarity
-        );
+        return _calculateTotalEfficiency(traits.efficiencyBonus, traits.rarity);
     }
 
     function getRepairCost(uint256 tokenId) external view returns (uint256) {
         InfrastructureSVGLib.InfrastructureTraits memory traits = _infrastructureTraits[tokenId];
         uint8 durabilityLost = 100 - traits.durability;
-        return InfrastructureMetadataLib.calculateRepairCost(durabilityLost, traits.rarity);
+        return _calculateRepairCost(durabilityLost, traits.rarity);
     }
 
-    // ============ TRANSFER FUNCTIONS (Model D: Conditional Transfer) ============
+    // ============ TRANSFER FUNCTIONS (Model D via ModularMerit) ============
 
-    /**
-     * @notice Request transfer approval from COLONY_WARS_ROLE (for staking)
-     * @param tokenId Token to request transfer for
-     * @param to Target address for transfer
-     */
-    function requestTransfer(uint256 tokenId, address to) 
-        external 
-    {
-        if (ownerOf(tokenId) != msg.sender) revert NotTokenOwner();
-        if (_isEquipped[tokenId]) revert CannotTransferWhileEquipped();
-        
-        _approvedTransferTarget[tokenId] = to;
-        emit TransferRequested(tokenId, msg.sender, to);
+    function requestTransfer(uint256 tokenId, address to) external {
+        _requestTransfer(tokenId, to);
     }
 
-    /**
-     * @notice Approve transfer (called by MultiCollectionStakingFacet)
-     * @param tokenId Token to approve
-     * @param to Target address
-     */
-    function approveTransfer(uint256 tokenId, address to) 
-        external 
+    function approveTransfer(uint256 tokenId, address to)
+        external
         onlyRole(COLONY_WARS_ROLE)
     {
-        if (_approvedTransferTarget[tokenId] != to) revert TransferNotApproved();
-        emit TransferApproved(tokenId, to);
+        _approveTransfer(tokenId, to);
     }
 
-    /**
-     * @notice Complete transfer after approval
-     * @param from Source address
-     * @param to Destination address
-     * @param tokenId Token to transfer
-     */
-    function completeTransfer(
-        address from,
-        address to,
-        uint256 tokenId
-    ) external onlyRole(COLONY_WARS_ROLE) {
-        if (_approvedTransferTarget[tokenId] != to) revert TransferNotApproved();
-        if (_isEquipped[tokenId]) revert CannotTransferWhileEquipped();
-        
-        delete _approvedTransferTarget[tokenId];
-        _transfer(from, to, tokenId);
+    function completeTransfer(address from, address to, uint256 tokenId)
+        external
+        onlyRole(COLONY_WARS_ROLE)
+    {
+        if (_completeTransfer(from, to, tokenId)) {
+            _transfer(from, to, tokenId);
+        }
+    }
+
+    function rejectTransfer(uint256 tokenId, string calldata reason)
+        external
+        onlyRole(COLONY_WARS_ROLE)
+    {
+        _rejectTransfer(tokenId, reason);
+    }
+
+    // ============ COLONY INTEGRATION (IMeritCollection) ============
+
+    /// @inheritdoc IMeritCollection
+    function isAssigned(uint256 tokenId) external view override returns (bool) {
+        return _isEquipped[tokenId];
+    }
+
+    /// @inheritdoc IMeritCollection
+    function getAssignmentTarget(uint256 tokenId) external view override returns (uint256) {
+        return _equippedToColony[tokenId];
     }
 
     // ============ ADMIN FUNCTIONS ============
 
-    function setContractURI(string memory newContractUri) 
-        external 
-        onlyRole(ADMIN_ROLE) 
+    function setContractURI(string memory newContractUri)
+        external
+        onlyRole(ADMIN_ROLE)
     {
         _contractUri = newContractUri;
+    }
+
+    function setMetadataRenderer(IInfrastructureDescriptor _metadataRenderer)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        metadataRenderer = _metadataRenderer;
     }
 
     function pause() external onlyRole(ADMIN_ROLE) {
@@ -407,6 +382,19 @@ contract ColonyInfrastructureCards is
     ) external onlyRole(ADMIN_ROLE) {
         require(newMax >= typeMinted[infraType], "Cannot set below minted");
         typeMaxSupply[infraType] = newMax;
+    }
+
+    function updateTypeMinted(
+        InfrastructureSVGLib.InfrastructureType infraType,
+        uint256 newMinted
+    ) external onlyRole(ADMIN_ROLE) {
+        require(newMinted <= typeMaxSupply[infraType], "Cannot exceed max supply");
+        typeMinted[infraType] = newMinted;
+    }
+
+    function setMaxSupply(uint256 newMaxSupply) external onlyRole(ADMIN_ROLE) {
+        if (newMaxSupply < _tokenIdCounter) revert InvalidMaxSupply();
+        maxSupply = newMaxSupply;
     }
 
     // ============ INTERNAL FUNCTIONS ============
@@ -444,21 +432,59 @@ contract ColonyInfrastructureCards is
     ) private pure returns (uint8) {
         uint8 baseTech = infraType == InfrastructureSVGLib.InfrastructureType.ResearchLab ? 5 :
                         infraType == InfrastructureSVGLib.InfrastructureType.DefenseTurret ? 4 : 3;
-        
+
         return baseTech + uint8(rarity);
     }
+
+    function _calculateDegradation(InfrastructureSVGLib.Rarity rarity) private pure returns (uint8) {
+        // Higher rarity = less degradation per use
+        if (rarity == InfrastructureSVGLib.Rarity.Legendary) return 1;
+        if (rarity == InfrastructureSVGLib.Rarity.Epic) return 2;
+        if (rarity == InfrastructureSVGLib.Rarity.Rare) return 3;
+        if (rarity == InfrastructureSVGLib.Rarity.Uncommon) return 4;
+        return 5; // Common
+    }
+
+    function _calculateRepairCost(uint8 durabilityToRestore, InfrastructureSVGLib.Rarity rarity) private pure returns (uint256) {
+        // Base cost: 0.01 ZICO per durability point, higher rarity = higher cost
+        uint256 baseCost = uint256(durabilityToRestore) * 0.01 ether;
+        uint256 multiplier = 100 + (uint256(rarity) * 25); // Common=100%, Legendary=200%
+        return (baseCost * multiplier) / 100;
+    }
+
+    function _calculateTotalEfficiency(uint8 baseEfficiency, InfrastructureSVGLib.Rarity rarity) private pure returns (uint256) {
+        // Rarity multiplier: Common=100%, Uncommon=115%, Rare=130%, Epic=175%, Legendary=250%
+        uint256 multiplier = rarity == InfrastructureSVGLib.Rarity.Legendary ? 250 :
+                            rarity == InfrastructureSVGLib.Rarity.Epic ? 175 :
+                            rarity == InfrastructureSVGLib.Rarity.Rare ? 130 :
+                            rarity == InfrastructureSVGLib.Rarity.Uncommon ? 115 : 100;
+        return (uint256(baseEfficiency) * multiplier) / 100;
+    }
+
+    // ============ MODULAR MERIT OVERRIDES ============
 
     function _checkDiamondPermission() internal view override {
         _checkRole(DIAMOND_ROLE);
     }
 
-    /**
-     * @notice Check if token exists (required by ModularSpecimen)
-     * @param tokenId Token ID to check
-     * @return Whether token exists
-     */
     function _tokenExists(uint256 tokenId) internal view override returns (bool) {
         return _ownerOf(tokenId) != address(0);
+    }
+
+    function _isTokenOwner(uint256 tokenId, address account) internal view override returns (bool) {
+        return _ownerOf(tokenId) == account;
+    }
+
+    function _checkTransferRestrictions(uint256 tokenId) internal view override {
+        if (_isEquipped[tokenId]) revert CannotTransferWhileEquipped();
+    }
+
+    function _getApprovedTarget(uint256 tokenId) internal view override returns (address) {
+        return _approvedTransferTarget[tokenId];
+    }
+
+    function _setApprovedTarget(uint256 tokenId, address target) internal override {
+        _approvedTransferTarget[tokenId] = target;
     }
 
     function _authorizeUpgrade(address newImplementation) 

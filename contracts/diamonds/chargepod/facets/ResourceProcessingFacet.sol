@@ -59,7 +59,7 @@ contract ResourceProcessingFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         
         address caller = LibMeta.msgSender();
-        bytes32 colonyId = cws.userToColony[caller];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
         require(colonyId != bytes32(0), "No colony");
         
         // Get recipe
@@ -118,7 +118,7 @@ contract ResourceProcessingFacet is AccessControlBase {
         
         // Verify caller is colony owner
         address caller = LibMeta.msgSender();
-        bytes32 colonyId = cws.userToColony[caller];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
         require(order.colonyId == colonyId, "Not your order");
         
         // Check if processing complete
@@ -253,7 +253,7 @@ contract ResourceProcessingFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
         // Get user's colony
-        bytes32 colonyId = cws.userToColony[user];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(user);
         if (colonyId == bytes32(0)) {
             return (new bytes32[](0), new LibColonyWarsStorage.ProcessingOrder[](0));
         }
@@ -300,7 +300,7 @@ contract ResourceProcessingFacet is AccessControlBase {
 
         // Verify caller is colony owner
         address caller = LibMeta.msgSender();
-        bytes32 colonyId = cws.userToColony[caller];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
         require(order.colonyId == colonyId, "Not your order");
 
         // Get recipe to calculate resources to return

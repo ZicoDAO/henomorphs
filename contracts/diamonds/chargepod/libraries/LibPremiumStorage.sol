@@ -184,8 +184,7 @@ library LibPremiumStorage {
         bool nftMintEnabled;          // Whether to mint NFT
         uint8 minTier;                // Minimum tier for rewards (1-5)
         bool configured;              // Whether achievement is configured
-        // NEW FIELDS - APPEND ONLY BELOW
-        uint8 maxTier;                // Maximum tier achievable (1-5)
+        // NOTE: maxTier moved to separate mapping (achievementMaxTiers) - cannot modify deployed struct
     }
 
     struct UserAchievementReward {
@@ -193,6 +192,23 @@ library LibPremiumStorage {
         bool rewardClaimed;
         uint32 completionTime;
         uint8 tierAchieved;
+    }
+
+    // ==================== REWARD COLLECTIONS REGISTRY ====================
+
+    /// @notice Configuration for a registered reward collection
+    /// @dev Minimal config - collection handles its own logic (denominations, series, etc.)
+    struct RewardCollectionConfig {
+        address collectionAddress;      // Contract address (must implement IRewardRedeemable)
+        bool enabled;                   // Whether collection is active
+    }
+
+    /// @notice Configuration for achievement rewards from a collection
+    /// @dev Generic - collection interprets tierId according to its own logic
+    struct AchievementCollectionReward {
+        uint256 collectionId;           // Collection ID from registry (0 = none)
+        uint256 tierId;                 // Tier ID - interpreted by collection (e.g., reward value tier)
+        uint256 amount;                 // Multiplier/count passed to collection
     }
 
     // ==================== ORACLE INTEGRATION ====================
@@ -341,6 +357,19 @@ library LibPremiumStorage {
         // === NEW FIELDS - APPEND ONLY BELOW THIS LINE ===
         uint256[] configuredAchievementIds;  // List of configured achievement IDs
         mapping(uint256 => bool) isAchievementConfigured;  // Quick lookup for duplicate prevention
+
+        // === REWARD COLLECTIONS REGISTRY ===
+        mapping(uint256 => RewardCollectionConfig) rewardCollections;  // collectionId => config
+        uint256[] registeredCollectionIds;                              // List of registered collection IDs
+        mapping(uint256 => bool) isCollectionRegistered;                // Quick lookup
+
+        // === ACHIEVEMENT COLLECTION REWARDS ===
+        // Separate mapping - does NOT modify AchievementRewardConfig struct
+        // Collection interprets tierId according to its own logic (e.g., ColonyReserveNotes decomposes to banknotes)
+        mapping(uint256 => AchievementCollectionReward) achievementCollectionRewards;  // achievementId => collection reward
+
+        // === ACHIEVEMENT MAX TIERS (cannot add to AchievementRewardConfig - deployed struct) ===
+        mapping(uint256 => uint8) achievementMaxTiers;  // achievementId => maxTier (1-5)
     }
 
     /**

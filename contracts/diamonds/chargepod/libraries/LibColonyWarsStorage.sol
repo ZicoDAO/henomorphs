@@ -48,6 +48,10 @@ library LibColonyWarsStorage {
     bytes32 constant FEE_SPECIALIZATION = keccak256("specialization");
     bytes32 constant FEE_MASTERY_ACTION = keccak256("masteryAction");
     bytes32 constant FEE_INSPECTION = keccak256("inspection");
+    bytes32 constant FEE_INFRA_UPGRADE_COMMON = keccak256("infraUpgradeCommon");
+    bytes32 constant FEE_INFRA_UPGRADE_UNCOMMON = keccak256("infraUpgradeUncommon");
+    bytes32 constant FEE_INFRA_UPGRADE_RARE = keccak256("infraUpgradeRare");
+    bytes32 constant FEE_INFRA_UPGRADE_EPIC = keccak256("infraUpgradeEpic");
 
     // ============================================
     // STRUCTS - OPERATION FEES (Generic & Token-Agnostic)
@@ -140,6 +144,8 @@ library LibColonyWarsStorage {
         uint8 warStress;        // 0-10, increases maintenance costs
         uint32 lastStressTime;  // For stress decay calculation
         uint8 stakeIncreases;
+        // APPEND-ONLY: Added for pre-registration season tracking
+        uint32 registeredSeasonId;  // Season ID this colony is registered for (0 = not registered)
     }
     
     struct BattleInstance {
@@ -214,6 +220,7 @@ library LibColonyWarsStorage {
         bool enableAutoDefense;           // Default: true (enable automatic defense)
         uint32 autoDefenseTimeout;        // Default: 1800 (30 min timeout for active defense)
         uint256 maxGlobalTerritories;
+        // NOTE: preRegistrationWindow moved to ColonyWarsStorage end for storage safety
     }
 
     struct Season {
@@ -300,7 +307,22 @@ library LibColonyWarsStorage {
     }
 
     // === PHASE 6: External Contracts Configuration ===
+    /**
+     * @notice DEPRECATED - Do not use! Kept for storage layout compatibility.
+     * @dev Use CardContracts instead. This struct must remain unchanged
+     * to preserve Diamond storage slot alignment.
+     */
     struct ExternalContracts {
+        address territoryCards;
+        address infrastructureCards;
+        // DO NOT ADD FIELDS HERE - use CardContracts instead
+    }
+
+    /**
+     * @notice Card collection contract addresses
+     * @dev Storage-safe replacement for deprecated ExternalContracts
+     */
+    struct CardContracts {
         address territoryCards;
         address infrastructureCards;
         address resourceCards;
@@ -492,6 +514,25 @@ library LibColonyWarsStorage {
         uint256 contestProgress;        // Progress toward capture (0-10000 = 0-100%)
         uint32 contestStartTime;        // When contestation started
         bool active;                    // Is zone active in current season
+    }
+
+    // ============================================
+    // PRE-REGISTRATION SYSTEM (APPEND-ONLY)
+    // ============================================
+
+    /**
+     * @notice Pre-registration record for registering colony before season starts
+     * @dev Allows users to register colonies outside of active registration period
+     * Pre-registrations are activated automatically when season starts
+     */
+    struct PreRegistration {
+        bytes32 colonyId;           // Colony being pre-registered
+        address owner;              // Owner who initiated pre-registration
+        uint256 stake;              // Staked amount (held until activation or cancellation)
+        uint32 targetSeasonId;      // Season this pre-registration is for
+        uint32 registeredAt;        // Timestamp when pre-registration was created
+        bool activated;             // Whether this was activated (converted to full registration)
+        bool cancelled;             // Whether this was cancelled (refund issued)
     }
 
     struct ColonyWarsStorage {
@@ -836,6 +877,117 @@ library LibColonyWarsStorage {
          * @dev season => zoneIds[]
          */
         mapping(uint32 => uint256[]) seasonContestedZones;
+
+        // Note: Infrastructure upgrade pricing uses operationFees mapping
+        // with keys: FEE_INFRA_UPGRADE_COMMON, FEE_INFRA_UPGRADE_UNCOMMON,
+        // FEE_INFRA_UPGRADE_RARE, FEE_INFRA_UPGRADE_EPIC
+        // Configure via ColonyWarsConfigFacet.configureOperationFee()
+
+        // ============================================
+        // CARD CONTRACTS (APPEND-ONLY)
+        // ============================================
+
+        /**
+         * @notice Card collection contract addresses
+         * @dev Replaces deprecated ExternalContracts (contractAddresses field)
+         * Use this for all new code - includes resourceCards address
+         */
+        CardContracts cardContracts;
+
+        // ============================================
+        // RESOURCE CARD STAKING TO NODES (APPEND-ONLY)
+        // ============================================
+
+        /**
+         * @notice Resource cards staked to resource nodes
+         * @dev territoryId => array of staked resource card token IDs
+         * Max 3 cards per node for balanced gameplay
+         */
+        mapping(uint256 => uint256[]) nodeStakedResourceCards;
+
+        /**
+         * @notice Reverse lookup: which node a resource card is staked to
+         * @dev cardTokenId => territoryId (0 if not staked to any node)
+         */
+        mapping(uint256 => uint256) resourceCardStakedToNode;
+
+        // ============================================
+        // PRE-REGISTRATION SYSTEM (APPEND-ONLY)
+        // ============================================
+
+        /**
+         * @notice Pre-registration records by season and colony
+         * @dev seasonId => colonyId => PreRegistration
+         */
+        mapping(uint32 => mapping(bytes32 => PreRegistration)) preRegistrations;
+
+        /**
+         * @notice List of pre-registered colony IDs per season
+         * @dev seasonId => colonyIds[]
+         */
+        mapping(uint32 => bytes32[]) preRegisteredColonies;
+
+        /**
+         * @notice Index tracking for efficient batch processing
+         * @dev seasonId => next index to process in preRegisteredColonies array
+         */
+        mapping(uint32 => uint256) preRegistrationProcessingIndex;
+
+        // ============================================
+        // SEPARATED RESOURCE NODE STORAGE (APPEND-ONLY)
+        // ============================================
+        //
+        // RATIONALE: Original `resourceNodes` mapping was used by both
+        // TerritoryResourceFacet (keyed by territoryId) and ResourceEconomyFacet
+        // (keyed by auto-increment nodeId), causing potential key collisions.
+        // These new mappings provide clean separation while maintaining
+        // backward compatibility with existing data in `resourceNodes`.
+        //
+
+        /**
+         * @notice Territory-based resource nodes (TerritoryResourceFacet)
+         * @dev Key: territoryId => ResourceNode
+         * One node per territory, integrated with territory control system
+         * Production: 100 * level per 24h harvest
+         */
+        mapping(uint256 => ResourceNode) territoryResourceNodes;
+
+        /**
+         * @notice Economy resource nodes (ResourceEconomyFacet)
+         * @dev Key: economyNodeId => ResourceNode
+         * Multiple nodes possible, uses auto-increment counter
+         * Production: 10 * level * hours (accumulating)
+         */
+        mapping(uint256 => ResourceNode) economyResourceNodes;
+
+        /**
+         * @notice Counter for economy resource node IDs
+         * @dev Separate from resourceNodeCounter to avoid confusion
+         * Used by ResourceEconomyFacet for unique node identification
+         */
+        uint256 economyNodeCounter;
+
+        // ============================================
+        // CONFIG EXTENSIONS (APPEND-ONLY - MUST BE AT END)
+        // ============================================
+
+        /**
+         * @notice Pre-registration time window before season start
+         * @dev Moved here from ColonyWarsConfig for storage layout safety
+         * 0 = no time limit (pre-registration always open for scheduled seasons)
+         */
+        uint32 preRegistrationWindow;
+
+        // ============================================
+        // RESOURCE PROCESSING TRACKING (APPEND-ONLY)
+        // ============================================
+
+        /**
+         * @notice Processing orders per colony for UI tracking
+         * @dev colonyId => orderIds[]
+         * Used by getUserProcessingOrders() to list active processing operations
+         */
+        mapping(bytes32 => bytes32[]) colonyProcessingOrders;
     }
 
     function colonyWarsStorage() internal pure returns (ColonyWarsStorage storage cws) {
@@ -1795,7 +1947,30 @@ library LibColonyWarsStorage {
     function getSquadStakePosition(bytes32 colonyId) internal view returns (SquadStakePosition storage) {
         return colonyWarsStorage().colonySquadStakes[colonyId];
     }
-    
+
+    /**
+     * @notice Check if colony has any active (unresolved) battles in a season
+     * @param colonyId Colony to check
+     * @param seasonId Season to check battles in
+     * @return hasActive True if colony has active battles
+     */
+    function hasActiveBattles(bytes32 colonyId, uint32 seasonId) internal view returns (bool hasActive) {
+        ColonyWarsStorage storage cws = colonyWarsStorage();
+        bytes32[] storage seasonBattles = cws.seasonBattles[seasonId];
+
+        for (uint256 i = 0; i < seasonBattles.length; i++) {
+            BattleInstance storage battle = cws.battles[seasonBattles[i]];
+
+            // Check if colony is involved and battle is not resolved
+            if ((battle.attackerColony == colonyId || battle.defenderColony == colonyId) &&
+                battle.battleState < 2 && !cws.battleResolved[seasonBattles[i]]) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     // ============================================
     // INTERNAL HELPERS (PRIVATE)
     // ============================================
@@ -1894,4 +2069,5 @@ library LibColonyWarsStorage {
         uint256 dayTimestamp = block.timestamp / 1 days;
         cws.allianceDailyCoordinatedAttacks[allianceId][dayTimestamp]++;
     }
+
 }

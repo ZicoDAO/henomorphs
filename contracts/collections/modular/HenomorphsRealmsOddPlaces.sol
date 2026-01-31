@@ -10,9 +10,10 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {ModularSpecimen} from "../../diamonds/modular/base/ModularSpecimen.sol";
-import {IssueInfo, ItemTier, TierVariant, TraitPackEquipment} from "../../diamonds/modular/libraries/CollectionModel.sol";
-import {ICollectionDiamond} from "../../diamonds/modular/interfaces/ICollectionDiamond.sol";
+import {ModularSpecimen} from "../base/ModularSpecimen.sol";
+import {IssueInfo, ItemTier, TierVariant, TraitPackEquipment} from "../libraries/CollectionModel.sol";
+import {ICollectionDiamond} from "../interfaces/ICollectionDiamond.sol";
+import {IMintableCollection} from "../interfaces/IMintableCollection.sol";
 
 /**
  * @title HenomorphsRealmsOddPlaces - THE ODD PLACES
@@ -36,7 +37,8 @@ contract HenomorphsRealmsOddPlaces is
     ReentrancyGuardUpgradeable,
     PausableUpgradeable,
     UUPSUpgradeable,
-    ModularSpecimen
+    ModularSpecimen,
+    IMintableCollection
 {
 
     // ==================== ROLES ====================
@@ -165,6 +167,123 @@ contract HenomorphsRealmsOddPlaces is
         _variantNames[2] = "Mission Krosno";
         _variantNames[3] = "Mission Tomb";
         _variantNames[4] = "Mission Australia";
+    }
+
+    // ==================== IMINTABLE COLLECTION INTERFACE ====================
+
+    /**
+     * @notice Mint a token with specific tier and variant (IMintableCollection)
+     * @param to Recipient address
+     * @param tier Token tier
+     * @param variant Token variant (0-4)
+     * @return tokenId The minted token ID
+     */
+    function mintWithVariant(
+        address to,
+        uint8 tier,
+        uint8 variant
+    ) external override onlyRole(MINTER_ROLE) nonReentrant whenNotPaused returns (uint256 tokenId) {
+        if (to == address(0)) {
+            revert InvalidMintParameters();
+        }
+        if (variant > 4) {
+            revert InvalidVariant(variant);
+        }
+
+        uint256 tierSupply = _getCollectionMaxSupply(collectionId, tier);
+        _validateIssueAndTier(defaultIssue, tier);
+
+        if (_itemsCounters[defaultIssue][tier] + 1 > tierSupply) {
+            revert CollectionSoldOut();
+        }
+
+        tokenId = _getNextTokenId(defaultIssue, tier);
+
+        _safeMint(to, tokenId);
+        _notifyTokenMinted(tokenId, to);
+
+        bool syncSuccess = _assignVariantToToken(defaultIssue, tier, tokenId, variant);
+
+        unchecked {
+            _itemsCounters[defaultIssue][tier] += 1;
+            _itemsCollected[to][defaultIssue][tier] += 1;
+        }
+
+        emit VariantAssigned(tokenId, variant, syncSuccess);
+        emit MissionPassMinted(tokenId, variant, to);
+
+        return tokenId;
+    }
+
+    /**
+     * @notice Assign variant to existing token (IMintableCollection)
+     * @dev Wrapper using default issue
+     * @param tokenId Token ID
+     * @param tier Token tier
+     * @param variant Variant to assign (0-4)
+     */
+    function assignVariant(
+        uint256 tokenId,
+        uint8 tier,
+        uint8 variant
+    ) external override onlyRole(MINTER_ROLE) {
+        if (!_tokenExists(tokenId)) {
+            revert ERC721NonexistentToken(tokenId);
+        }
+        if (variant > 4) {
+            revert InvalidVariant(variant);
+        }
+
+        bool success = _assignVariantToToken(defaultIssue, tier, tokenId, variant);
+        if (!success) {
+            revert DiamondSyncFailed(tokenId, variant);
+        }
+
+        emit VariantAssigned(tokenId, variant, success);
+    }
+
+    /**
+     * @notice Reset token variant (IMintableCollection)
+     * @dev Wrapper using default issue
+     * @param tokenId Token ID
+     * @param tier Token tier
+     */
+    function resetVariant(
+        uint256 tokenId,
+        uint8 tier
+    ) external override onlyRole(DIAMOND_ROLE) {
+        if (!_tokenExists(tokenId)) {
+            revert ERC721NonexistentToken(tokenId);
+        }
+
+        _itemsVariants[defaultIssue][tier][tokenId] = 0;
+    }
+
+    /**
+     * @notice Get token variant for specific tier (IMintableCollection)
+     * @param tokenId Token ID
+     * @param tier Token tier
+     * @return variant The token's variant
+     */
+    function getTokenVariant(
+        uint256 tokenId,
+        uint8 tier
+    ) external view override returns (uint8 variant) {
+        return _itemsVariants[defaultIssue][tier][tokenId];
+    }
+
+    /**
+     * @notice Check if token has a variant assigned (IMintableCollection)
+     * @param tokenId Token ID
+     * @return Whether the token has any variant (non-zero or explicitly set)
+     */
+    function isTokenVarianted(uint256 tokenId) external view override returns (bool) {
+        if (!_tokenExists(tokenId)) {
+            return false;
+        }
+        // Check if token was minted (exists in counters)
+        // For Mission Pass, all minted tokens have a variant (even if 0)
+        return _ownerOf(tokenId) != address(0);
     }
 
     // ==================== IDARDION COLLECTION INTERFACE ====================
@@ -487,7 +606,7 @@ contract HenomorphsRealmsOddPlaces is
     }
 
     /**
-     * @notice Assign variant to existing token
+     * @notice Assign variant to existing token (with issueId)
      */
     function assignVariant(
         uint256 issueId,
@@ -516,7 +635,7 @@ contract HenomorphsRealmsOddPlaces is
     }
 
     /**
-     * @notice Reset token variant to 0 for rolling
+     * @notice Reset token variant to 0 for rolling (with issueId)
      */
     function resetVariant(uint256 issueId, uint8 tier, uint256 tokenId) external onlyRole(DIAMOND_ROLE) {
         if (!_tokenExists(tokenId)) {

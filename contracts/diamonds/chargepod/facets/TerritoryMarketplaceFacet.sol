@@ -4,12 +4,12 @@ pragma solidity ^0.8.27;
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {ColonyHelper} from "../libraries/ColonyHelper.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
 
 /**
  * @title TerritoryMarketplaceFacet
@@ -234,7 +234,7 @@ contract TerritoryMarketplaceFacet is AccessControlBase {
         cws.colonyTerritories[buyerColony].push(territoryId);
         
         // Handle Territory Card transfer
-        if (cws.contractAddresses.territoryCards != address(0)) {
+        if (cws.cardContracts.territoryCards != address(0)) {
             uint256 cardTokenId = cws.territoryToCard[territoryId];
             if (cardTokenId > 0) {
                 // Deactivate card from old owner
@@ -454,7 +454,7 @@ contract TerritoryMarketplaceFacet is AccessControlBase {
         cws.colonyTerritories[buyer].push(offer.territoryId);
         
         // Handle Territory Card transfer
-        if (cws.contractAddresses.territoryCards != address(0)) {
+        if (cws.cardContracts.territoryCards != address(0)) {
             uint256 cardTokenId = cws.territoryToCard[offer.territoryId];
             if (cardTokenId > 0) {
                 // Deactivate card from old owner
@@ -710,12 +710,12 @@ contract TerritoryMarketplaceFacet is AccessControlBase {
         bytes32 colonyId,
         LibColonyWarsStorage.ColonyWarsStorage storage cws
     ) internal {
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             return;
         }
         
         uint256 colonyIdUint = uint256(colonyId);
-        ITerritoryCards(cws.contractAddresses.territoryCards).assignToColony(cardTokenId, colonyIdUint);
+        ITerritoryCards(cws.cardContracts.territoryCards).assignToColony(cardTokenId, colonyIdUint);
     }
 
     /**
@@ -726,11 +726,11 @@ contract TerritoryMarketplaceFacet is AccessControlBase {
         uint256 cardTokenId,
         LibColonyWarsStorage.ColonyWarsStorage storage cws
     ) internal {
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             return;
         }
         
-        ITerritoryCards(cws.contractAddresses.territoryCards).deactivateTerritory(cardTokenId);
+        ITerritoryCards(cws.cardContracts.territoryCards).deactivateTerritory(cardTokenId);
     }
 
     /**
@@ -747,12 +747,12 @@ contract TerritoryMarketplaceFacet is AccessControlBase {
         address to,
         LibColonyWarsStorage.ColonyWarsStorage storage cws
     ) internal {
-        if (cws.contractAddresses.territoryCards == address(0)) {
+        if (cws.cardContracts.territoryCards == address(0)) {
             return;
         }
         
         // Use IERC721 transferFrom for NFT transfer
-        IERC721(cws.contractAddresses.territoryCards).transferFrom(from, to, cardTokenId);
+        IERC721(cws.cardContracts.territoryCards).transferFrom(from, to, cardTokenId);
     }
 }
 

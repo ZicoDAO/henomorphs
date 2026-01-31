@@ -4,9 +4,9 @@ pragma solidity ^0.8.27;
 import { LibColonyWarsStorage } from "../libraries/LibColonyWarsStorage.sol";
 import { LibHenomorphsStorage } from "../libraries/LibHenomorphsStorage.sol";
 import { LibMeta } from "../../shared/libraries/LibMeta.sol";
-import { AccessControlBase } from "../../common/facets/AccessControlBase.sol";
-import { AccessHelper } from "../../staking/libraries/AccessHelper.sol";
-import { PodsUtils } from "../../../libraries/PodsUtils.sol";
+import { AccessControlBase } from "./AccessControlBase.sol";
+import { AccessHelper } from "../libraries/AccessHelper.sol";
+import { PodsUtils } from "../../libraries/PodsUtils.sol";
 import { IERC721 } from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import { IERC721Receiver } from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 
@@ -207,7 +207,7 @@ contract MultiCollectionStakingFacet is AccessControlBase, IERC721Receiver {
         
         // Validate colony ownership
         address caller = LibMeta.msgSender();
-        require(cws.userToColony[caller] == colonyId, "Not colony owner");
+        require(LibColonyWarsStorage.getUserPrimaryColony(caller) == colonyId, "Not colony owner");
         
         // Validate colony is registered for current season
         if (!cws.colonyWarProfiles[colonyId].registered) {
@@ -269,7 +269,7 @@ contract MultiCollectionStakingFacet is AccessControlBase, IERC721Receiver {
         
         // Validate colony ownership
         address caller = LibMeta.msgSender();
-        require(cws.userToColony[caller] == colonyId, "Not colony owner");
+        require(LibColonyWarsStorage.getUserPrimaryColony(caller) == colonyId, "Not colony owner");
         
         LibColonyWarsStorage.SquadStakePosition storage squad = cws.colonySquadStakes[colonyId];
         if (!squad.active) revert NoTeamStaked();
@@ -329,7 +329,7 @@ contract MultiCollectionStakingFacet is AccessControlBase, IERC721Receiver {
         
         // Validate colony ownership
         address caller = LibMeta.msgSender();
-        require(cws.userToColony[caller] == colonyId, "Not colony owner");
+        require(LibColonyWarsStorage.getUserPrimaryColony(caller) == colonyId, "Not colony owner");
         
         LibColonyWarsStorage.SquadStakePosition storage squad = cws.colonySquadStakes[colonyId];
         if (!squad.active) revert NoTeamStaked();
@@ -376,7 +376,7 @@ contract MultiCollectionStakingFacet is AccessControlBase, IERC721Receiver {
         
         // Validate colony ownership
         address caller = LibMeta.msgSender();
-        require(cws.userToColony[caller] == colonyId, "Not colony owner");
+        require(LibColonyWarsStorage.getUserPrimaryColony(caller) == colonyId, "Not colony owner");
         
         LibColonyWarsStorage.SquadStakePosition storage squad = cws.colonySquadStakes[colonyId];
         if (!squad.active) revert NoTeamStaked();

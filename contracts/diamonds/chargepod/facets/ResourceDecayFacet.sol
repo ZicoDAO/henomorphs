@@ -31,12 +31,32 @@ contract ResourceDecayFacet is AccessControlBase {
     
     function setDecayRate(uint16 baseRate) external onlyAuthorized {
         if (baseRate > 1000) revert InvalidDecayRate(baseRate); // Max 10% per day
-        
+
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         rs.config.baseResourceDecayRate = baseRate;
         emit DecayConfigUpdated(rs.config.resourceDecayEnabled, baseRate);
     }
-    
+
+    /**
+     * @notice Fix corrupted decay timestamp for user
+     * @param user User address
+     */
+    function fixUserResourceDecay(address user) external onlyAuthorized {
+        LibResourceStorage.resourceStorage().lastDecayUpdate[user] = uint32(block.timestamp);
+    }
+
+    /**
+     * @notice Batch fix decay timestamps
+     * @param users User addresses
+     */
+    function fixUserResourceDecayBatch(address[] calldata users) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        uint32 t = uint32(block.timestamp);
+        for (uint256 i = 0; i < users.length; i++) {
+            rs.lastDecayUpdate[users[i]] = t;
+        }
+    }
+
     // ==================== DECAY EXECUTION ====================
     
     function applyDecayToUser(address user) external {
@@ -52,7 +72,8 @@ contract ResourceDecayFacet is AccessControlBase {
         
         uint256[4] memory decayedAmounts;
         uint32 lastUpdate = rs.lastDecayUpdate[user];
-        uint32 daysPassed = (uint32(block.timestamp) - lastUpdate) / 86400;
+        uint32 currentTime = uint32(block.timestamp);
+        uint32 daysPassed = currentTime > lastUpdate ? (currentTime - lastUpdate) / 86400 : 0;
         
         for (uint8 i = 0; i < 4; i++) {
             uint256 afterAmount = rs.userResources[user][i];
@@ -75,7 +96,8 @@ contract ResourceDecayFacet is AccessControlBase {
             address user = users[i];
             
             uint32 lastUpdate = rs.lastDecayUpdate[user];
-            if (lastUpdate > 0 && block.timestamp - lastUpdate < 86400) {
+            // Skip if decay was applied recently (< 1 day) or timestamp is corrupted (future)
+            if (lastUpdate > 0 && (lastUpdate >= block.timestamp || block.timestamp - lastUpdate < 86400)) {
                 continue;
             }
             
@@ -103,13 +125,17 @@ contract ResourceDecayFacet is AccessControlBase {
     
     function checkDecayNeeded(address user) external view returns (bool needsDecay, uint32 daysSinceLastUpdate) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        
+
         if (!rs.config.resourceDecayEnabled) return (false, 0);
-        
+
         uint32 lastUpdate = rs.lastDecayUpdate[user];
         if (lastUpdate == 0) return (false, 0);
-        
-        uint32 timePassed = uint32(block.timestamp) - lastUpdate;
+
+        uint32 currentTime = uint32(block.timestamp);
+        // Handle corrupted future timestamp
+        if (currentTime <= lastUpdate) return (false, 0);
+
+        uint32 timePassed = currentTime - lastUpdate;
         daysSinceLastUpdate = timePassed / 86400;
         needsDecay = timePassed >= 86400;
     }
@@ -129,7 +155,11 @@ contract ResourceDecayFacet is AccessControlBase {
         uint32 lastUpdate = rs.lastDecayUpdate[user];
         if (lastUpdate == 0) return estimatedDecay;
 
-        uint32 timePassed = uint32(block.timestamp) - lastUpdate;
+        uint32 currentTime = uint32(block.timestamp);
+        // Handle corrupted future timestamp
+        if (currentTime <= lastUpdate) return estimatedDecay;
+
+        uint32 timePassed = currentTime - lastUpdate;
         if (timePassed < 86400) return estimatedDecay;
 
         uint32 daysPassed = timePassed / 86400;
@@ -159,8 +189,10 @@ contract ResourceDecayFacet is AccessControlBase {
     function getLastDecayUpdate(address user) external view returns (uint32 lastUpdate, uint32 timeSince) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         lastUpdate = rs.lastDecayUpdate[user];
-        if (lastUpdate > 0) {
-            timeSince = uint32(block.timestamp) - lastUpdate;
+        uint32 currentTime = uint32(block.timestamp);
+        // Handle corrupted future timestamp - return 0 for timeSince
+        if (lastUpdate > 0 && currentTime > lastUpdate) {
+            timeSince = currentTime - lastUpdate;
         }
     }
 }

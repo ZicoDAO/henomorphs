@@ -3,9 +3,9 @@ pragma solidity ^0.8.27;
 
 import {LibMissionStorage} from "../libraries/LibMissionStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
-import {ControlFee} from "../../../libraries/HenomorphsModel.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {ControlFee} from "../../libraries/HenomorphsModel.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /**
@@ -38,6 +38,9 @@ contract MissionConfigFacet is AccessControlBase {
         uint256 baseReward
     );
     event MissionVariantEnabled(uint16 indexed collectionId, uint8 indexed variantId, bool enabled);
+    event MissionVariantObjectiveTemplatesSet(uint16 indexed collectionId, uint8 indexed variantId, uint8 templateCount);
+    event MissionVariantEventTemplatesSet(uint16 indexed collectionId, uint8 indexed variantId, uint8 templateCount);
+    event MissionVariantRestConfigSet(uint16 indexed collectionId, uint8 indexed variantId, uint8 maxUses, uint8 chargeRestore);
 
     // Recharge events
     event RechargeConfigSet(uint16 indexed collectionId, uint96 pricePerUse, uint16 discountBps);
@@ -62,6 +65,8 @@ contract MissionConfigFacet is AccessControlBase {
     error InvalidMapSize();
     error TooManyVariants();
     error VariantNotConfigured(uint16 collectionId, uint8 variantId);
+    error TooManyTemplates();
+    error InvalidTemplateConfig();
 
     // Recharge errors
     error InvalidRechargeConfig();
@@ -417,6 +422,145 @@ contract MissionConfigFacet is AccessControlBase {
         config.perfectCompletionBonus = perfectCompletionBonus;
     }
 
+    /**
+     * @notice Configure objective templates for a mission variant
+     * @dev Templates define how objectives are generated with randomized targets
+     * @param collectionId Mission Pass collection ID
+     * @param variantId Variant ID
+     * @param templates Array of objective templates (max 8)
+     */
+    function setMissionVariantObjectiveTemplates(
+        uint16 collectionId,
+        uint8 variantId,
+        LibMissionStorage.ObjectiveTemplate[] calldata templates
+    ) external onlyAuthorized whenNotPaused {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+
+        if (collectionId == 0 || collectionId > ms.passCollectionCounter) {
+            revert CollectionNotRegistered(collectionId);
+        }
+        if (variantId == 0 || variantId > ms.passCollections[collectionId].variantCount) {
+            revert VariantNotConfigured(collectionId, variantId);
+        }
+        if (templates.length > LibMissionStorage.MAX_OBJECTIVES) {
+            revert TooManyTemplates();
+        }
+
+        LibMissionStorage.MissionVariantConfig storage config = ms.variantConfigs[collectionId][variantId];
+
+        // Validate and copy templates
+        for (uint8 i = 0; i < templates.length; i++) {
+            LibMissionStorage.ObjectiveTemplate calldata t = templates[i];
+            // Validate template
+            if (t.minTarget > t.maxTarget) {
+                revert InvalidTemplateConfig();
+            }
+            config.objectiveTemplates[i] = t;
+        }
+
+        // Clear remaining slots if new array is shorter
+        for (uint8 i = uint8(templates.length); i < LibMissionStorage.MAX_OBJECTIVES; i++) {
+            config.objectiveTemplates[i] = LibMissionStorage.ObjectiveTemplate({
+                objectiveType: LibMissionStorage.ObjectiveType.Collect,
+                minTarget: 0,
+                maxTarget: 0,
+                isRequired: false,
+                bonusRewardBps: 0,
+                enabled: false
+            });
+        }
+
+        config.objectiveTemplateCount = uint8(templates.length);
+
+        emit MissionVariantObjectiveTemplatesSet(collectionId, variantId, uint8(templates.length));
+    }
+
+    /**
+     * @notice Configure event templates for a mission variant
+     * @dev Templates define which events can occur and with what frequency
+     * @param collectionId Mission Pass collection ID
+     * @param variantId Variant ID
+     * @param templates Array of event templates (max 8)
+     */
+    function setMissionVariantEventTemplates(
+        uint16 collectionId,
+        uint8 variantId,
+        LibMissionStorage.EventTemplate[] calldata templates
+    ) external onlyAuthorized whenNotPaused {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+
+        if (collectionId == 0 || collectionId > ms.passCollectionCounter) {
+            revert CollectionNotRegistered(collectionId);
+        }
+        if (variantId == 0 || variantId > ms.passCollections[collectionId].variantCount) {
+            revert VariantNotConfigured(collectionId, variantId);
+        }
+        if (templates.length > 8) {
+            revert TooManyTemplates();
+        }
+
+        LibMissionStorage.MissionVariantConfig storage config = ms.variantConfigs[collectionId][variantId];
+
+        // Validate and copy templates
+        for (uint8 i = 0; i < templates.length; i++) {
+            LibMissionStorage.EventTemplate calldata t = templates[i];
+            // Validate template
+            if (t.minDifficulty > t.maxDifficulty) {
+                revert InvalidTemplateConfig();
+            }
+            if (t.weight == 0 || t.weight > 100) {
+                revert InvalidTemplateConfig();
+            }
+            config.eventTemplates[i] = t;
+        }
+
+        // Clear remaining slots if new array is shorter
+        for (uint8 i = uint8(templates.length); i < 8; i++) {
+            config.eventTemplates[i] = LibMissionStorage.EventTemplate({
+                eventType: LibMissionStorage.EventType.Patrol,
+                minDifficulty: 0,
+                maxDifficulty: 0,
+                weight: 0,
+                penaltyBps: 0,
+                enabled: false
+            });
+        }
+
+        config.eventTemplateCount = uint8(templates.length);
+
+        emit MissionVariantEventTemplatesSet(collectionId, variantId, uint8(templates.length));
+    }
+
+    /**
+     * @notice Configure Rest action parameters for a variant
+     * @dev Allows players to recover charge during missions
+     * @param collectionId Mission Pass collection ID
+     * @param variantId Variant ID
+     * @param maxUses Maximum Rest uses per mission (0 = disabled)
+     * @param chargeRestore Charge amount restored per Rest action
+     */
+    function setMissionVariantRestConfig(
+        uint16 collectionId,
+        uint8 variantId,
+        uint8 maxUses,
+        uint8 chargeRestore
+    ) external onlyAuthorized whenNotPaused {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+
+        if (collectionId == 0 || collectionId > ms.passCollectionCounter) {
+            revert CollectionNotRegistered(collectionId);
+        }
+        if (variantId == 0 || variantId > ms.passCollections[collectionId].variantCount) {
+            revert VariantNotConfigured(collectionId, variantId);
+        }
+
+        LibMissionStorage.MissionVariantConfig storage config = ms.variantConfigs[collectionId][variantId];
+        config.maxRestUsesPerMission = maxUses;
+        config.restChargeRestore = chargeRestore;
+
+        emit MissionVariantRestConfigSet(collectionId, variantId, maxUses, chargeRestore);
+    }
+
     // ============================================================
     // VIEW FUNCTIONS
     // ============================================================
@@ -530,6 +674,81 @@ contract MissionConfigFacet is AccessControlBase {
             }
         }
         return false;
+    }
+
+    /**
+     * @notice Get objective templates for a mission variant
+     * @param collectionId Mission Pass collection ID
+     * @param variantId Variant ID
+     * @return templates Fixed-size array of objective templates
+     * @return count Number of active templates
+     */
+    function getMissionVariantObjectiveTemplates(
+        uint16 collectionId,
+        uint8 variantId
+    ) external view returns (
+        LibMissionStorage.ObjectiveTemplate[8] memory templates,
+        uint8 count
+    ) {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        if (collectionId == 0 || collectionId > ms.passCollectionCounter) {
+            revert CollectionNotRegistered(collectionId);
+        }
+        if (variantId == 0 || variantId > ms.passCollections[collectionId].variantCount) {
+            revert VariantNotConfigured(collectionId, variantId);
+        }
+
+        LibMissionStorage.MissionVariantConfig storage config = ms.variantConfigs[collectionId][variantId];
+        return (config.objectiveTemplates, config.objectiveTemplateCount);
+    }
+
+    /**
+     * @notice Get event templates for a mission variant
+     * @param collectionId Mission Pass collection ID
+     * @param variantId Variant ID
+     * @return templates Fixed-size array of event templates
+     * @return count Number of active templates
+     */
+    function getMissionVariantEventTemplates(
+        uint16 collectionId,
+        uint8 variantId
+    ) external view returns (
+        LibMissionStorage.EventTemplate[8] memory templates,
+        uint8 count
+    ) {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        if (collectionId == 0 || collectionId > ms.passCollectionCounter) {
+            revert CollectionNotRegistered(collectionId);
+        }
+        if (variantId == 0 || variantId > ms.passCollections[collectionId].variantCount) {
+            revert VariantNotConfigured(collectionId, variantId);
+        }
+
+        LibMissionStorage.MissionVariantConfig storage config = ms.variantConfigs[collectionId][variantId];
+        return (config.eventTemplates, config.eventTemplateCount);
+    }
+
+    /**
+     * @notice Get Rest action configuration for a mission variant
+     * @param collectionId Mission Pass collection ID
+     * @param variantId Variant ID
+     * @return maxUses Maximum Rest uses per mission (0 = disabled)
+     * @return chargeRestore Charge amount restored per Rest action
+     */
+    function getMissionVariantRestConfig(
+        uint16 collectionId,
+        uint8 variantId
+    ) external view returns (uint8 maxUses, uint8 chargeRestore) {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        if (collectionId == 0 || collectionId > ms.passCollectionCounter) {
+            revert CollectionNotRegistered(collectionId);
+        }
+        if (variantId == 0 || variantId > ms.passCollections[collectionId].variantCount) {
+            revert VariantNotConfigured(collectionId, variantId);
+        }
+
+        LibMissionStorage.MissionVariantConfig storage config = ms.variantConfigs[collectionId][variantId];
+        return (config.maxRestUsesPerMission, config.restChargeRestore);
     }
 
     /**

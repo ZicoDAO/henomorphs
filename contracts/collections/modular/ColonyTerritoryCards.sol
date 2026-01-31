@@ -10,10 +10,19 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts/utils/Base64.sol";
-import {ModularSpecimen} from "../../diamonds/modular/base/ModularSpecimen.sol";
-import {ICollectionDiamond} from "../../diamonds/modular/interfaces/ICollectionDiamond.sol";
-import {TerritorySVGLib} from "../../diamonds/modular/libraries/TerritorySVGLib.sol";
-import {TerritoryMetadataLib} from "../../diamonds/modular/libraries/TerritoryMetadataLib.sol";
+import {ModularMerit} from "../base/ModularMerit.sol";
+import {IMeritCollection} from "../interfaces/IMeritCollection.sol";
+import {ICollectionDiamond} from "../interfaces/ICollectionDiamond.sol";
+import {TerritorySVGLib} from "../libraries/TerritorySVGLib.sol";
+import {TerritoryMetadataLib} from "../libraries/TerritoryMetadataLib.sol";
+
+/**
+ * @title ITerritoryManagement
+ * @notice Interface for Territory Management facet in Chargepod Diamond
+ */
+interface ITerritoryManagement {
+    function onCardTransferred(uint256 cardTokenId, address from, address to) external;
+}
 
 /**
  * @title ColonyTerritoryCards
@@ -33,12 +42,11 @@ contract ColonyTerritoryCards is
     ReentrancyGuardUpgradeable,
     PausableUpgradeable,
     UUPSUpgradeable,
-    ModularSpecimen
+    ModularMerit,
+    IMeritCollection
 {
-    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
-    bytes32 public constant COLONY_WARS_ROLE = keccak256("COLONY_WARS_ROLE");
-    bytes32 public constant DIAMOND_ROLE = keccak256("DIAMOND_ROLE");
+    // Role definitions inherited from ModularMerit:
+    // ADMIN_ROLE, MINTER_ROLE, COLONY_WARS_ROLE, DIAMOND_ROLE
 
     enum TerritoryType { ZicoMine, TradeHub, Fortress, Observatory, Sanctuary }
     enum Rarity { COMMON, UNCOMMON, RARE, EPIC, LEGENDARY }
@@ -61,8 +69,12 @@ contract ColonyTerritoryCards is
     mapping(uint256 => TerritoryTraits) private _territoryTraits;
     mapping(uint256 => uint256) private _territoryToColonyId;
     mapping(uint256 => bool) private _territoryActive;
+
+    // ==================== CONDITIONAL TRANSFER STORAGE ====================
+    // This mapping MUST remain at this exact storage slot for upgrade compatibility
+    // ModularMerit uses virtual _getApprovedTarget/_setApprovedTarget to access it
     mapping(uint256 => address) private _approvedTransferTarget;
-    
+
     uint256 private _tokenIdCounter;
     uint256 public maxSupply;
     string private _contractUri;
@@ -70,25 +82,25 @@ contract ColonyTerritoryCards is
     mapping(address => uint256) private _walletMintCount;
     uint256 public maxMintsPerWallet;
 
+    // Territory Management (Chargepod Diamond) for automatic takeover on transfer
+    address public territoryManagement;
+
     event TerritoryMinted(uint256 indexed tokenId, address indexed recipient, TerritoryType territoryType, Rarity rarity);
     event TerritoryAssignedToColony(uint256 indexed tokenId, uint256 indexed colonyId);
     event TerritoryActivated(uint256 indexed tokenId, uint256 indexed colonyId);
     event TerritoryDeactivated(uint256 indexed tokenId, uint256 indexed colonyId);
-    event TransferRequested(uint256 indexed tokenId, address indexed from, address indexed to);
-    event TransferApproved(uint256 indexed tokenId, address indexed to);
-    event TransferRejected(uint256 indexed tokenId, address indexed to, string reason);
+    // TransferRequested, TransferApproved, TransferRejected inherited from ModularMerit
     event TerritoryClaimedFromTreasury(uint256 indexed tokenId, address indexed treasury, address indexed recipient);
     event MaxMintsPerWalletUpdated(uint256 newLimit);
     event WalletMintCountReset(address indexed wallet);
+    event TerritoryManagementSet(address indexed newAddress);
 
     error MaxSupplyReached();
     error InvalidTerritoryType();
     error InvalidRarity();
     error TerritoryAlreadyAssigned();
     error TerritoryNotActive();
-    error TransferNotApproved();
-    error NotTokenOwner();
-    error CannotTransferToZeroAddress();
+    // TransferNotApproved, NotTokenOwner, CannotTransferToZeroAddress inherited from ModularMerit
     error TerritoryNotInTreasury();
     error InvalidTreasuryAddress();
     error AlreadyRevealed();
@@ -113,7 +125,7 @@ contract ColonyTerritoryCards is
         __ReentrancyGuard_init();
         __Pausable_init();
         __UUPSUpgradeable_init();
-        __ModularSpecimen_init(diamondAddress, collectionId_, 1, 1);
+        __ModularMerit_init(diamondAddress, collectionId_);
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
@@ -294,6 +306,16 @@ contract ColonyTerritoryCards is
             _walletMintCount[wallets[i]] = 0;
             emit WalletMintCountReset(wallets[i]);
         }
+    }
+
+    /**
+     * @notice Set Territory Management contract address (Chargepod Diamond)
+     * @dev This enables automatic territory takeover when cards are transferred
+     * @param _territoryManagement Address of the TerritoryManagementFacet
+     */
+    function setTerritoryManagement(address _territoryManagement) external onlyRole(ADMIN_ROLE) {
+        territoryManagement = _territoryManagement;
+        emit TerritoryManagementSet(_territoryManagement);
     }
 
     /**
@@ -478,11 +500,11 @@ contract ColonyTerritoryCards is
      * @notice Clear transfer approval
      * @dev Useful for expired approvals or changed conditions
      */
-    function clearTransferApproval(uint256 tokenId) 
-        external 
-        onlyRole(COLONY_WARS_ROLE) 
+    function clearTransferApproval(uint256 tokenId)
+        external
+        onlyRole(COLONY_WARS_ROLE)
     {
-        delete _approvedTransferTarget[tokenId];
+        _clearTransferApproval(tokenId);
     }
 
     /**
@@ -530,21 +552,15 @@ contract ColonyTerritoryCards is
         return _territoryToColonyId[tokenId];
     }
 
-    function isTerritoryActive(uint256 tokenId) 
-        external 
-        view 
-        returns (bool) 
+    function isTerritoryActive(uint256 tokenId)
+        external
+        view
+        returns (bool)
     {
         return _territoryActive[tokenId];
     }
 
-    function getApprovedTransferTarget(uint256 tokenId) 
-        external 
-        view 
-        returns (address) 
-    {
-        return _approvedTransferTarget[tokenId];
-    }
+    // getApprovedTransferTarget is inherited from ModularMerit
 
     // Internal calculation helpers (delegate to metadata library)
     function _calculateBonus(TerritoryType tType, Rarity rarity) 
@@ -580,67 +596,47 @@ contract ColonyTerritoryCards is
         );
     }
 
-    // ============ TRANSFER FUNCTIONS (Model D: Conditional Transfer) ============
+    // ============ TRANSFER FUNCTIONS (Model D via ModularMerit) ============
 
-    /**
-     * @notice Request transfer approval from COLONY_WARS_ROLE (for staking)
-     * @param tokenId Token to request transfer for
-     * @param to Target address for transfer
-     */
-    function requestTransfer(uint256 tokenId, address to) 
-        external 
-    {
-        if (ownerOf(tokenId) != msg.sender) revert NotTokenOwner();
-        if (ownerOf(tokenId) != msg.sender) revert NotTokenOwner();
-        if (to == address(0)) revert CannotTransferToZeroAddress();
+    function requestTransfer(uint256 tokenId, address to) external {
+        // Additional check: only active territories can be transfer-requested
         if (!_territoryActive[tokenId]) revert TerritoryNotActive();
-
-        _approvedTransferTarget[tokenId] = to;
-        emit TransferRequested(tokenId, msg.sender, to);
+        _requestTransfer(tokenId, to);
     }
 
-    /**
-     * @notice Approve transfer (called by MultiCollectionStakingFacet)
-     * @param tokenId Token to approve
-     * @param to Target address
-     */
-    function approveTransfer(uint256 tokenId, address to) 
-        external 
+    function approveTransfer(uint256 tokenId, address to)
+        external
         onlyRole(COLONY_WARS_ROLE)
     {
-        _approvedTransferTarget[tokenId] = to;
-        emit TransferApproved(tokenId, to);
+        _approveTransfer(tokenId, to);
     }
 
-    /**
-     * @notice Complete transfer after approval
-     * @param from Source address
-     * @param to Destination address
-     * @param tokenId Token to transfer
-     */
-    function completeTransfer(
-        address from,
-        address to,
-        uint256 tokenId
-    ) external onlyRole(COLONY_WARS_ROLE) {
-        if (_approvedTransferTarget[tokenId] != to) revert TransferNotApproved();
-        
-        delete _approvedTransferTarget[tokenId];
-        _transfer(from, to, tokenId);
-    }
-
-    /**
-     * @notice Reject transfer request
-     * @param tokenId Token to reject
-     * @param reason Rejection reason
-     */
-    function rejectTransfer(uint256 tokenId, string calldata reason) 
-        external 
+    function completeTransfer(address from, address to, uint256 tokenId)
+        external
         onlyRole(COLONY_WARS_ROLE)
     {
-        address to = _approvedTransferTarget[tokenId];
-        delete _approvedTransferTarget[tokenId];
-        emit TransferRejected(tokenId, to, reason);
+        if (_completeTransfer(from, to, tokenId)) {
+            _transfer(from, to, tokenId);
+        }
+    }
+
+    function rejectTransfer(uint256 tokenId, string calldata reason)
+        external
+        onlyRole(COLONY_WARS_ROLE)
+    {
+        _rejectTransfer(tokenId, reason);
+    }
+
+    // ============ COLONY INTEGRATION (IMeritCollection) ============
+
+    /// @inheritdoc IMeritCollection
+    function isAssigned(uint256 tokenId) external view override returns (bool) {
+        return _territoryToColonyId[tokenId] != 0;
+    }
+
+    /// @inheritdoc IMeritCollection
+    function getAssignmentTarget(uint256 tokenId) external view override returns (uint256) {
+        return _territoryToColonyId[tokenId];
     }
 
     // Admin functions
@@ -688,10 +684,12 @@ contract ColonyTerritoryCards is
      *      Burning (to == address(0)) always allowed
      */
     function _update(address to, uint256 tokenId, address auth)
-        internal 
+        internal
         override(ERC721Upgradeable, ERC721EnumerableUpgradeable)
         returns (address)
     {
+        address from = _ownerOf(tokenId);
+
         // Allow burning regardless of state
         if (to == address(0)) {
             // Clear approvals on burn
@@ -705,13 +703,26 @@ contract ColonyTerritoryCards is
             if (_approvedTransferTarget[tokenId] != to) {
                 revert TransferNotApproved();
             }
-            
+
             // Clear approval after successful use (one-time approval)
             delete _approvedTransferTarget[tokenId];
         }
-        
-        // Inactive territories transfer freely
-        return super._update(to, tokenId, auth);
+
+        // Perform the transfer
+        address previousOwner = super._update(to, tokenId, auth);
+
+        // Notify Territory Management about transfer (for automatic takeover)
+        // Only for actual transfers (not mints), when territory management is configured
+        if (territoryManagement != address(0) && from != address(0) && to != address(0)) {
+            try ITerritoryManagement(territoryManagement).onCardTransferred(tokenId, from, to) {
+                // Success - takeover handled by TerritoryManagementFacet
+            } catch {
+                // Ignore failures - transfer should not fail because of callback
+                // The territory remains with the previous colony if takeover fails
+            }
+        }
+
+        return previousOwner;
     }
 
     function _increaseBalance(address account, uint128 value)
@@ -730,17 +741,38 @@ contract ColonyTerritoryCards is
         return super.supportsInterface(interfaceId);
     }
 
-    // ModularSpecimen overrides
+    // ============ MODULAR MERIT OVERRIDES ============
+
     function _checkDiamondPermission() internal view override {
         _checkRole(DIAMOND_ROLE);
     }
 
-    /**
-     * @notice Check if token exists (required by ModularSpecimen)
-     * @param tokenId Token ID to check
-     * @return Whether token exists
-     */
     function _tokenExists(uint256 tokenId) internal view override returns (bool) {
         return _ownerOf(tokenId) != address(0);
+    }
+
+    function _isTokenOwner(uint256 tokenId, address account) internal view override returns (bool) {
+        return _ownerOf(tokenId) == account;
+    }
+
+    /**
+     * @notice Check transfer restrictions for territories
+     * @dev Active territories require explicit approval flow
+     *      This is handled in _update() override for this collection
+     */
+    function _checkTransferRestrictions(uint256 tokenId) internal view override {
+        // Territory-specific: active territories have restrictions
+        // but actual enforcement is in _update() to support the special
+        // behavior where inactive territories transfer freely
+        // This function is called by ModularMerit._requestTransfer()
+        // so we check the active state there in requestTransfer() override
+    }
+
+    function _getApprovedTarget(uint256 tokenId) internal view override returns (address) {
+        return _approvedTransferTarget[tokenId];
+    }
+
+    function _setApprovedTarget(uint256 tokenId, address target) internal override {
+        _approvedTransferTarget[tokenId] = target;
     }
 }

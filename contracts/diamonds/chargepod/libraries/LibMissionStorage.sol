@@ -2,7 +2,7 @@
 pragma solidity ^0.8.27;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {ControlFee} from "../../../libraries/HenomorphsModel.sol";
+import {ControlFee} from "../../libraries/HenomorphsModel.sol";
 
 /**
  * @title LibMissionStorage
@@ -34,6 +34,7 @@ library LibMissionStorage {
     uint8 constant CHARGE_COMBAT_DEFENSIVE = 5;
     uint8 constant CHARGE_STEALTH = 8;
     uint8 constant CHARGE_HACK = 6;
+    uint8 constant CHARGE_REST_DEFAULT = 10;  // Default charge restore for Rest action
 
     // ============================================================
     // ENUMS
@@ -299,6 +300,36 @@ library LibMissionStorage {
     }
 
     // ============================================================
+    // TEMPLATE STRUCTURES (for configurable objectives & events)
+    // ============================================================
+
+    /**
+     * @notice Template for generating mission objectives
+     * @dev Allows admins to configure objective types and parameters per variant
+     */
+    struct ObjectiveTemplate {
+        ObjectiveType objectiveType;    // Type of objective
+        uint8 minTarget;                // Minimum target amount (e.g., 3 items)
+        uint8 maxTarget;                // Maximum target amount (e.g., 7 items)
+        bool isRequired;                // true = required, false = bonus
+        uint16 bonusRewardBps;          // Bonus reward for completion (basis points)
+        bool enabled;                   // Whether this template is active
+    }
+
+    /**
+     * @notice Template for generating mission events
+     * @dev Allows admins to configure event types and parameters per variant
+     */
+    struct EventTemplate {
+        EventType eventType;            // Type of event
+        uint8 minDifficulty;            // Minimum difficulty (1-10)
+        uint8 maxDifficulty;            // Maximum difficulty (1-10)
+        uint8 weight;                   // Selection weight (1-100, higher = more frequent)
+        uint16 penaltyBps;              // Penalty for ignoring event (basis points)
+        bool enabled;                   // Whether this template is active
+    }
+
+    // ============================================================
     // CONFIG STRUCTURES
     // ============================================================
 
@@ -336,7 +367,7 @@ library LibMissionStorage {
         uint8 maxCombatNodes;
         uint8 lootNodeChance;          // Percent (0-100)
 
-        // Objectives
+        // Objectives (legacy, kept for backward compatibility)
         uint8 requiredObjectivesCount;
         uint8 bonusObjectivesCount;
 
@@ -357,6 +388,19 @@ library LibMissionStorage {
         uint16 perfectCompletionBonus; // All objectives + no damage
 
         bool enabled;
+
+        // ============ CONFIGURABLE TEMPLATES ============
+        // Objective templates (max 8, matches MAX_OBJECTIVES)
+        ObjectiveTemplate[8] objectiveTemplates;
+        uint8 objectiveTemplateCount;  // Number of active templates (0 = use legacy)
+
+        // Event templates (max 8)
+        EventTemplate[8] eventTemplates;
+        uint8 eventTemplateCount;      // Number of active templates (0 = use legacy)
+
+        // ============ REST ACTION CONFIG ============
+        uint8 maxRestUsesPerMission;   // Max Rest uses per mission (0 = disabled)
+        uint8 restChargeRestore;       // Charge amount restored per Rest action
     }
 
     /**

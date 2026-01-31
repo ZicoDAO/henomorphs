@@ -3,17 +3,18 @@ pragma solidity ^0.8.27;
 
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
-import {LibBiopodIntegration} from "../../staking/libraries/LibBiopodIntegration.sol";
+import {LibBiopodIntegration} from "../libraries/LibBiopodIntegration.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
-import {PodsUtils} from "../../../libraries/PodsUtils.sol";
+import {PodsUtils} from "../../libraries/PodsUtils.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-import {ControlFee, SpecimenCollection, PowerMatrix, Calibration} from "../../../libraries/HenomorphsModel.sol";
-import {ISpecimenBiopod} from "../../../interfaces/ISpecimenBiopod.sol";
-import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
+import {ControlFee, SpecimenCollection, PowerMatrix, Calibration} from "../../libraries/HenomorphsModel.sol";
+import {ISpecimenBiopod} from "../../interfaces/ISpecimenBiopod.sol";
+import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
+import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
 import {ChargeCalculator} from "../libraries/ChargeCalculator.sol";
-import {IStakingSystem, IExternalCollection} from "../../staking/interfaces/IStakingInterfaces.sol";
+import {IStakingSystem, IExternalCollection} from "../interfaces/IStakingInterfaces.sol";
+import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 
 /**
  * @title RepairFacet 
@@ -837,5 +838,220 @@ contract RepairFacet is AccessControlBase {
         charge.intelligence = 10;
         charge.calibrationCount = 0;
         charge.lastInteraction = 0;
+    }
+
+    // ==================== RESOURCE-BASED REPAIR ====================
+
+    event WearRepairedWithResources(
+        uint256 indexed collectionId,
+        uint256 indexed tokenId,
+        address indexed user,
+        uint256 wearReduced,
+        uint256 bioCost,
+        uint256 basicCost
+    );
+
+    error ResourceRepairNotEnabled();
+    error InsufficientBioResources(uint256 required, uint256 available);
+    error InsufficientBasicResources(uint256 required, uint256 available);
+    error InvalidWearAmount();
+
+    /**
+     * @notice Repair wear using Bio + Basic resources instead of YLW tokens
+     * @dev RESOURCE SINK: Alternative F2P repair path using in-game resources
+     *      - Wear repair costs: bioPerWearPoint Bio + basicPerWearPoint Basic per wear point
+     *      - This is cheaper than token repair by discountBasisPoints (default 20%)
+     *      - Charge repair is NOT available via resources (use Energy for cooldown boost instead)
+     * @param collectionId Collection ID
+     * @param tokenId Henomorph token ID
+     * @param wearReduction Amount of wear to reduce
+     * @return actualReduced Actual wear points reduced
+     */
+    function repairWearWithResources(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint256 wearReduction
+    ) external nonReentrant returns (uint256 actualReduced) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        // Check if enabled
+        if (!rs.resourceRepairConfig.enabled) revert ResourceRepairNotEnabled();
+
+        // Validate amount
+        if (wearReduction == 0 || wearReduction > MAX_REPAIR_AMOUNT) {
+            revert InvalidWearAmount();
+        }
+
+        // Check permissions
+        _checkRepairPermissions(collectionId, tokenId);
+
+        address user = LibMeta.msgSender();
+
+        // Apply decay before checking balance
+        LibResourceStorage.applyResourceDecay(user);
+
+        // Get current wear and calculate actual reduction
+        uint256 currentWear = _getCurrentWear(collectionId, tokenId);
+        actualReduced = wearReduction > currentWear ? currentWear : wearReduction;
+
+        if (actualReduced == 0) {
+            revert HenomorphFullyRepaired();
+        }
+
+        // Calculate and verify costs
+        uint256 bioCost = actualReduced * rs.resourceRepairConfig.bioPerWearPoint;
+        uint256 basicCost = actualReduced * rs.resourceRepairConfig.basicPerWearPoint;
+
+        if (rs.userResources[user][LibResourceStorage.BIO_COMPOUNDS] < bioCost) {
+            revert InsufficientBioResources(bioCost, rs.userResources[user][LibResourceStorage.BIO_COMPOUNDS]);
+        }
+        if (rs.userResources[user][LibResourceStorage.BASIC_MATERIALS] < basicCost) {
+            revert InsufficientBasicResources(basicCost, rs.userResources[user][LibResourceStorage.BASIC_MATERIALS]);
+        }
+
+        // Consume resources
+        rs.userResources[user][LibResourceStorage.BIO_COMPOUNDS] -= bioCost;
+        rs.userResources[user][LibResourceStorage.BASIC_MATERIALS] -= basicCost;
+
+        // Apply wear repair via existing system
+        if (!LibBiopodIntegration.applyWearRepair(collectionId, tokenId, actualReduced)) {
+            // Refund resources on failure
+            rs.userResources[user][LibResourceStorage.BIO_COMPOUNDS] += bioCost;
+            rs.userResources[user][LibResourceStorage.BASIC_MATERIALS] += basicCost;
+            revert RepairOperationFailed("Wear repair via Biopod failed");
+        }
+
+        // Notify Staking system of wear change
+        _notifyStakingOfWearChange(collectionId, tokenId, currentWear, actualReduced);
+
+        emit WearRepairedWithResources(collectionId, tokenId, user, actualReduced, bioCost, basicCost);
+    }
+
+    /**
+     * @notice Notify staking system of wear change
+     */
+    function _notifyStakingOfWearChange(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint256 currentWear,
+        uint256 reduced
+    ) private {
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+        if (hs.stakingSystemAddress != address(0)) {
+            uint256 newWear = currentWear > reduced ? currentWear - reduced : 0;
+            try IStakingSystem(hs.stakingSystemAddress).notifyWearChange(collectionId, tokenId, newWear) {} catch {}
+        }
+    }
+
+    /**
+     * @notice Preview resource-based wear repair costs
+     * @param user User address
+     * @param collectionId Collection ID
+     * @param tokenId Token ID
+     * @param wearReduction Desired wear reduction
+     * @return canRepair Whether user can afford the repair
+     * @return reason Failure reason if cannot repair
+     * @return bioCost Bio resources needed
+     * @return basicCost Basic resources needed
+     * @return actualReduction Actual wear that will be reduced
+     */
+    function previewResourceRepair(
+        address user,
+        uint256 collectionId,
+        uint256 tokenId,
+        uint256 wearReduction
+    ) external view returns (
+        bool canRepair,
+        string memory reason,
+        uint256 bioCost,
+        uint256 basicCost,
+        uint256 actualReduction
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        if (!rs.resourceRepairConfig.enabled) {
+            return (false, "Resource repair not enabled", 0, 0, 0);
+        }
+
+        if (wearReduction == 0 || wearReduction > MAX_REPAIR_AMOUNT) {
+            return (false, "Invalid wear amount", 0, 0, 0);
+        }
+
+        // Get current wear from Biopod
+        uint256 currentWear = _getCurrentWear(collectionId, tokenId);
+
+        if (currentWear == 0) {
+            return (false, "No wear to repair", 0, 0, 0);
+        }
+
+        // Calculate actual reduction and costs
+        actualReduction = wearReduction > currentWear ? currentWear : wearReduction;
+        bioCost = actualReduction * rs.resourceRepairConfig.bioPerWearPoint;
+        basicCost = actualReduction * rs.resourceRepairConfig.basicPerWearPoint;
+
+        // Check if user has enough resources
+        if (rs.userResources[user][LibResourceStorage.BIO_COMPOUNDS] < bioCost) {
+            return (false, "Insufficient Bio", bioCost, basicCost, actualReduction);
+        }
+
+        if (rs.userResources[user][LibResourceStorage.BASIC_MATERIALS] < basicCost) {
+            return (false, "Insufficient Basic", bioCost, basicCost, actualReduction);
+        }
+
+        return (true, "", bioCost, basicCost, actualReduction);
+    }
+
+    /**
+     * @notice Get current wear from Biopod
+     */
+    function _getCurrentWear(uint256 collectionId, uint256 tokenId) private view returns (uint256) {
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+        address biopod = hs.specimenCollections[collectionId].biopodAddress;
+
+        if (biopod != address(0)) {
+            try ISpecimenBiopod(biopod).probeCalibration(collectionId, tokenId) returns (Calibration memory cal) {
+                return cal.wear;
+            } catch {}
+        }
+        return 0;
+    }
+
+    /**
+     * @notice Get resource repair configuration
+     */
+    function getResourceRepairConfig() external view returns (
+        uint256 bioPerWearPoint,
+        uint256 basicPerWearPoint,
+        uint16 discountBasisPoints,
+        bool enabled
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        LibResourceStorage.ResourceRepairConfig storage config = rs.resourceRepairConfig;
+
+        return (
+            config.bioPerWearPoint,
+            config.basicPerWearPoint,
+            config.discountBasisPoints,
+            config.enabled
+        );
+    }
+
+    /**
+     * @notice Configure resource repair parameters (ADMIN ONLY)
+     */
+    function configureResourceRepair(
+        uint256 bioPerWearPoint,
+        uint256 basicPerWearPoint,
+        uint16 discountBasisPoints,
+        bool enabled
+    ) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        rs.resourceRepairConfig = LibResourceStorage.ResourceRepairConfig({
+            bioPerWearPoint: bioPerWearPoint,
+            basicPerWearPoint: basicPerWearPoint,
+            discountBasisPoints: discountBasisPoints,
+            enabled: enabled
+        });
     }
 }

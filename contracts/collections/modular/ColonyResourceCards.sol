@@ -9,8 +9,9 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {ModularSpecimen} from "../../diamonds/modular/base/ModularSpecimen.sol";
-import {ResourceSVGLib} from "../../diamonds/modular/libraries/ResourceSVGLib.sol";
+import {ModularMerit} from "../base/ModularMerit.sol";
+import {IMeritCollection} from "../interfaces/IMeritCollection.sol";
+import {ResourceSVGLib} from "../libraries/ResourceSVGLib.sol";
 import {IResourceDescriptor} from "./interfaces/IResourceDescriptor.sol";
 
 /**
@@ -37,12 +38,11 @@ contract ColonyResourceCards is
     ReentrancyGuardUpgradeable,
     PausableUpgradeable,
     UUPSUpgradeable,
-    ModularSpecimen
+    ModularMerit,
+    IMeritCollection
 {
-    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
-    bytes32 public constant COLONY_WARS_ROLE = keccak256("COLONY_WARS_ROLE");
-    bytes32 public constant DIAMOND_ROLE = keccak256("DIAMOND_ROLE");
+    // Role definitions inherited from ModularMerit:
+    // ADMIN_ROLE, MINTER_ROLE, COLONY_WARS_ROLE, DIAMOND_ROLE
 
     // Rarity thresholds (out of 10000) - matching ColonyTerritoryCards
     uint256 private constant LEGENDARY_THRESHOLD = 100;   // 1%
@@ -54,7 +54,12 @@ contract ColonyResourceCards is
     mapping(uint256 => ResourceSVGLib.ResourceTraits) private _resourceTraits;
     mapping(uint256 => uint256) private _stakedToNode;
     mapping(uint256 => bool) private _isStaked;
+
+    // ==================== CONDITIONAL TRANSFER STORAGE ====================
+    // This mapping MUST remain at this exact storage slot for upgrade compatibility
+    // ModularMerit uses virtual _getApprovedTarget/_setApprovedTarget to access it
     mapping(uint256 => address) private _approvedTransferTarget;
+
     mapping(address => uint256) private _walletMintCount;
 
     uint256 private _tokenIdCounter;
@@ -81,8 +86,7 @@ contract ColonyResourceCards is
     event ResourceStaked(uint256 indexed tokenId, uint256 indexed nodeId);
     event ResourceUnstaked(uint256 indexed tokenId, uint256 indexed nodeId);
     event ResourcesCombined(uint256[] burnedTokens, uint256 indexed newTokenId);
-    event TransferRequested(uint256 indexed tokenId, address indexed from, address indexed to);
-    event TransferApproved(uint256 indexed tokenId, address indexed to);
+    // TransferRequested, TransferApproved, TransferRejected inherited from ModularMerit
     event MetadataRendererUpdated(address indexed oldRenderer, address indexed newRenderer);
 
     error MaxSupplyReached();
@@ -91,8 +95,7 @@ contract ColonyResourceCards is
     error InvalidRarity();
     error ResourceAlreadyStaked();
     error ResourceNotStaked();
-    error TransferNotApproved();
-    error NotTokenOwner();
+    // TransferNotApproved, NotTokenOwner inherited from ModularMerit
     error CannotTransferWhileStaked();
     error InvalidCombineInput();
     error InvalidMetadataRenderer();
@@ -118,7 +121,7 @@ contract ColonyResourceCards is
         __ReentrancyGuard_init();
         __Pausable_init();
         __UUPSUpgradeable_init();
-        __ModularSpecimen_init(diamondAddress, collectionId_, 1, 1);
+        __ModularMerit_init(diamondAddress, collectionId_);
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
@@ -284,8 +287,9 @@ contract ColonyResourceCards is
 
         // Cannot upgrade Legendary
         if (baseRarity == ResourceSVGLib.Rarity.Legendary) revert InvalidCombineInput();
+        address tokenOwner = ownerOf(tokenIds[0]); 
 
-        // Burn old tokens
+        // Burn old tokens (bypass approval check - COLONY_WARS_ROLE is trusted)
         for (uint256 i = 0; i < 3; i++) {
             _burn(tokenIds[i]);
         }
@@ -303,7 +307,8 @@ contract ColonyResourceCards is
             maxStack: _getMaxStackSize(rType)
         });
 
-        _safeMint(msg.sender, newTokenId);
+        
+        _safeMint(tokenOwner, newTokenId);
         emit ResourcesCombined(tokenIds, newTokenId);
 
         return newTokenId;
@@ -366,33 +371,45 @@ contract ColonyResourceCards is
         return uint256(traits.yieldBonus) * uint256(traits.qualityLevel);
     }
 
-    // ============ TRANSFER FUNCTIONS (Model D) ============
+    // ============ TRANSFER FUNCTIONS (Model D via ModularMerit) ============
 
     function requestTransfer(uint256 tokenId, address to) external {
-        if (ownerOf(tokenId) != msg.sender) revert NotTokenOwner();
-        if (_isStaked[tokenId]) revert CannotTransferWhileStaked();
-
-        _approvedTransferTarget[tokenId] = to;
-        emit TransferRequested(tokenId, msg.sender, to);
+        _requestTransfer(tokenId, to);
     }
 
     function approveTransfer(uint256 tokenId, address to)
         external
         onlyRole(COLONY_WARS_ROLE)
     {
-        _approvedTransferTarget[tokenId] = to;
-        emit TransferApproved(tokenId, to);
+        _approveTransfer(tokenId, to);
     }
 
     function completeTransfer(address from, address to, uint256 tokenId)
         external
         onlyRole(COLONY_WARS_ROLE)
     {
-        if (_approvedTransferTarget[tokenId] != to) revert TransferNotApproved();
-        if (_isStaked[tokenId]) revert CannotTransferWhileStaked();
+        if (_completeTransfer(from, to, tokenId)) {
+            _transfer(from, to, tokenId);
+        }
+    }
 
-        delete _approvedTransferTarget[tokenId];
-        _transfer(from, to, tokenId);
+    function rejectTransfer(uint256 tokenId, string calldata reason)
+        external
+        onlyRole(COLONY_WARS_ROLE)
+    {
+        _rejectTransfer(tokenId, reason);
+    }
+
+    // ============ COLONY INTEGRATION (IMeritCollection) ============
+
+    /// @inheritdoc IMeritCollection
+    function isAssigned(uint256 tokenId) external view override returns (bool) {
+        return _isStaked[tokenId];
+    }
+
+    /// @inheritdoc IMeritCollection
+    function getAssignmentTarget(uint256 tokenId) external view override returns (uint256) {
+        return _stakedToNode[tokenId];
     }
 
     // ============ ADMIN FUNCTIONS ============
@@ -505,12 +522,30 @@ contract ColonyResourceCards is
         return 10; // RareElements - most limited
     }
 
+    // ============ MODULAR MERIT OVERRIDES ============
+
     function _checkDiamondPermission() internal view override {
         _checkRole(DIAMOND_ROLE);
     }
 
     function _tokenExists(uint256 tokenId) internal view override returns (bool) {
         return _ownerOf(tokenId) != address(0);
+    }
+
+    function _isTokenOwner(uint256 tokenId, address account) internal view override returns (bool) {
+        return _ownerOf(tokenId) == account;
+    }
+
+    function _checkTransferRestrictions(uint256 tokenId) internal view override {
+        if (_isStaked[tokenId]) revert CannotTransferWhileStaked();
+    }
+
+    function _getApprovedTarget(uint256 tokenId) internal view override returns (address) {
+        return _approvedTransferTarget[tokenId];
+    }
+
+    function _setApprovedTarget(uint256 tokenId, address target) internal override {
+        _approvedTransferTarget[tokenId] = target;
     }
 
     function _authorizeUpgrade(address) internal override onlyRole(ADMIN_ROLE) {}

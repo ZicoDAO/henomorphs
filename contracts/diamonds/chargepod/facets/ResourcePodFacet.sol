@@ -17,6 +17,15 @@ import {IColonyTerritoryCards} from "../interfaces/IColonyTerritoryCards.sol";
 import {IStakingSystem} from "../interfaces/IStakingInterfaces.sol";
 
 /**
+ * @notice Minimal interface for ResourceEventFacet inter-facet calls
+ */
+interface IResourceEventFacet {
+    function getActiveResourceEvents() external view returns (string[] memory);
+    function getActiveProductionMultiplier(uint8 resourceType) external view returns (uint16);
+    function recordEventAction(string calldata eventId, address user) external;
+}
+
+/**
  * @title ResourcePodFacet
  * @notice Passive resource generation from NFT activity integration
  * @dev Integrates with Chargepod/Biopod systems for automatic resource generation
@@ -301,11 +310,14 @@ contract ResourcePodFacet is AccessControlBase {
         if (generationRate > 0) {
             uint256 combinedId = PodsUtils.combineIds(collectionId, tokenId);
             address tokenOwner = _getTokenOwner(collectionId, tokenId);
-            
+
             if (tokenOwner == address(0)) return 0;
-            
+
             // Apply Territory Card bonuses
             generationRate = _applyTerritoryBonuses(tokenOwner, generationRate);
+
+            // Apply Resource Event production multiplier (if any active events)
+            generationRate = _applyEventMultiplier(generationRate, resourceType);
 
             // Apply decay before adding new resources
             LibResourceStorage.applyResourceDecay(tokenOwner);
@@ -313,20 +325,24 @@ contract ResourcePodFacet is AccessControlBase {
             // Update user resources
             rs.userResources[tokenOwner][resourceType] += generationRate;
             rs.userResourcesLastUpdate[tokenOwner] = uint32(block.timestamp);
-            
+
             // Update token generation stats
             rs.tokenResourceGeneration[combinedId][resourceType] += generationRate;
             rs.tokenLastGeneration[combinedId] = uint32(block.timestamp);
-            
+
             // Update global stats
             unchecked {
                 rs.totalResourcesGenerated += generationRate;
             }
-            
+
             emit ResourceGenerated(tokenOwner, collectionId, tokenId, resourceType, generationRate);
+
+            // Record action for active Resource Events (for leaderboard tracking)
+            _recordEventActions(tokenOwner);
+
             return generationRate;
         }
-        
+
         return 0;
     }
 
@@ -354,20 +370,26 @@ contract ResourcePodFacet is AccessControlBase {
 
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
 
+        // Apply Resource Event production multiplier (if any active events)
+        uint256 adjustedAmount = _applyEventMultiplier(amount, resourceType);
+
         // Apply decay before adding new resources
         LibResourceStorage.applyResourceDecay(user);
 
         // Update user resources
-        rs.userResources[user][resourceType] += amount;
+        rs.userResources[user][resourceType] += adjustedAmount;
         rs.userResourcesLastUpdate[user] = uint32(block.timestamp);
 
         // Update global stats
         unchecked {
-            rs.totalResourcesGenerated += amount;
+            rs.totalResourcesGenerated += adjustedAmount;
         }
 
         // Emit event with collectionId=0, tokenId=0 to indicate direct award
-        emit ResourceGenerated(user, 0, 0, resourceType, amount);
+        emit ResourceGenerated(user, 0, 0, resourceType, adjustedAmount);
+
+        // Record action for active Resource Events (for leaderboard tracking)
+        _recordEventActions(user);
 
         return true;
     }
@@ -583,7 +605,7 @@ contract ResourcePodFacet is AccessControlBase {
 
         // Verify territory ownership
         LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
-        bytes32 colonyId = cws.userToColony[user];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(user);
 
         if (territory.controllingColony != colonyId || colonyId == bytes32(0)) {
             revert TerritoryNotOwned(territoryId);
@@ -742,12 +764,24 @@ contract ResourcePodFacet is AccessControlBase {
      */
     function getUserResources(address user) external view returns (uint256[4] memory resources) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        
+
         for (uint8 i = 0; i < 4; i++) {
             resources[i] = rs.userResources[user][i];
         }
-        
+
         return resources;
+    }
+
+    /**
+     * @notice Get user's balance for a specific resource type
+     * @param user Address to check
+     * @param resourceType Type of resource (0=Basic, 1=Energy, 2=Bio, 3=Rare)
+     * @return balance The user's balance for the specified resource type
+     */
+    function getUserResourceBalance(address user, uint8 resourceType) external view returns (uint256 balance) {
+        if (resourceType > 3) revert InvalidConfiguration("resource type");
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        return rs.userResources[user][resourceType];
     }
     
     /**
@@ -989,7 +1023,7 @@ contract ResourcePodFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
 
         // Get user's colony directly from storage
-        bytes32 colonyId = cws.userToColony[user];
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(user);
         if (colonyId == bytes32(0)) {
             return baseAmount;
         }
@@ -1036,6 +1070,9 @@ contract ResourcePodFacet is AccessControlBase {
             boostedAmount = baseAmount;
         }
 
+        // Apply Energy Surge production boost (if active)
+        boostedAmount = LibResourceStorage.applyProductionBoost(user, boostedAmount);
+
         return boostedAmount;
     }
 
@@ -1046,5 +1083,250 @@ contract ResourcePodFacet is AccessControlBase {
     function _isAuthorizedForColony(bytes32 colonyId, address /* user */) internal view returns (bool) {
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
         return ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress);
+    }
+
+    // ==================== ENERGY SURGE BOOST ====================
+
+    event EnergySurgeActivated(address indexed user, uint256 energyAmount, uint16 boostMultiplier, uint32 endTime);
+
+    error EnergySurgeNotEnabled();
+    error InsufficientEnergyForSurge(uint256 required, uint256 available);
+    error EnergySurgeAmountBelowMinimum(uint256 provided, uint256 minimum);
+
+    /**
+     * @notice Activate Energy Surge to boost production from territories
+     * @dev RESOURCE SINK: Consumes Energy Crystals for temporary production bonus
+     *      Formula: boostMultiplier = energyAmount / resourcePerBasisPoint (capped at maxMultiplier)
+     *               duration = energyAmount * durationPerResource
+     * @param energyAmount Amount of Energy Crystals to consume
+     * @return boostMultiplier Bonus in basis points (e.g., 5000 = +50%)
+     * @return endTime Timestamp when boost expires
+     */
+    function activateEnergySurge(uint256 energyAmount)
+        external
+        whenNotPaused
+        returns (uint16 boostMultiplier, uint32 endTime)
+    {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        LibResourceStorage.BoostConfig storage config = rs.energySurgeConfig;
+
+        // Check if enabled
+        if (!config.enabled) revert EnergySurgeNotEnabled();
+
+        // Check minimum amount
+        if (energyAmount < config.minResourceAmount) {
+            revert EnergySurgeAmountBelowMinimum(energyAmount, config.minResourceAmount);
+        }
+
+        address user = LibMeta.msgSender();
+
+        // Apply decay before checking balance
+        LibResourceStorage.applyResourceDecay(user);
+
+        // Check user has enough Energy resources
+        uint256 available = rs.userResources[user][LibResourceStorage.ENERGY_CRYSTALS];
+        if (available < energyAmount) {
+            revert InsufficientEnergyForSurge(energyAmount, available);
+        }
+
+        // Calculate boost multiplier (basis points)
+        uint256 calculatedMultiplier = energyAmount / config.resourcePerBasisPoint;
+        if (calculatedMultiplier > config.maxMultiplier) {
+            calculatedMultiplier = config.maxMultiplier;
+        }
+        boostMultiplier = uint16(calculatedMultiplier);
+
+        // Calculate duration
+        uint256 duration = energyAmount * config.durationPerResource;
+        endTime = uint32(block.timestamp + duration);
+
+        // If user has existing boost, extend time (additive) but DON'T stack multiplier
+        if (rs.productionBoostEndTime[user] > uint32(block.timestamp)) {
+            endTime = rs.productionBoostEndTime[user] + uint32(duration);
+            if (rs.productionBoostMultiplier[user] > boostMultiplier) {
+                boostMultiplier = rs.productionBoostMultiplier[user];
+            }
+        }
+
+        // Consume Energy resources
+        rs.userResources[user][LibResourceStorage.ENERGY_CRYSTALS] -= energyAmount;
+
+        // Set boost
+        rs.productionBoostEndTime[user] = endTime;
+        rs.productionBoostMultiplier[user] = boostMultiplier;
+
+        // Update stats
+        rs.totalBoostsActivated++;
+        rs.totalResourcesConsumedByBoosts += energyAmount;
+
+        emit EnergySurgeActivated(user, energyAmount, boostMultiplier, endTime);
+    }
+
+    /**
+     * @notice Get user's current Energy Surge boost status
+     * @param user User address
+     * @return isActive Whether boost is currently active
+     * @return multiplier Current boost multiplier (basis points)
+     * @return endTime When boost expires (0 if none)
+     * @return remainingSeconds Seconds until boost expires
+     */
+    function getEnergySurgeStatus(address user) external view returns (
+        bool isActive,
+        uint16 multiplier,
+        uint32 endTime,
+        uint32 remainingSeconds
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        endTime = rs.productionBoostEndTime[user];
+        multiplier = rs.productionBoostMultiplier[user];
+
+        if (endTime > uint32(block.timestamp)) {
+            isActive = true;
+            remainingSeconds = endTime - uint32(block.timestamp);
+        } else {
+            isActive = false;
+            remainingSeconds = 0;
+        }
+    }
+
+    /**
+     * @notice Preview Energy Surge activation
+     * @param user User address
+     * @param energyAmount Amount to spend
+     * @return canActivate Whether user can activate with this amount
+     * @return reason Failure reason if cannot activate
+     * @return expectedMultiplier Expected boost multiplier
+     * @return expectedEndTime Expected boost end time
+     */
+    function previewEnergySurge(address user, uint256 energyAmount) external view returns (
+        bool canActivate,
+        string memory reason,
+        uint16 expectedMultiplier,
+        uint32 expectedEndTime
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        LibResourceStorage.BoostConfig storage config = rs.energySurgeConfig;
+
+        if (!config.enabled) {
+            return (false, "Energy Surge not enabled", 0, 0);
+        }
+
+        if (energyAmount < config.minResourceAmount) {
+            return (false, "Amount below minimum", 0, 0);
+        }
+
+        uint256 available = rs.userResources[user][LibResourceStorage.ENERGY_CRYSTALS];
+        if (available < energyAmount) {
+            return (false, "Insufficient Energy resources", 0, 0);
+        }
+
+        // Calculate expected results
+        uint256 calcMultiplier = energyAmount / config.resourcePerBasisPoint;
+        if (calcMultiplier > config.maxMultiplier) {
+            calcMultiplier = config.maxMultiplier;
+        }
+        expectedMultiplier = uint16(calcMultiplier);
+
+        uint256 duration = energyAmount * config.durationPerResource;
+        expectedEndTime = uint32(block.timestamp + duration);
+
+        // Account for existing boost extension
+        if (rs.productionBoostEndTime[user] > uint32(block.timestamp)) {
+            expectedEndTime = rs.productionBoostEndTime[user] + uint32(duration);
+            if (rs.productionBoostMultiplier[user] > expectedMultiplier) {
+                expectedMultiplier = rs.productionBoostMultiplier[user];
+            }
+        }
+
+        canActivate = true;
+        reason = "";
+    }
+
+    /**
+     * @notice Get Energy Surge configuration
+     */
+    function getEnergySurgeConfig() external view returns (
+        uint256 resourcePerBasisPoint,
+        uint256 durationPerResource,
+        uint16 maxMultiplier,
+        uint256 minResourceAmount,
+        bool enabled
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        LibResourceStorage.BoostConfig storage config = rs.energySurgeConfig;
+
+        return (
+            config.resourcePerBasisPoint,
+            config.durationPerResource,
+            config.maxMultiplier,
+            config.minResourceAmount,
+            config.enabled
+        );
+    }
+
+    /**
+     * @notice Configure Energy Surge parameters (ADMIN ONLY)
+     */
+    function configureEnergySurge(
+        uint256 resourcePerBasisPoint,
+        uint256 durationPerResource,
+        uint16 maxMultiplier,
+        uint256 minResourceAmount,
+        bool enabled
+    ) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        rs.energySurgeConfig = LibResourceStorage.BoostConfig({
+            resourcePerBasisPoint: resourcePerBasisPoint,
+            durationPerResource: durationPerResource,
+            maxMultiplier: maxMultiplier,
+            minResourceAmount: minResourceAmount,
+            enabled: enabled
+        });
+    }
+
+    // ==================== RESOURCE EVENT INTEGRATION ====================
+
+    /**
+     * @notice Apply Resource Event production multiplier
+     * @dev Calls ResourceEventFacet via inter-facet call to get active multiplier
+     * @param baseAmount Base resource amount before multiplier
+     * @param resourceType Type of resource being generated
+     * @return adjustedAmount Amount after applying event multiplier
+     */
+    function _applyEventMultiplier(uint256 baseAmount, uint8 resourceType) internal view returns (uint256 adjustedAmount) {
+        try IResourceEventFacet(address(this)).getActiveProductionMultiplier(resourceType) returns (uint16 multiplier) {
+            // Multiplier is in basis points (10000 = 100%, 20000 = 200%)
+            if (multiplier > 10000) {
+                adjustedAmount = (baseAmount * multiplier) / 10000;
+            } else {
+                adjustedAmount = baseAmount;
+            }
+        } catch {
+            // If ResourceEventFacet is not deployed or call fails, use base amount
+            adjustedAmount = baseAmount;
+        }
+    }
+
+    /**
+     * @notice Record actions for all active Resource Events
+     * @dev Calls ResourceEventFacet via inter-facet call for leaderboard tracking
+     * @param user User who performed the action
+     */
+    function _recordEventActions(address user) internal {
+        try IResourceEventFacet(address(this)).getActiveResourceEvents() returns (string[] memory activeEvents) {
+            for (uint256 i = 0; i < activeEvents.length; i++) {
+                // Record action for each active event (for leaderboard tracking)
+                // This call is onlyTrusted, which allows inter-facet calls
+                try IResourceEventFacet(address(this)).recordEventAction(activeEvents[i], user) {
+                    // Action recorded successfully
+                } catch {
+                    // If recording fails, continue with other events
+                }
+            }
+        } catch {
+            // If ResourceEventFacet is not deployed or call fails, skip event recording
+        }
     }
 }

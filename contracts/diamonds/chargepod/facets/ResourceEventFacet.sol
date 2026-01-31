@@ -5,7 +5,7 @@ import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibGamingStorage} from "../libraries/LibGamingStorage.sol";
-import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {AccessControlBase} from "./AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -39,37 +39,53 @@ contract ResourceEventFacet is AccessControlBase {
     error InsufficientContribution(uint256 required, uint256 provided);
     error RewardsNotAvailable();
     error LeaderboardFull();
+    error InvalidEventId();
     
     // Storage structures moved to LibResourceStorage
     
     // ==================== EVENT MANAGEMENT ====================
     
     /**
-     * @notice Start resource event tied to seasonal event
-     * @dev Called by SeasonFacet when unified season starts
+     * @notice Start resource event with explicit start and end times
+     * @dev Supports scheduled events (future start) or immediate start (startTime = 0)
+     * @param eventId Unique event identifier
+     * @param eventType Event type (1=Rush, 3=Festival, 11-14=Per-resource)
+     * @param startTime Start timestamp (0 = start now)
+     * @param endTime End timestamp
+     * @param productionMultiplier Production bonus in basis points (20000 = 200%)
+     * @param costReduction Cost reduction in basis points (2500 = 25%)
+     * @param rewardPool Total reward pool in tokens
      */
     function startResourceEvent(
         string calldata eventId,
         uint8 eventType,
-        uint32 duration,
+        uint40 startTime,
+        uint40 endTime,
         uint16 productionMultiplier,
         uint16 costReduction,
         uint256 rewardPool
     ) external onlyAuthorized whenNotPaused {
+        // Validate eventId is not empty
+        if (bytes(eventId).length == 0) revert InvalidEventId();
+
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        
+
         // Check if event already exists in active events
         bytes32 eventHash = keccak256(bytes(eventId));
         if (rs.resourceEvents[eventHash].active) revert AlreadyParticipating(eventId);
-        
-        uint32 currentTime = uint32(block.timestamp);
-        
+
+        // If startTime is 0, use current block timestamp
+        uint40 actualStartTime = startTime == 0 ? uint40(block.timestamp) : startTime;
+
+        // Validate end time is after start time
+        require(endTime > actualStartTime, "End time must be after start time");
+
         rs.resourceEvents[eventHash] = LibResourceStorage.ResourceEvent({
             eventId: eventHash,
             name: eventId,
             description: "",
-            startTime: currentTime,
-            endTime: currentTime + duration,
+            startTime: actualStartTime,
+            endTime: endTime,
             productionMultiplier: productionMultiplier,
             processingDiscount: costReduction,
             active: true,
@@ -79,10 +95,37 @@ contract ResourceEventFacet is AccessControlBase {
             minContribution: 100,
             rewardPool: rewardPool
         });
-        
+
         rs.activeEventIds.push(eventId);
-        
-        emit ResourceEventStarted(eventId, currentTime, currentTime + duration);
+
+        emit ResourceEventStarted(eventId, uint32(actualStartTime), uint32(endTime));
+    }
+
+    /**
+     * @notice Start resource event with duration (legacy/convenience method)
+     * @dev Starts immediately with specified duration
+     */
+    function startResourceEventWithDuration(
+        string calldata eventId,
+        uint8 eventType,
+        uint32 duration,
+        uint16 productionMultiplier,
+        uint16 costReduction,
+        uint256 rewardPool
+    ) external onlyAuthorized whenNotPaused {
+        uint40 startTime = uint40(block.timestamp);
+        uint40 endTime = startTime + uint40(duration);
+
+        // Call the main function via internal call pattern
+        this.startResourceEvent(
+            eventId,
+            eventType,
+            startTime,
+            endTime,
+            productionMultiplier,
+            costReduction,
+            rewardPool
+        );
     }
     
     /**
@@ -92,18 +135,84 @@ contract ResourceEventFacet is AccessControlBase {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         bytes32 eventHash = keccak256(bytes(eventId));
         LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
-        
+
         if (!evt.active) revert EventNotActive(eventId);
-        
+
         evt.active = false;
-        evt.endTime = uint32(block.timestamp);
-        
+        evt.endTime = uint40(block.timestamp);
+
         _removeFromActiveEvents(eventId);
         unchecked { rs.totalEventsHosted++; }
-        
+
         emit ResourceEventEnded(eventId, rs.totalEventParticipants[eventId]);
     }
-    
+
+    /**
+     * @notice Update event parameters (bonuses, duration, reward pool)
+     * @dev Can only update active events
+     */
+    function updateResourceEvent(
+        string calldata eventId,
+        uint16 productionMultiplier,
+        uint16 costReduction,
+        uint40 newStartTime,
+        uint40 newEndTime,
+        uint256 rewardPool
+    ) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        bytes32 eventHash = keccak256(bytes(eventId));
+        LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+        if (!evt.active) revert EventNotActive(eventId);
+
+        evt.productionMultiplier = productionMultiplier;
+        evt.processingDiscount = costReduction;
+        evt.startTime = newStartTime;
+        evt.endTime = newEndTime;
+        evt.rewardPool = rewardPool;
+    }
+
+    /**
+     * @notice Activate or deactivate event without ending it
+     */
+    function setResourceEventActive(string calldata eventId, bool active) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        bytes32 eventHash = keccak256(bytes(eventId));
+        LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+        if (bytes(evt.name).length == 0) revert InvalidEventId();
+
+        bool wasActive = evt.active;
+        evt.active = active;
+
+        // Update activeEventIds array
+        if (active && !wasActive) {
+            rs.activeEventIds.push(eventId);
+        } else if (!active && wasActive) {
+            _removeFromActiveEvents(eventId);
+        }
+    }
+
+    /**
+     * @notice Delete event definition completely
+     * @dev Only for cleanup - cannot delete events with participants who haven't claimed
+     */
+    function deleteResourceEvent(string calldata eventId) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        bytes32 eventHash = keccak256(bytes(eventId));
+        LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+        if (bytes(evt.name).length == 0) revert InvalidEventId();
+
+        // Remove from active events if present
+        if (evt.active) {
+            _removeFromActiveEvents(eventId);
+        }
+
+        // Clear event data
+        delete rs.resourceEvents[eventHash];
+    }
+
     // ==================== PARTICIPATION ====================
     
     /**
@@ -158,16 +267,24 @@ contract ResourceEventFacet is AccessControlBase {
     
     /**
      * @notice Complete action during event for bonus tracking
-     * @dev Called by action facets when user performs actions during event
+     * @dev Called by other facets (ResourcePodFacet, etc.) when user performs actions
+     *      Uses onlyTrusted to allow: inter-facet calls, staking system, and admins
      */
-    function recordEventAction(string calldata eventId, address user) external {
+    function recordEventAction(string calldata eventId, address user) external onlyTrusted {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         bytes32 eventHash = keccak256(bytes(eventId));
         LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
-        
-        if (!evt.active || block.timestamp > evt.endTime) return;
-        
+
+        if (!evt.active || block.timestamp < evt.startTime || block.timestamp > evt.endTime) return;
+
         LibResourceStorage.EventParticipant storage participant = rs.eventParticipants[eventId][user];
+
+        // Count as participant if first interaction
+        if (participant.contribution == 0 && participant.actionsCompleted == 0) {
+            participant.participationTime = uint32(block.timestamp);
+            unchecked { rs.totalEventParticipants[eventId]++; }
+        }
+
         participant.actionsCompleted++;
         
         // Update leaderboard score (contribution + actions)
@@ -242,6 +359,7 @@ contract ResourceEventFacet is AccessControlBase {
     
     /**
      * @notice Update event leaderboard
+     * @dev Handles duplicates by checking if user already exists in leaderboard
      */
     function _updateLeaderboard(
         string calldata eventId,
@@ -250,25 +368,38 @@ contract ResourceEventFacet is AccessControlBase {
     ) internal {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         LibResourceStorage.EventLeaderboard storage leaderboard = rs.eventLeaderboards[eventId];
-        
+
         rs.eventLeaderboardScores[eventId][user] = score;
-        
-        // Check if user should be in top 10
-        if (leaderboard.topParticipants.length < 10) {
-            // Add to leaderboard
+
+        // Check if user already exists in leaderboard
+        bool userExists = false;
+        for (uint256 i = 0; i < leaderboard.topParticipants.length; i++) {
+            if (leaderboard.topParticipants[i] == user) {
+                userExists = true;
+                break;
+            }
+        }
+
+        // If user already in leaderboard, just re-sort
+        if (userExists) {
+            _sortLeaderboard(eventId);
+        }
+        // If leaderboard not full, add user
+        else if (leaderboard.topParticipants.length < 10) {
             leaderboard.topParticipants.push(user);
             _sortLeaderboard(eventId);
-        } else if (score > leaderboard.minScoreRequired) {
-            // Replace lowest scorer
+        }
+        // If score beats minimum, replace lowest scorer
+        else if (score > leaderboard.minScoreRequired) {
             leaderboard.topParticipants[9] = user;
             _sortLeaderboard(eventId);
         }
-        
+
         // Update min score
         if (leaderboard.topParticipants.length == 10) {
             leaderboard.minScoreRequired = rs.eventLeaderboardScores[eventId][leaderboard.topParticipants[9]];
         }
-        
+
         emit EventLeaderboardUpdated(eventId, leaderboard.topParticipants[0], rs.eventLeaderboardScores[eventId][leaderboard.topParticipants[0]]);
     }
     
@@ -294,30 +425,44 @@ contract ResourceEventFacet is AccessControlBase {
     }
     
     // ==================== EVENT BONUSES ====================
-    
+
     /**
      * @notice Get active production multiplier for resource type
      * @dev Called by ResourcePodFacet to apply event bonuses
+     * @param resourceType Resource type:
+     *   0 = BasicMaterials (Stone, Wood)
+     *   1 = EnergyCrystals
+     *   2 = BioCompounds
+     *   3 = RareElements
+     *
+     * Event types and their resource targeting:
+     *   1  = Resource Rush (ALL resources)
+     *   11 = Basic Materials Rush (only type 0)
+     *   12 = Energy Rush (only type 1)
+     *   13 = Bio Rush (only type 2)
+     *   14 = Rare Elements Rush (only type 3)
      */
     function getActiveProductionMultiplier(uint8 resourceType) external view returns (uint16 multiplier) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         multiplier = 10000; // 100% base
-        
-        // Check all active events
+
         for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
             bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
             LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
-            
-            if (evt.active && block.timestamp <= evt.endTime) {
-                // Resource Rush (type 1) - double all production
-                if (evt.eventType == 1) {
+
+            if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
+                uint8 evtType = evt.eventType;
+
+                // Type 1: Resource Rush - all resources get bonus
+                if (evtType == 1) {
                     multiplier = (multiplier * evt.productionMultiplier) / 10000;
                 }
-                // Can add more event-specific logic here
+                // Types 11-14: Per-resource Rush (11 = resource 0, 12 = resource 1, etc.)
+                else if (evtType >= 11 && evtType <= 14 && evtType - 11 == resourceType) {
+                    multiplier = (multiplier * evt.productionMultiplier) / 10000;
+                }
             }
         }
-        
-        return multiplier;
     }
     
     /**
@@ -331,7 +476,7 @@ contract ResourceEventFacet is AccessControlBase {
             bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
             LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
             
-            if (evt.active && block.timestamp <= evt.endTime) {
+            if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
                 // Crafting Festival (type 3) - reduce costs
                 if (evt.eventType == 3) {
                     if (evt.processingDiscount > reduction) {
@@ -345,15 +490,77 @@ contract ResourceEventFacet is AccessControlBase {
     }
     
     // ==================== VIEW FUNCTIONS ====================
-    
+
     /**
-     * @notice Get active events
+     * @notice Get currently active events (active flag AND not expired)
      */
     function getActiveResourceEvents() external view returns (string[] memory) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        // Count truly active events
+        uint256 activeCount = 0;
+        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+            if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
+                activeCount++;
+            }
+        }
+
+        // Build filtered array
+        string[] memory result = new string[](activeCount);
+        uint256 idx = 0;
+        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+            if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
+                result[idx++] = rs.activeEventIds[i];
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * @notice Get all event IDs in the active array (including expired)
+     * @dev For admin cleanup purposes
+     */
+    function getAllResourceEventIds() external view returns (string[] memory) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         return rs.activeEventIds;
     }
-    
+
+    /**
+     * @notice Get scheduled future events (created but not yet started)
+     * @dev Returns events where active=true AND block.timestamp < startTime
+     */
+    function getScheduledResourceEvents() external view returns (string[] memory) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        // Count scheduled events
+        uint256 scheduledCount = 0;
+        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+            if (evt.active && block.timestamp < evt.startTime) {
+                scheduledCount++;
+            }
+        }
+
+        // Build filtered array
+        string[] memory result = new string[](scheduledCount);
+        uint256 idx = 0;
+        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+            if (evt.active && block.timestamp < evt.startTime) {
+                result[idx++] = rs.activeEventIds[i];
+            }
+        }
+
+        return result;
+    }
+
     /**
      * @notice Get event leaderboard
      */
@@ -397,9 +604,53 @@ contract ResourceEventFacet is AccessControlBase {
             estimatedReward = (rs.resourceEvents[eventHash].rewardPool * userShare) / 10000;
         }
     }
-    
+
+    /**
+     * @notice Get full resource event details
+     * @param eventId Event identifier string
+     * @return eventType Event type (1=Resource Rush, 2=Trade Frenzy, 3=Crafting Festival, 4=Harvest Bonanza)
+     * @return startTime Unix timestamp when event started
+     * @return endTime Unix timestamp when event ends
+     * @return productionMultiplier Production bonus in basis points (10000 = 100%)
+     * @return processingDiscount Cost reduction in basis points
+     * @return rewardPool Total YLW reward pool for the event
+     * @return totalContributions Total resources contributed by all participants
+     * @return participantCount Number of unique participants
+     * @return active Whether the event is currently active
+     * @return minContribution Minimum contribution required to claim rewards
+     */
+    function getResourceEventDetails(string calldata eventId) external view returns (
+        uint8 eventType,
+        uint40 startTime,
+        uint40 endTime,
+        uint16 productionMultiplier,
+        uint16 processingDiscount,
+        uint256 rewardPool,
+        uint256 totalContributions,
+        uint256 participantCount,
+        bool active,
+        uint256 minContribution
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        bytes32 eventHash = keccak256(bytes(eventId));
+        LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+        return (
+            evt.eventType,
+            evt.startTime,
+            evt.endTime,
+            evt.productionMultiplier,
+            evt.processingDiscount,
+            evt.rewardPool,
+            rs.totalEventContributions[eventId],
+            rs.totalEventParticipants[eventId],
+            evt.active,
+            evt.minContribution
+        );
+    }
+
     // ==================== HELPERS ====================
-    
+
     function _removeFromActiveEvents(string calldata eventId) internal {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         
