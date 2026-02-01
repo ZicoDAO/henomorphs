@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {LibCollectionStorage} from "../libraries/LibCollectionStorage.sol";
-import {LibMeta} from "../../shared/libraries/LibMeta.sol";
+import {LibMeta} from "../shared/libraries/LibMeta.sol";
 import {TierVariant, ItemTier} from "../libraries/CollectionModel.sol"; 
 import {AccessControlBase} from "./AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -139,20 +139,20 @@ contract RollingFacet is AccessControlBase {
         uint8 rerollsRemaining
     ) {
         CollectionType collectionType = _getCollectionType(collectionId);
-        
-        if (collectionType == CollectionType.Main) {
+
+        if (collectionType == CollectionType.Main || collectionType == CollectionType.Realm) {
             return _rollMainVariant(collectionId, 0, previousRollHash, signature);
         } else {
             return _rollAugmentVariant(collectionId, 0, specimenCollectionId, specimenTokenId, previousRollHash, signature);
         }
     }
-    
+
     /**
      * @notice Roll variant for any collection that supports it
      * @param collectionId Collection ID
-     * @param tokenId Token ID  
-     * @param specimenCollectionId Specimen collection ID (0 for Main collections)
-     * @param specimenTokenId Specimen token ID (0 for Main collections)
+     * @param tokenId Token ID
+     * @param specimenCollectionId Specimen collection ID (0 for Main/Realm collections)
+     * @param specimenTokenId Specimen token ID (0 for Main/Realm collections)
      * @param previousRollHash Previous roll hash (bytes32(0) for first roll)
      * @param signature User signature
      * @return rollHash Unique identifier for this roll
@@ -176,8 +176,8 @@ contract RollingFacet is AccessControlBase {
         uint8 rerollsRemaining
     ) {
         CollectionType collectionType = _getCollectionType(collectionId);
-        
-        if (collectionType == CollectionType.Main) {
+
+        if (collectionType == CollectionType.Main || collectionType == CollectionType.Realm) {
             return _rollMainVariant(collectionId, tokenId, previousRollHash, signature);
         } else {
             return _rollAugmentVariant(collectionId, tokenId, specimenCollectionId, specimenTokenId, previousRollHash, signature);
@@ -224,13 +224,13 @@ contract RollingFacet is AccessControlBase {
         
         CollectionType collectionType = _getCollectionType(collectionId);
         
-        if (collectionType == CollectionType.Main) {
-            // Main collections: assign to existing token
+        if (collectionType == CollectionType.Main || collectionType == CollectionType.Realm) {
+            // Main/Realm collections: assign to existing token
             (uint256 tokenId, uint8 assignedVariant) = assignVariant(collectionId, rollHash, signature);
             tokenIds = new uint256[](1);
             tokenIds[0] = tokenId;
             return (tokenIds, assignedVariant, 0);
-            
+
         } else if (collectionType == CollectionType.Augment || collectionType == CollectionType.Accessory) {
             // For augment collections, this would need to call back to MintingFacet
             // This is a simplified implementation - in practice you'd need cross-facet communication
@@ -895,8 +895,8 @@ contract RollingFacet is AccessControlBase {
         CollectionType collectionType = _getCollectionType(collectionId);
         LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
 
-        if (collectionType == CollectionType.Main) {
-            // Main collection validation with self-rolling support
+        if (collectionType == CollectionType.Main || collectionType == CollectionType.Realm) {
+            // Main/Realm collection validation with self-rolling support
             (address contractAddress,, bool exists) = LibCollectionStorage.getCollectionInfo(collectionId);
             if (!exists) {
                 return (false, "Collection not found");
@@ -1450,7 +1450,7 @@ contract RollingFacet is AccessControlBase {
     ) {
         CollectionType collectionType = _getCollectionType(collectionId);
         
-        if (collectionType == CollectionType.Main) {
+        if (collectionType == CollectionType.Main || collectionType == CollectionType.Realm) {
             LibCollectionStorage.MintingConfig storage config = LibCollectionStorage.collectionStorage().mintingConfigs[collectionId][1];
             traditionalMinting = config.isActive;
             rollingMinting = config.allowRolling && supportsRolling(collectionId);
@@ -1594,9 +1594,9 @@ contract RollingFacet is AccessControlBase {
         LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
         (, uint8 tier,) = LibCollectionStorage.getCollectionInfo(specimenCollectionId);
         
-        // Check if token already has variant for non-Main collections
+        // Check if token already has variant for non-Main/Realm collections
         CollectionType collectionType = _getCollectionType(specimenCollectionId);
-        if (collectionType != CollectionType.Main) {
+        if (collectionType != CollectionType.Main && collectionType != CollectionType.Realm) {
             if (cs.itemsVariants[specimenCollectionId][tier][tokenId] != 0) {
                 if (!cs.tokenRollingUnlocked[specimenCollectionId][tokenId]) {
                     return (false, "Token already has assigned variant", 0);
@@ -1613,7 +1613,7 @@ contract RollingFacet is AccessControlBase {
             
             rollsRemaining = specimenConfig.maxRollsPerCoupon - activeCount;
         } else {
-            // Main collections don't have rolling limits
+            // Main/Realm collections don't have rolling limits
             rollsRemaining = 0;
         }
         
@@ -1902,11 +1902,12 @@ contract RollingFacet is AccessControlBase {
         }
         
         LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
-        
-        if (cs.collections[collectionId].collectionType != CollectionType.Main) {
+
+        if (cs.collections[collectionId].collectionType != CollectionType.Main &&
+            cs.collections[collectionId].collectionType != CollectionType.Realm) {
             revert InvalidCollectionType();
         }
-        
+
         for (uint256 i = 0; i < tokenIds.length; i++) {
             cs.collectionCouponUsed[collectionId][tokenIds[i]] = false;
             emit CouponReset(collectionId, tokenIds[i]);

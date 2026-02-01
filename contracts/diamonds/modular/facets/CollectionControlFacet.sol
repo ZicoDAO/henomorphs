@@ -782,7 +782,7 @@ contract CollectionControlFacet is AccessControlBase {
             revert InvalidAddress("contractAddress", params.contractAddress);
         }
         
-        if (uint8(params.collectionType) > 6) {
+        if (uint8(params.collectionType) > 7) {
             revert InvalidEnumValue("collectionType", uint8(params.collectionType));
         }
         

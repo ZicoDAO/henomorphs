@@ -427,6 +427,50 @@ contract TerritoryManagementFacet is AccessControlBase {
         }
     }
 
+    /**
+     * @notice Admin function to assign a card to a territory
+     * @dev Bypasses ownership checks and fees - use with caution
+     * @param cardTokenId Card NFT token ID to assign
+     * @param territoryId Territory ID to assign to (0 to unbind)
+     */
+    function adminAssignCardToTerritory(
+        uint256 cardTokenId,
+        uint256 territoryId
+    ) external onlyAuthorized whenNotPaused {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+
+        // Clear previous mapping if card was bound elsewhere
+        uint256 oldTerritoryId = cws.cardToTerritory[cardTokenId];
+        if (oldTerritoryId != 0) {
+            cws.territoryToCard[oldTerritoryId] = 0;
+        }
+
+        // Unbind case
+        if (territoryId == 0) {
+            delete cws.cardToTerritory[cardTokenId];
+            emit TerritoryCardDeactivated(oldTerritoryId, cardTokenId);
+            return;
+        }
+
+        // Validate territory exists
+        LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
+        if (!territory.active) {
+            revert TerritoryNotFound();
+        }
+
+        // Clear previous card from target territory
+        uint256 oldCardId = cws.territoryToCard[territoryId];
+        if (oldCardId != 0) {
+            delete cws.cardToTerritory[oldCardId];
+        }
+
+        // Set bidirectional mapping
+        cws.territoryToCard[territoryId] = cardTokenId;
+        cws.cardToTerritory[cardTokenId] = territoryId;
+
+        emit CardBoundToTerritory(cardTokenId, territoryId, territory.controllingColony);
+    }
+
     // ============================================================================
     // NOTE: captureTerritory() has been moved to TerritorySiegeFacet.sol
     // Do NOT duplicate this function here - it causes Diamond selector conflicts.

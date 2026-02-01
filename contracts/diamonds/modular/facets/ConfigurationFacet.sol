@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
-import {LibMeta} from "../../shared/libraries/LibMeta.sol";
+import {LibMeta} from "../shared/libraries/LibMeta.sol";
 import {LibCollectionStorage} from "../libraries/LibCollectionStorage.sol";
 import {CollectionType} from "../libraries/ModularAssetModel.sol";
 import {AccessControlBase} from "./AccessControlBase.sol";
@@ -228,8 +228,9 @@ contract ConfigurationFacet is AccessControlBase {
         
         LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
         
-        if (cs.collections[config.collectionId].collectionType != CollectionType.Main && 
-            cs.collections[config.collectionId].collectionType != CollectionType.Augment) {
+        if (cs.collections[config.collectionId].collectionType != CollectionType.Main &&
+            cs.collections[config.collectionId].collectionType != CollectionType.Augment &&
+            cs.collections[config.collectionId].collectionType != CollectionType.Realm) {
 
             revert InvalidCollectionType(cs.collections[config.collectionId].collectionType, CollectionType.Main);
         }
@@ -265,8 +266,9 @@ contract ConfigurationFacet is AccessControlBase {
         
         LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
         
-        if (cs.collections[pricingConfig.collectionId].collectionType != CollectionType.Main && 
-            cs.collections[pricingConfig.collectionId].collectionType != CollectionType.Augment) {
+        if (cs.collections[pricingConfig.collectionId].collectionType != CollectionType.Main &&
+            cs.collections[pricingConfig.collectionId].collectionType != CollectionType.Augment &&
+            cs.collections[pricingConfig.collectionId].collectionType != CollectionType.Realm) {
             revert InvalidCollectionType(cs.collections[pricingConfig.collectionId].collectionType, CollectionType.Main);
         }
         

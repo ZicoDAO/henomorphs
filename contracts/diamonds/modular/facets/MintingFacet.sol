@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {LibCollectionStorage} from "../libraries/LibCollectionStorage.sol";
-import {LibMeta} from "../../shared/libraries/LibMeta.sol";
+import {LibMeta} from "../shared/libraries/LibMeta.sol";
 import {TierVariant, ItemTier} from "../libraries/CollectionModel.sol"; 
 import {AccessControlBase} from "./AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -382,7 +382,7 @@ contract MintingFacet is AccessControlBase {
         // Enforce collection type restriction only if default mint not allowed
         if (!allowDefaultMint) {
             CollectionType collectionType = _getCollectionType(collectionId);
-            if (collectionType != CollectionType.Main) {
+            if (collectionType != CollectionType.Main && collectionType != CollectionType.Realm) {
                 revert InvalidCollectionType();
             }
         }
@@ -485,7 +485,7 @@ contract MintingFacet is AccessControlBase {
         CollectionType collectionType = _getCollectionType(collectionId);
         LibCollectionStorage.MintingConfig storage config = _getMintingConfig(collectionId, tier);
         
-        if (collectionType == CollectionType.Main) {
+        if (collectionType == CollectionType.Main || collectionType == CollectionType.Realm) {
             if (config.allowRolling && request.useSpecimenRolling && _supportsRolling(collectionId)) {
                 return _mintMainWithRolling(collectionId, tier, request);
             } else {

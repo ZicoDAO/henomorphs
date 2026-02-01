@@ -758,7 +758,8 @@ contract ResourcePodFacet is AccessControlBase {
     // ==================== VIEW FUNCTIONS ====================
     
     /**
-     * @notice Get user's resource balances
+     * @notice Get user's resource balances (raw, without decay preview)
+     * @dev WARNING: This returns raw storage values. Use getUserResourcesWithDecay() for accurate balances.
      * @param user Address to check
      * @return resources Array of [Basic, Energy, Bio, Rare] balances
      */
@@ -773,7 +774,96 @@ contract ResourcePodFacet is AccessControlBase {
     }
 
     /**
-     * @notice Get user's balance for a specific resource type
+     * @notice Get user's resource balances with decay preview applied
+     * @dev This is a VIEW function that simulates decay without modifying storage.
+     *      Use this for accurate balance display in UI.
+     * @param user Address to check
+     * @return resources Array of [Basic, Energy, Bio, Rare] balances after decay
+     * @return pendingDecay Array of pending decay amounts per resource type
+     * @return daysSinceLastDecay Days since last decay was applied
+     */
+    function getUserResourcesWithDecay(address user) external view returns (
+        uint256[4] memory resources,
+        uint256[4] memory pendingDecay,
+        uint32 daysSinceLastDecay
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        // Get raw balances first
+        for (uint8 i = 0; i < 4; i++) {
+            resources[i] = rs.userResources[user][i];
+        }
+
+        // If decay is disabled, return raw values
+        if (!rs.config.resourceDecayEnabled || rs.config.baseResourceDecayRate == 0) {
+            return (resources, pendingDecay, 0);
+        }
+
+        uint32 currentTime = uint32(block.timestamp);
+        uint32 lastUpdate = rs.lastDecayUpdate[user];
+
+        // No previous decay record
+        if (lastUpdate == 0) {
+            return (resources, pendingDecay, 0);
+        }
+
+        // Prevent underflow
+        if (currentTime <= lastUpdate) {
+            return (resources, pendingDecay, 0);
+        }
+
+        uint32 timePassed = currentTime - lastUpdate;
+        if (timePassed < 86400) {
+            // Less than 1 day, no decay
+            return (resources, pendingDecay, 0);
+        }
+
+        daysSinceLastDecay = timePassed / 86400;
+
+        // Calculate decay preview for each resource type (same formula as applyResourceDecay)
+        for (uint8 i = 0; i < 4; i++) {
+            uint256 currentAmount = resources[i];
+            if (currentAmount > 0) {
+                // sqrt-based decay formula
+                uint256 sqrtAmount = _sqrt(currentAmount);
+                uint256 decayAmount = (sqrtAmount * rs.config.baseResourceDecayRate * daysSinceLastDecay) / 100;
+
+                // Minimum decay of 1
+                if (decayAmount == 0 && currentAmount > 0) {
+                    decayAmount = 1;
+                }
+
+                pendingDecay[i] = decayAmount;
+
+                if (decayAmount > currentAmount) {
+                    resources[i] = 0;
+                } else {
+                    resources[i] = currentAmount - decayAmount;
+                }
+            }
+        }
+
+        return (resources, pendingDecay, daysSinceLastDecay);
+    }
+
+    /**
+     * @notice Internal sqrt function for view calculations
+     * @dev Babylonian method implementation
+     */
+    function _sqrt(uint256 x) internal pure returns (uint256) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        uint256 y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+        return y;
+    }
+
+    /**
+     * @notice Get user's balance for a specific resource type (raw, without decay)
+     * @dev WARNING: Returns raw storage value. Use getUserResourceBalanceWithDecay() for accurate balance.
      * @param user Address to check
      * @param resourceType Type of resource (0=Basic, 1=Energy, 2=Bio, 3=Rare)
      * @return balance The user's balance for the specified resource type
@@ -782,6 +872,58 @@ contract ResourcePodFacet is AccessControlBase {
         if (resourceType > 3) revert InvalidConfiguration("resource type");
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         return rs.userResources[user][resourceType];
+    }
+
+    /**
+     * @notice Get user's balance for a specific resource type with decay preview
+     * @param user Address to check
+     * @param resourceType Type of resource (0=Basic, 1=Energy, 2=Bio, 3=Rare)
+     * @return balance The user's balance after decay
+     * @return pendingDecay Amount of pending decay for this resource
+     */
+    function getUserResourceBalanceWithDecay(address user, uint8 resourceType) external view returns (
+        uint256 balance,
+        uint256 pendingDecay
+    ) {
+        if (resourceType > 3) revert InvalidConfiguration("resource type");
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        balance = rs.userResources[user][resourceType];
+
+        // If decay is disabled or no balance, return raw value
+        if (!rs.config.resourceDecayEnabled || rs.config.baseResourceDecayRate == 0 || balance == 0) {
+            return (balance, 0);
+        }
+
+        uint32 currentTime = uint32(block.timestamp);
+        uint32 lastUpdate = rs.lastDecayUpdate[user];
+
+        if (lastUpdate == 0 || currentTime <= lastUpdate) {
+            return (balance, 0);
+        }
+
+        uint32 timePassed = currentTime - lastUpdate;
+        if (timePassed < 86400) {
+            return (balance, 0);
+        }
+
+        uint32 daysPassed = timePassed / 86400;
+
+        // Calculate decay using sqrt formula
+        uint256 sqrtAmount = _sqrt(balance);
+        pendingDecay = (sqrtAmount * rs.config.baseResourceDecayRate * daysPassed) / 100;
+
+        if (pendingDecay == 0 && balance > 0) {
+            pendingDecay = 1;
+        }
+
+        if (pendingDecay > balance) {
+            balance = 0;
+        } else {
+            balance = balance - pendingDecay;
+        }
+
+        return (balance, pendingDecay);
     }
     
     /**

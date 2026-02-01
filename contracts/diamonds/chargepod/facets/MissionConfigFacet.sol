@@ -60,6 +60,7 @@ contract MissionConfigFacet is AccessControlBase {
     error InvalidVariantConfiguration();
     error CollectionNotRegistered(uint16 collectionId);
     error CollectionAlreadyRegistered(address collection);
+    error CollectionIdAlreadyUsed(uint16 collectionId);
     error InvalidRewardAmount();
     error InvalidDuration();
     error InvalidMapSize();
@@ -130,7 +131,8 @@ contract MissionConfigFacet is AccessControlBase {
     // ============================================================
 
     /**
-     * @notice Register a new Mission Pass NFT collection
+     * @notice Register a Mission Pass collection with a specific ID
+     * @param collectionId Desired collection ID (must be unique, cannot be 0)
      * @param collectionAddress ERC721/ERC1155 contract address
      * @param name Human readable collection name
      * @param variantCount Number of mission variants available
@@ -139,11 +141,11 @@ contract MissionConfigFacet is AccessControlBase {
      * @param minHenomorphs Minimum Henomorphs per mission
      * @param maxHenomorphs Maximum Henomorphs per mission
      * @param minChargePercent Minimum charge percentage to participate
-     * @param eligibleCollections Array of Henomorph collection IDs that can participate
+     * @param eligibleCollections Array of specimen collection IDs that can participate
      * @param entryFee Fee configuration for starting missions
-     * @return collectionId The assigned collection ID
      */
     function registerMissionPassCollection(
+        uint16 collectionId,
         address collectionAddress,
         string calldata name,
         uint8 variantCount,
@@ -154,7 +156,10 @@ contract MissionConfigFacet is AccessControlBase {
         uint8 minChargePercent,
         uint16[] calldata eligibleCollections,
         ControlFee calldata entryFee
-    ) external onlyAuthorized whenNotPaused returns (uint16 collectionId) {
+    ) external onlyAuthorized whenNotPaused {
+        if (collectionId == 0) {
+            revert CollectionNotRegistered(collectionId);
+        }
         if (collectionAddress == address(0)) {
             revert InvalidCollectionAddress();
         }
@@ -173,16 +178,43 @@ contract MissionConfigFacet is AccessControlBase {
 
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
 
-        // Check if collection already registered
-        for (uint16 i = 1; i <= ms.passCollectionCounter; i++) {
-            if (ms.passCollections[i].collectionAddress == collectionAddress) {
-                revert CollectionAlreadyRegistered(collectionAddress);
-            }
+        // Check if address already registered
+        if (ms.passCollectionByAddress[collectionAddress] != 0) {
+            revert CollectionAlreadyRegistered(collectionAddress);
         }
 
-        ms.passCollectionCounter++;
-        collectionId = ms.passCollectionCounter;
+        // Check if ID already used
+        if (ms.passCollections[collectionId].collectionAddress != address(0)) {
+            revert CollectionIdAlreadyUsed(collectionId);
+        }
 
+        // Update counter if needed to maintain consistency
+        if (collectionId > ms.passCollectionCounter) {
+            ms.passCollectionCounter = collectionId;
+        }
+
+        _registerPassCollection(ms, collectionId, collectionAddress, name, variantCount,
+            maxUsesPerToken, globalCooldown, minHenomorphs, maxHenomorphs,
+            minChargePercent, eligibleCollections, entryFee);
+    }
+
+    /**
+     * @dev Internal function to register a pass collection
+     */
+    function _registerPassCollection(
+        LibMissionStorage.MissionStorage storage ms,
+        uint16 collectionId,
+        address collectionAddress,
+        string calldata name,
+        uint8 variantCount,
+        uint16 maxUsesPerToken,
+        uint32 globalCooldown,
+        uint8 minHenomorphs,
+        uint8 maxHenomorphs,
+        uint8 minChargePercent,
+        uint16[] calldata eligibleCollections,
+        ControlFee calldata entryFee
+    ) internal {
         ms.passCollections[collectionId] = LibMissionStorage.MissionPassCollection({
             collectionAddress: collectionAddress,
             name: name,
@@ -196,6 +228,12 @@ contract MissionConfigFacet is AccessControlBase {
             eligibleCollections: eligibleCollections,
             entryFee: entryFee
         });
+
+        // Update reverse mappings
+        ms.passCollectionByAddress[collectionAddress] = collectionId;
+        for (uint256 i = 0; i < eligibleCollections.length; i++) {
+            ms.passesForSpecimen[eligibleCollections[i]].push(collectionId);
+        }
 
         emit MissionPassCollectionRegistered(collectionId, collectionAddress, name);
     }
@@ -232,10 +270,10 @@ contract MissionConfigFacet is AccessControlBase {
     }
 
     /**
-     * @notice Update eligible Henomorph collections for a Mission Pass collection
-     * @dev Sets which Henomorph collections can participate in missions using this pass
+     * @notice Update eligible specimen collections for a Mission Pass collection
+     * @dev Sets which specimen collections can participate in missions using this pass
      * @param collectionId Mission Pass collection ID to modify
-     * @param eligibleCollections Array of Henomorph collection IDs that can participate
+     * @param eligibleCollections Array of specimen collection IDs that can participate
      */
     function setMissionPassEligibleCollections(
         uint16 collectionId,
@@ -247,9 +285,39 @@ contract MissionConfigFacet is AccessControlBase {
             revert CollectionNotRegistered(collectionId);
         }
 
+        // Remove from old reverse mappings
+        uint16[] storage oldEligible = ms.passCollections[collectionId].eligibleCollections;
+        for (uint256 i = 0; i < oldEligible.length; i++) {
+            _removePassFromSpecimen(ms, oldEligible[i], collectionId);
+        }
+
+        // Update eligible collections
         ms.passCollections[collectionId].eligibleCollections = eligibleCollections;
 
+        // Add to new reverse mappings
+        for (uint256 i = 0; i < eligibleCollections.length; i++) {
+            ms.passesForSpecimen[eligibleCollections[i]].push(collectionId);
+        }
+
         emit MissionPassEligibleCollectionsUpdated(collectionId, eligibleCollections);
+    }
+
+    /**
+     * @dev Remove a pass collection from specimen's reverse mapping (swap and pop)
+     */
+    function _removePassFromSpecimen(
+        LibMissionStorage.MissionStorage storage ms,
+        uint16 specimenCollectionId,
+        uint16 passCollectionId
+    ) internal {
+        uint16[] storage passes = ms.passesForSpecimen[specimenCollectionId];
+        for (uint256 i = 0; i < passes.length; i++) {
+            if (passes[i] == passCollectionId) {
+                passes[i] = passes[passes.length - 1];
+                passes.pop();
+                break;
+            }
+        }
     }
 
     /**
@@ -592,7 +660,7 @@ contract MissionConfigFacet is AccessControlBase {
     }
 
     /**
-     * @notice Get Mission Pass collection details
+     * @notice Get Mission Pass collection details by ID
      * @param collectionId Collection ID
      * @return collection Full collection configuration
      */
@@ -606,6 +674,19 @@ contract MissionConfigFacet is AccessControlBase {
             revert CollectionNotRegistered(collectionId);
         }
         return ms.passCollections[collectionId];
+    }
+
+    /**
+     * @notice Get Mission Pass collection ID by contract address
+     * @param collectionAddress The NFT contract address
+     * @return collectionId Collection ID (0 if not registered)
+     */
+    function getMissionPassCollectionByAddress(address collectionAddress)
+        external
+        view
+        returns (uint16 collectionId)
+    {
+        return LibMissionStorage.missionStorage().passCollectionByAddress[collectionAddress];
     }
 
     /**
@@ -635,9 +716,9 @@ contract MissionConfigFacet is AccessControlBase {
     }
 
     /**
-     * @notice Get eligible Henomorph collections for a Mission Pass collection
+     * @notice Get eligible specimen collections for a Mission Pass collection
      * @param collectionId Mission Pass collection ID
-     * @return eligibleCollections Array of Henomorph collection IDs that can participate
+     * @return eligibleCollections Array of specimen collection IDs that can participate
      */
     function getMissionPassEligibleCollections(uint16 collectionId)
         external
@@ -652,15 +733,15 @@ contract MissionConfigFacet is AccessControlBase {
     }
 
     /**
-     * @notice Check if a Henomorph collection is eligible for a Mission Pass collection
+     * @notice Check if a specimen collection can use a specific Mission Pass
      * @param passCollectionId Mission Pass collection ID
-     * @param henomorphCollectionId Henomorph collection ID to check
-     * @return isEligible True if the Henomorph collection can participate
+     * @param specimenCollectionId Specimen collection ID to check
+     * @return canUse True if the specimen collection can do missions with this pass
      */
-    function isHenomorphCollectionEligible(uint16 passCollectionId, uint16 henomorphCollectionId)
+    function canSpecimenUseMissionPass(uint16 passCollectionId, uint16 specimenCollectionId)
         external
         view
-        returns (bool isEligible)
+        returns (bool canUse)
     {
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
         if (passCollectionId == 0 || passCollectionId > ms.passCollectionCounter) {
@@ -669,11 +750,37 @@ contract MissionConfigFacet is AccessControlBase {
 
         uint16[] storage eligible = ms.passCollections[passCollectionId].eligibleCollections;
         for (uint256 i = 0; i < eligible.length; i++) {
-            if (eligible[i] == henomorphCollectionId) {
+            if (eligible[i] == specimenCollectionId) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * @notice Get all Mission Pass collections configured for a specimen collection
+     * @param specimenCollectionId Specimen collection ID
+     * @return passCollectionIds Array of pass collection IDs that support this specimen
+     */
+    function getMissionPassesForSpecimen(uint16 specimenCollectionId)
+        external
+        view
+        returns (uint16[] memory passCollectionIds)
+    {
+        return LibMissionStorage.missionStorage().passesForSpecimen[specimenCollectionId];
+    }
+
+    /**
+     * @notice Check if any Mission Pass is configured for a specimen collection
+     * @param specimenCollectionId Specimen collection ID
+     * @return configured True if at least one pass supports this specimen
+     */
+    function hasMissionPassConfigured(uint16 specimenCollectionId)
+        external
+        view
+        returns (bool configured)
+    {
+        return LibMissionStorage.missionStorage().passesForSpecimen[specimenCollectionId].length > 0;
     }
 
     /**

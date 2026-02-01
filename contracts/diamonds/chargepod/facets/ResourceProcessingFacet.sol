@@ -25,6 +25,7 @@ contract ResourceProcessingFacet is AccessControlBase {
     error ProcessingNotComplete();
     error OrderAlreadyClaimed();
     error OrderNotFound();
+    error InvalidConversionRatio();
 
     // Events
     event RecipeCreated(uint8 indexed recipeId, uint256 ylwCost, uint32 processingTime);
@@ -65,10 +66,15 @@ contract ResourceProcessingFacet is AccessControlBase {
         // Get recipe
         LibColonyWarsStorage.ProcessingRecipe storage recipe = cws.processingRecipes[recipeId];
         if (!recipe.active) revert RecipeNotFound();
-        
+
         // Check tech level requirement
-        // Tech level is managed via TerritoryEquipmentFacet.totalTechBonus
-        
+        if (recipe.requiredTechLevel > 0) {
+            uint8 colonyTechLevel = _getColonyTechLevel(colonyId, cws);
+            if (colonyTechLevel < recipe.requiredTechLevel) {
+                revert InsufficientTechLevel();
+            }
+        }
+
         // Calculate costs
         uint256 totalInputNeeded = recipe.inputAmount * (inputAmount / recipe.outputAmount);
         
@@ -188,7 +194,12 @@ contract ResourceProcessingFacet is AccessControlBase {
         uint256 auxCost,
         uint32 processingTime,
         uint8 requiredTechLevel
-    ) external onlyAuthorized{
+    ) external onlyAuthorized {
+        // Minimal validation: output cannot exceed input (prevents resource multiplication)
+        if (outputAmount > inputAmount) {
+            revert InvalidConversionRatio();
+        }
+
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibColonyWarsStorage.ProcessingRecipe storage recipe = cws.processingRecipes[recipeId];
 
@@ -317,5 +328,38 @@ contract ResourceProcessingFacet is AccessControlBase {
         order.claimed = true;
 
         emit ProcessingCancelled(orderId, colonyId, caller, totalInputNeeded);
+    }
+
+    // ==================== VIEW FUNCTIONS ====================
+
+    /**
+     * @notice Get colony's effective tech level (max across all territories)
+     * @param colonyId Colony to check
+     * @return techLevel Maximum tech bonus from colony's territories
+     */
+    function getColonyTechLevel(bytes32 colonyId) external view returns (uint8 techLevel) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        return _getColonyTechLevel(colonyId, cws);
+    }
+
+    // ==================== INTERNAL HELPERS ====================
+
+    /**
+     * @dev Internal helper to get colony tech level
+     */
+    function _getColonyTechLevel(
+        bytes32 colonyId,
+        LibColonyWarsStorage.ColonyWarsStorage storage cws
+    ) private view returns (uint8 techLevel) {
+        uint256[] storage territoryIds = cws.colonyTerritories[colonyId];
+
+        for (uint256 i = 0; i < territoryIds.length; i++) {
+            LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[territoryIds[i]];
+            if (equipment.totalTechBonus > techLevel) {
+                techLevel = equipment.totalTechBonus;
+            }
+        }
+
+        return techLevel;
     }
 }

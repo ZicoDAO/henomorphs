@@ -96,6 +96,7 @@ contract ResourceEconomyFacet is AccessControlBase {
     uint256 constant BASE_PRODUCTION_RATE = 10; // Resources per hour
     uint256 constant TOKEN_HARVEST_REWARD_BASE = 5 ether; // 5 YLW base reward
     uint8 constant MAX_NODE_LEVEL = 10;
+    uint32 constant MAINTENANCE_PERIOD = 7 days; // Maintenance grace period before penalties
     
     // Constants - Node Costs (ZICO)
     uint256 constant NODE_CREATION_COST_PER_LEVEL = 100 ether; // 100 ZICO per level
@@ -238,17 +239,6 @@ contract ResourceEconomyFacet is AccessControlBase {
             // If lastHarvestTime > block.timestamp (corrupted), allow harvest to fix it
         }
 
-        // Check maintenance status - safe arithmetic
-        uint32 daysSinceMaintenance = 0;
-        unchecked {
-            if (node.lastMaintenancePaid > 0 && node.lastMaintenancePaid <= block.timestamp) {
-                daysSinceMaintenance = uint32((block.timestamp - node.lastMaintenancePaid) / 1 days);
-            }
-        }
-        if (daysSinceMaintenance > 0) {
-            revert NodeMaintenanceRequired();
-        }
-
         // Calculate accumulated resources - safe arithmetic
         uint256 hoursSinceHarvest = 0;
         unchecked {
@@ -261,6 +251,12 @@ contract ResourceEconomyFacet is AccessControlBase {
         // Apply territory equipment bonus
         LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[node.territoryId];
         production = (production * (100 + equipment.totalProductionBonus)) / 100;
+
+        // Apply maintenance penalty if overdue (50% reduction per week overdue, min 10% yield)
+        uint256 penaltyPercent = _calculateMaintenancePenalty(node.lastMaintenancePaid);
+        if (penaltyPercent > 0) {
+            production = (production * (100 - penaltyPercent)) / 100;
+        }
 
         // Award resources to USER (primary reward - 100%)
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
@@ -279,6 +275,11 @@ contract ResourceEconomyFacet is AccessControlBase {
 
         // Calculate YLW reward: Base + level bonus
         uint256 tokenReward = TOKEN_HARVEST_REWARD_BASE + (uint256(node.nodeLevel) * 1 ether);
+
+        // Apply same maintenance penalty to YLW reward
+        if (penaltyPercent > 0) {
+            tokenReward = (tokenReward * (100 - penaltyPercent)) / 100;
+        }
 
         // Reward auxiliary currency (Utility token for daily activities)
         // Uses Treasury → Mint fallback pattern for sustainable tokenomics
@@ -449,6 +450,36 @@ contract ResourceEconomyFacet is AccessControlBase {
     }
 
     /**
+     * @notice Get current maintenance penalty for a node
+     * @param nodeId Node to query
+     * @return penaltyPercent Current penalty percentage (0-90)
+     * @return weeksOverdue Number of weeks maintenance is overdue
+     * @return effectiveYieldPercent Effective yield percentage after penalty (10-100)
+     */
+    function getMaintenancePenalty(uint256 nodeId)
+        external
+        view
+        returns (uint256 penaltyPercent, uint256 weeksOverdue, uint256 effectiveYieldPercent)
+    {
+        LibColonyWarsStorage.ResourceNode storage node =
+            LibColonyWarsStorage.colonyWarsStorage().economyResourceNodes[nodeId];
+
+        if (!node.active) return (0, 0, 100);
+
+        penaltyPercent = _calculateMaintenancePenalty(node.lastMaintenancePaid);
+        effectiveYieldPercent = 100 - penaltyPercent;
+
+        // Calculate weeks overdue for display
+        if (node.lastMaintenancePaid > 0 && node.lastMaintenancePaid <= block.timestamp) {
+            uint32 timeSinceMaintenance = uint32(block.timestamp) - node.lastMaintenancePaid;
+            if (timeSinceMaintenance > MAINTENANCE_PERIOD) {
+                uint32 overdueTime = timeSinceMaintenance - MAINTENANCE_PERIOD;
+                weeksOverdue = overdueTime / MAINTENANCE_PERIOD + 1;
+            }
+        }
+    }
+
+    /**
      * @notice Get comprehensive economy node info (similar to TerritoryResourceFacet.getResourceNodeInfo)
      * @param nodeId Node to query
      * @return exists Whether node exists and is active
@@ -600,6 +631,38 @@ contract ResourceEconomyFacet is AccessControlBase {
                 if (node.nodeLevel < MAX_NODE_LEVEL) {
                     upgradeCostsZico[i] = uint256(node.nodeLevel) * NODE_UPGRADE_COST_MULTIPLIER;
                 }
+            }
+        }
+    }
+
+    // ============================================================================
+    // INTERNAL HELPERS - Maintenance Penalty
+    // ============================================================================
+
+    /**
+     * @notice Calculate maintenance penalty percentage based on time overdue
+     * @param lastMaintenancePaid Timestamp of last maintenance payment
+     * @return penaltyPercent Penalty percentage (0-90)
+     * @dev Returns 0 if within grace period, otherwise 50% per week overdue, capped at 90%
+     */
+    function _calculateMaintenancePenalty(uint32 lastMaintenancePaid) internal view returns (uint256 penaltyPercent) {
+        if (lastMaintenancePaid == 0 || lastMaintenancePaid > block.timestamp) {
+            return 0;
+        }
+
+        unchecked {
+            uint32 timeSinceMaintenance = uint32(block.timestamp) - lastMaintenancePaid;
+
+            if (timeSinceMaintenance <= MAINTENANCE_PERIOD) {
+                return 0; // Within grace period - no penalty
+            }
+
+            uint32 overdueTime = timeSinceMaintenance - MAINTENANCE_PERIOD;
+            uint256 weeksOverdue = overdueTime / MAINTENANCE_PERIOD;
+            penaltyPercent = 50 * (weeksOverdue + 1); // 50%, 100%, 150%...
+
+            if (penaltyPercent > 90) {
+                penaltyPercent = 90; // Cap at 90% penalty (minimum 10% yield)
             }
         }
     }

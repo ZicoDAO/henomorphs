@@ -248,9 +248,10 @@ contract ResourceEventFacet is AccessControlBase {
         // Track participation
         LibResourceStorage.EventParticipant storage participant = rs.eventParticipants[eventId][user];
         
-        if (participant.contribution == 0) {
-            // First time participating
+        if (participant.contribution == 0 && participant.actionsCompleted == 0) {
+            // First time participating - add to participants list
             participant.participationTime = uint32(block.timestamp);
+            rs.eventParticipantsList[eventId].push(user);
             unchecked { rs.totalEventParticipants[eventId]++; }
         }
         
@@ -274,14 +275,15 @@ contract ResourceEventFacet is AccessControlBase {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         bytes32 eventHash = keccak256(bytes(eventId));
         LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
-
+        
         if (!evt.active || block.timestamp < evt.startTime || block.timestamp > evt.endTime) return;
 
         LibResourceStorage.EventParticipant storage participant = rs.eventParticipants[eventId][user];
 
-        // Count as participant if first interaction
+        // First interaction - add to participants list
         if (participant.contribution == 0 && participant.actionsCompleted == 0) {
             participant.participationTime = uint32(block.timestamp);
+            rs.eventParticipantsList[eventId].push(user);
             unchecked { rs.totalEventParticipants[eventId]++; }
         }
 
@@ -580,7 +582,100 @@ contract ResourceEventFacet is AccessControlBase {
             scores[i] = rs.eventLeaderboardScores[eventId][participants[i]];
         }
     }
-    
+
+    /**
+     * @notice Get paginated full ranking for event
+     * @param eventId Event identifier
+     * @param offset Starting index (0-based)
+     * @param limit Max results to return (recommended: 50-100)
+     * @return addresses Participant addresses (sorted by score descending)
+     * @return scores Corresponding scores
+     * @return total Total number of participants
+     */
+    function getEventRankingPaginated(
+        string calldata eventId,
+        uint256 offset,
+        uint256 limit
+    ) external view returns (
+        address[] memory addresses,
+        uint256[] memory scores,
+        uint256 total
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        address[] storage allParticipants = rs.eventParticipantsList[eventId];
+        total = allParticipants.length;
+
+        if (offset >= total || limit == 0) {
+            return (new address[](0), new uint256[](0), total);
+        }
+
+        // Build temporary arrays with scores for sorting
+        uint256[] memory allScores = new uint256[](total);
+        address[] memory sorted = new address[](total);
+
+        for (uint256 i = 0; i < total; i++) {
+            sorted[i] = allParticipants[i];
+            allScores[i] = rs.eventLeaderboardScores[eventId][allParticipants[i]];
+        }
+
+        // Insertion sort (descending) - efficient enough for typical event sizes
+        for (uint256 i = 1; i < total; i++) {
+            uint256 keyScore = allScores[i];
+            address keyAddr = sorted[i];
+            uint256 j = i;
+            while (j > 0 && allScores[j - 1] < keyScore) {
+                allScores[j] = allScores[j - 1];
+                sorted[j] = sorted[j - 1];
+                j--;
+            }
+            allScores[j] = keyScore;
+            sorted[j] = keyAddr;
+        }
+
+        // Apply pagination
+        uint256 end = offset + limit;
+        if (end > total) end = total;
+        uint256 resultLen = end - offset;
+
+        addresses = new address[](resultLen);
+        scores = new uint256[](resultLen);
+
+        for (uint256 i = 0; i < resultLen; i++) {
+            addresses[i] = sorted[offset + i];
+            scores[i] = allScores[offset + i];
+        }
+    }
+
+    /**
+     * @notice Get total participant count for event
+     */
+    function getEventParticipantCount(string calldata eventId) external view returns (uint256) {
+        return LibResourceStorage.resourceStorage().eventParticipantsList[eventId].length;
+    }
+
+    /**
+     * @notice Backfill participants list for existing events (migration)
+     * @dev Only adds addresses that have actual participation data
+     * @param eventId Event identifier
+     * @param participants Addresses to add (from off-chain EventParticipation events)
+     */
+    function backfillEventParticipants(
+        string calldata eventId,
+        address[] calldata participants
+    ) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        for (uint256 i = 0; i < participants.length; i++) {
+            address user = participants[i];
+            LibResourceStorage.EventParticipant storage p = rs.eventParticipants[eventId][user];
+
+            // Only add if user actually participated (has contribution or actions)
+            if (p.contribution > 0 || p.actionsCompleted > 0) {
+                rs.eventParticipantsList[eventId].push(user);
+            }
+        }
+    }
+
     /**
      * @notice Get user participation data
      */
