@@ -247,10 +247,20 @@ contract ResourceEconomyFacet is AccessControlBase {
             }
         }
         uint256 production = uint256(BASE_PRODUCTION_RATE) * uint256(node.nodeLevel) * hoursSinceHarvest;
-        
-        // Apply territory equipment bonus
+
+        // Apply territory equipment bonus (Infrastructure Cards)
         LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[node.territoryId];
         production = (production * (100 + equipment.totalProductionBonus)) / 100;
+
+        // Apply colony infrastructure bonus (Processing Facilities, etc.)
+        uint16 colonyInfraBonus = LibResourceStorage.getInfrastructureBonus(colonyId, 0);
+        production = (production * colonyInfraBonus) / 100;
+
+        // Apply active event bonus
+        production = _applyEventBonus(production);
+
+        // Apply Rare Catalyst harvest boost
+        production = LibResourceStorage.applyHarvestBoost(LibMeta.msgSender(), production);
 
         // Apply maintenance penalty if overdue (50% reduction per week overdue, min 10% yield)
         uint256 penaltyPercent = _calculateMaintenancePenalty(node.lastMaintenancePaid);
@@ -372,27 +382,50 @@ contract ResourceEconomyFacet is AccessControlBase {
      * @return production Pending resources amount
      * @return tokenReward Expected YLW reward for harvesting
      */
-    function getPendingResources(uint256 nodeId) 
-        external 
-        view 
-        returns (uint256 production, uint256 tokenReward) 
+    function getPendingResources(uint256 nodeId)
+        external
+        view
+        returns (uint256 production, uint256 tokenReward)
     {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
-        
+
         if (!node.active) return (0, 0);
-        
+
+        // Get controlling colony
+        LibColonyWarsStorage.Territory storage territory = cws.territories[node.territoryId];
+        bytes32 colonyId = territory.controllingColony;
+
         // Calculate pending production
         uint256 hoursSinceHarvest = (block.timestamp - node.lastHarvestTime) / 1 hours;
         production = BASE_PRODUCTION_RATE * node.nodeLevel * hoursSinceHarvest;
-        
-        // Apply equipment bonus
+
+        // Apply equipment bonus (Infrastructure Cards)
         LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[node.territoryId];
         production = (production * (100 + equipment.totalProductionBonus)) / 100;
-        
-        // Calculate YLW reward
+
+        // Apply colony infrastructure bonus (Processing Facilities, etc.)
+        uint16 colonyInfraBonus = LibResourceStorage.getInfrastructureBonus(colonyId, 0);
+        production = (production * colonyInfraBonus) / 100;
+
+        // Apply active event bonus
+        production = _applyEventBonus(production);
+
+        // Apply Rare Catalyst harvest boost (for caller)
+        production = LibResourceStorage.applyHarvestBoost(msg.sender, production);
+
+        // Apply maintenance penalty if overdue
+        uint256 penaltyPercent = _calculateMaintenancePenalty(node.lastMaintenancePaid);
+        if (penaltyPercent > 0) {
+            production = (production * (100 - penaltyPercent)) / 100;
+        }
+
+        // Calculate YLW reward (also affected by penalty)
         tokenReward = TOKEN_HARVEST_REWARD_BASE + (uint256(node.nodeLevel) * 1 ether);
-        
+        if (penaltyPercent > 0) {
+            tokenReward = (tokenReward * (100 - penaltyPercent)) / 100;
+        }
+
         return (production, tokenReward);
     }
 
@@ -475,6 +508,87 @@ contract ResourceEconomyFacet is AccessControlBase {
             if (timeSinceMaintenance > MAINTENANCE_PERIOD) {
                 uint32 overdueTime = timeSinceMaintenance - MAINTENANCE_PERIOD;
                 weeksOverdue = overdueTime / MAINTENANCE_PERIOD + 1;
+            }
+        }
+    }
+
+    /**
+     * @notice Get all production bonuses for an economy node in one call
+     * @param nodeId Economy node ID
+     * @param user User address (for Rare Catalyst check)
+     * @return equipmentBonus Bonus from Infrastructure Cards (100 = no bonus)
+     * @return colonyInfraBonus Bonus from colony infrastructure (100 = no bonus)
+     * @return eventBonus Bonus from active events in basis points (10000 = 1x)
+     * @return harvestBoostBps Rare Catalyst boost in basis points (0 = no boost)
+     * @return maintenancePenalty Penalty from overdue maintenance (0-90%)
+     * @return combinedMultiplier Total combined multiplier (10000 = 1x, 15000 = 1.5x)
+     */
+    function getFullEconomyBonuses(uint256 nodeId, address user) external view returns (
+        uint16 equipmentBonus,
+        uint16 colonyInfraBonus,
+        uint256 eventBonus,
+        uint16 harvestBoostBps,
+        uint256 maintenancePenalty,
+        uint256 combinedMultiplier
+    ) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
+
+        if (!node.active) {
+            return (100, 100, 10000, 0, 0, 10000);
+        }
+
+        // Get controlling colony
+        bytes32 colonyId = cws.territories[node.territoryId].controllingColony;
+
+        // 1. Equipment bonus (Infrastructure Cards)
+        LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[node.territoryId];
+        equipmentBonus = 100 + equipment.totalProductionBonus;
+
+        // 2. Colony infrastructure bonus
+        colonyInfraBonus = LibResourceStorage.getInfrastructureBonus(colonyId, 0);
+
+        // 3. Event bonus (calculate from active events)
+        eventBonus = _calculateEventMultiplier();
+
+        // 4. Rare Catalyst harvest boost
+        harvestBoostBps = LibResourceStorage.getActiveHarvestBoost(user);
+
+        // 5. Maintenance penalty
+        maintenancePenalty = _calculateMaintenancePenalty(node.lastMaintenancePaid);
+
+        // Calculate combined multiplier (in basis points, 10000 = 1x)
+        combinedMultiplier = uint256(equipmentBonus) * colonyInfraBonus * eventBonus;
+        combinedMultiplier = combinedMultiplier / 100000; // Normalize from (100 * 100 * 10000) to basis points
+
+        // Apply harvest boost
+        if (harvestBoostBps > 0) {
+            combinedMultiplier = combinedMultiplier + (combinedMultiplier * harvestBoostBps / 10000);
+        }
+
+        // Apply maintenance penalty
+        if (maintenancePenalty > 0) {
+            combinedMultiplier = (combinedMultiplier * (100 - maintenancePenalty)) / 100;
+        }
+    }
+
+    /**
+     * @notice Calculate total event multiplier from active events
+     * @return multiplier Event multiplier in basis points (10000 = 1x)
+     */
+    function _calculateEventMultiplier() internal view returns (uint256 multiplier) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        multiplier = 10000; // Base 1x
+
+        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+            if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
+                // Type 1: Resource Rush, Type 4: Harvest Bonanza
+                if (evt.eventType == 1 || evt.eventType == 4) {
+                    multiplier = (multiplier * evt.productionMultiplier) / 10000;
+                }
             }
         }
     }
@@ -636,8 +750,32 @@ contract ResourceEconomyFacet is AccessControlBase {
     }
 
     // ============================================================================
-    // INTERNAL HELPERS - Maintenance Penalty
+    // INTERNAL HELPERS - Bonus Calculations
     // ============================================================================
+
+    /**
+     * @notice Apply active event production bonus
+     * @param baseAmount Base production amount
+     * @return Amount after applying event bonuses
+     */
+    function _applyEventBonus(uint256 baseAmount) internal view returns (uint256) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+            if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
+                // Type 1: Resource Rush - all resources get bonus
+                // Type 4: Harvest Bonanza - production bonus
+                if (evt.eventType == 1 || evt.eventType == 4) {
+                    baseAmount = (baseAmount * evt.productionMultiplier) / 10000;
+                }
+            }
+        }
+
+        return baseAmount;
+    }
 
     /**
      * @notice Calculate maintenance penalty percentage based on time overdue
