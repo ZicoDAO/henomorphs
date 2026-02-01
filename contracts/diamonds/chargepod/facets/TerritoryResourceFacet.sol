@@ -868,6 +868,60 @@ contract TerritoryResourceFacet is AccessControlBase {
         }
     }
 
+    /**
+     * @notice Get all production bonuses for a territory node in one call
+     * @param territoryId Territory ID
+     * @param user User address (for Rare Catalyst check)
+     * @return territoryBonus Bonus from territory + Territory Card (100 = no bonus)
+     * @return colonyInfraBonus Bonus from colony infrastructure (100 = no bonus)
+     * @return infraCardBonus Bonus from Infrastructure Cards (100 = no bonus)
+     * @return resourceCardBonus Bonus from Resource Cards (100 = no bonus)
+     * @return harvestBoostBps Rare Catalyst boost in basis points (0 = no boost)
+     * @return combinedMultiplier Total combined multiplier (10000 = 1x, 15000 = 1.5x)
+     */
+    function getFullProductionBonuses(uint256 territoryId, address user) external view returns (
+        uint16 territoryBonus,
+        uint16 colonyInfraBonus,
+        uint16 infraCardBonus,
+        uint16 resourceCardBonus,
+        uint16 harvestBoostBps,
+        uint256 combinedMultiplier
+    ) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibColonyWarsStorage.ResourceNode storage node = cws.territoryResourceNodes[territoryId];
+
+        if (!node.active) {
+            return (100, 100, 100, 100, 0, 10000);
+        }
+
+        // Get controlling colony
+        bytes32 colonyId = cws.territories[territoryId].controllingColony;
+
+        // 1. Territory bonus (territory.bonusValue + Territory Card)
+        territoryBonus = _calculateTerritoryBonus(colonyId, uint8(node.resourceType), territoryId);
+
+        // 2. Colony infrastructure bonus
+        colonyInfraBonus = LibResourceStorage.getInfrastructureBonus(colonyId, 0);
+
+        // 3. Infrastructure Card bonus
+        infraCardBonus = _getInfrastructureCardBonus(territoryId);
+
+        // 4. Resource Card bonus
+        resourceCardBonus = _getResourceCardBonus(territoryId, uint8(node.resourceType));
+
+        // 5. Rare Catalyst harvest boost
+        harvestBoostBps = LibResourceStorage.getActiveHarvestBoost(user);
+
+        // Calculate combined multiplier (in basis points, 10000 = 1x)
+        combinedMultiplier = uint256(territoryBonus) * colonyInfraBonus * infraCardBonus * resourceCardBonus;
+        combinedMultiplier = combinedMultiplier / 1000000; // Normalize from (100^4) to basis points
+
+        // Apply harvest boost
+        if (harvestBoostBps > 0) {
+            combinedMultiplier = combinedMultiplier + (combinedMultiplier * harvestBoostBps / 10000);
+        }
+    }
+
     // ==================== CARD BONUS HELPER FUNCTIONS ====================
 
     /**
