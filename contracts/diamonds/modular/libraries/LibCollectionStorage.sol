@@ -100,6 +100,7 @@ library LibCollectionStorage {
         uint8[] excludedVariants;
         bool active;
         bool allowSelfRolling;  // true = allows variant 0 (self-rolling), false = requires variant > 0 (coupon)
+        bool hasTargetRestrictions;  // if true, check couponValidForTarget mapping
     }
 
     struct RollCoupon {
@@ -261,6 +262,21 @@ library LibCollectionStorage {
         uint256 totalFeePaid;
         uint8[] assignedAccessories;
         uint8 augmentVariant;
+    }
+
+    /**
+     * @notice Mission assignment tracking - henomorph participation in missions
+     * @dev Tracks when a henomorph token is assigned to a mission
+     *      Token is NOT transformed, only metadata reflects mission status
+     *      Similar pattern to AugmentAssignment but lightweight
+     */
+    struct MissionAssignment {
+        bytes32 sessionId;           // Mission session identifier
+        address passCollection;      // Mission Pass collection address
+        uint256 passTokenId;         // Mission Pass token ID
+        uint8 missionVariant;        // Mission variant (0-4: Sentry Station, Mars, Krosno, Tomb, Australia)
+        uint256 assignmentTime;      // Block timestamp when assigned
+        bool active;                 // Whether mission is currently active
     }
 
     struct AugmentCollectionConfig {
@@ -658,7 +674,8 @@ library LibCollectionStorage {
         mapping(uint256 => mapping(uint8 => MintPricing)) mintPricingByTier;
 
         mapping(uint256 => CouponCollection) couponCollections;
-        
+        mapping(uint256 => mapping(uint256 => bool)) couponValidForTarget;  // couponCollectionId => targetCollectionId => isValid
+
         mapping(uint256 => RollCoupon) rollCouponsByTokenId;
         mapping(bytes32 => VariantRoll) variantRollsByHash;
         mapping(bytes32 => bool) mintedRollsByHash;
@@ -732,6 +749,16 @@ library LibCollectionStorage {
 
         // Track Main collection coupon usage (prevent double-spending)
         mapping(uint256 => mapping(uint256 => bool)) collectionCouponUsed; // collectionId => tokenId => used
+
+        // ==================== MISSION TRACKING SYSTEM ====================
+
+        // Mission assignment tracking: specimenCollection => tokenId => MissionAssignment
+        // Tracks when a henomorph is assigned to a mission (no transformation, metadata only)
+        mapping(address => mapping(uint256 => MissionAssignment)) specimenMissionAssignments;
+
+        // ==================== USER ROLLING TRACKING ====================
+        // Track user's rolling count per collection for free roll eligibility (Main/Realm collections)
+        mapping(uint256 => mapping(address => uint256)) userCollectionRollCount; // collectionId => user => rollCount
     }
 
     // ==================== STORAGE ACCESSOR ====================

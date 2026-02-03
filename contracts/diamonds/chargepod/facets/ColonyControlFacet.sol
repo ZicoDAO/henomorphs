@@ -2,15 +2,15 @@
 pragma solidity ^0.8.27;
 
 import {LibHenomorphsStorage} from "../../chargepod/libraries/LibHenomorphsStorage.sol";
-import {LibStakingStorage} from "../libraries/LibStakingStorage.sol";
+import {LibStakingStorage} from "../../staking/libraries/LibStakingStorage.sol";
 import {PodsUtils} from "../../../libraries/PodsUtils.sol";
-import {ColonyHelper} from "../libraries/ColonyHelper.sol";
+import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
-import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
 import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
 import {ControlFee, ColonyCriteria} from "../../../libraries/HenomorphsModel.sol";
-import {IStakingSystem, IChargeFacet} from "../interfaces/IStakingInterfaces.sol";
+import {IStakingSystem, IChargeFacet} from "../../staking/interfaces/IStakingInterfaces.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 /**

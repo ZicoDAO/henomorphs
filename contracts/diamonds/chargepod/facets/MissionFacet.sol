@@ -4,15 +4,16 @@ pragma solidity ^0.8.27;
 import {LibMissionStorage} from "../libraries/LibMissionStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
-import {PodsUtils} from "../../libraries/PodsUtils.sol";
-import {AccessHelper} from "../libraries/AccessHelper.sol";
-import {ColonyHelper} from "../libraries/ColonyHelper.sol";
-import {AccessControlBase} from "./AccessControlBase.sol";
-import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
-import {ControlFee, SpecimenCollection, PowerMatrix} from "../../libraries/HenomorphsModel.sol";
+import {PodsUtils} from "../../../libraries/PodsUtils.sol";
+import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
+import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
+import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
+import {ControlFee, SpecimenCollection, PowerMatrix} from "../../../libraries/HenomorphsModel.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ICollectionDiamond} from "../../modular/interfaces/ICollectionDiamond.sol";
 
 /**
  * @title MissionFacet
@@ -195,8 +196,9 @@ contract MissionFacet is AccessControlBase {
         sessionId = _generateSessionId(ms, initiator);
         revealBlock = block.number + LibMissionStorage.REVEAL_DELAY_BLOCKS;
 
-        // Lock participants
-        _lockParticipants(sessionId, participantIds);
+        // Lock participants and notify Diamond about mission assignment
+        // Note: Token is NOT transformed - only metadata tracking for mission status
+        _lockParticipants(sessionId, participantIds, passCollectionId, passTokenId, missionVariant);
 
         // Initialize packed state
         _initializePackedState(ms, sessionId, passCollectionId, passTokenId, missionVariant, revealBlock);
@@ -1112,9 +1114,18 @@ contract MissionFacet is AccessControlBase {
     // INTERNAL FUNCTIONS - LOCKING
     // ============================================================
 
-    function _lockParticipants(bytes32 sessionId, uint256[] calldata participantIds) internal {
+    function _lockParticipants(
+        bytes32 sessionId,
+        uint256[] calldata participantIds,
+        uint16 passCollectionId,
+        uint256 passTokenId,
+        uint8 missionVariant
+    ) internal {
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        // Get pass collection address for Diamond notifications
+        address passCollectionAddress = ms.passCollections[passCollectionId].collectionAddress;
 
         for (uint256 i = 0; i < participantIds.length; i++) {
             uint256 combinedId = participantIds[i];
@@ -1136,17 +1147,113 @@ contract MissionFacet is AccessControlBase {
                 status: 0, // Active
                 bonusFlags: 0
             }));
+
+            // Notify Diamond about mission assignment (metadata tracking only)
+            // Token is NOT transformed - only metadata reflects mission status
+            _notifyMissionAssigned(
+                combinedId,
+                sessionId,
+                passCollectionAddress,
+                passTokenId,
+                missionVariant
+            );
         }
     }
 
     function _unlockParticipants(bytes32 sessionId) internal {
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
         LibMissionStorage.PackedParticipant[] storage participants = ms.sessionParticipants[sessionId];
+
+        // Get pass collection info for notifications
+        LibMissionStorage.MissionPassCollection storage passConfig = ms.passCollections[state.passCollectionId];
 
         for (uint256 i = 0; i < participants.length; i++) {
             uint256 combinedId = uint256(participants[i].combinedId);
             ms.lockedHenomorphs[combinedId] = false;
             delete ms.henomorphActiveMission[combinedId];
+
+            // Notify Diamond about mission removal (metadata update)
+            _notifyMissionRemoved(combinedId, sessionId, passConfig.collectionAddress);
+        }
+    }
+
+    // ============================================================
+    // INTERNAL FUNCTIONS - DIAMOND NOTIFICATIONS
+    // ============================================================
+
+    /**
+     * @notice Notify Diamond about mission assignment (metadata tracking only)
+     * @dev Token is NOT transformed - Diamond only tracks mission status for metadata
+     * @param combinedId Combined collection + token ID
+     * @param sessionId Mission session ID
+     * @param passCollectionAddress Mission Pass collection address
+     * @param passTokenId Mission Pass token ID
+     * @param missionVariant Mission variant (0-4)
+     */
+    function _notifyMissionAssigned(
+        uint256 combinedId,
+        bytes32 sessionId,
+        address passCollectionAddress,
+        uint256 passTokenId,
+        uint8 missionVariant
+    ) internal {
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        // Extract collection ID and token ID from combined ID
+        (uint256 collectionId, uint256 tokenId) = PodsUtils.extractIds(combinedId);
+
+        // Get specimen collection configuration
+        SpecimenCollection storage collection = hs.specimenCollections[uint16(collectionId)];
+
+        // Only notify if collection has Diamond configured and is modular
+        if (collection.diamondAddress != address(0) && collection.isModularSpecimen) {
+            try ICollectionDiamond(collection.diamondAddress).onMissionAssigned(
+                collection.collectionAddress,
+                tokenId,
+                sessionId,
+                passCollectionAddress,
+                passTokenId,
+                missionVariant
+            ) {
+                // Success - Diamond notified
+            } catch {
+                // Ignore errors to prevent mission start failures
+                // Mission can proceed even if metadata notification fails
+            }
+        }
+    }
+
+    /**
+     * @notice Notify Diamond about mission removal (clear metadata tracking)
+     * @dev Called when mission ends (complete, fail, or abandon)
+     * @param combinedId Combined collection + token ID
+     * @param sessionId Mission session ID
+     */
+    function _notifyMissionRemoved(
+        uint256 combinedId,
+        bytes32 sessionId,
+        address
+    ) internal {
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        // Extract collection ID and token ID from combined ID
+        (uint256 collectionId, uint256 tokenId) = PodsUtils.extractIds(combinedId);
+
+        // Get specimen collection configuration
+        SpecimenCollection storage collection = hs.specimenCollections[uint16(collectionId)];
+
+        // Only notify if collection has Diamond configured and is modular
+        if (collection.diamondAddress != address(0) && collection.isModularSpecimen) {
+            try ICollectionDiamond(collection.diamondAddress).onMissionRemoved(
+                collection.collectionAddress,
+                tokenId,
+                sessionId
+            ) {
+                // Success - Diamond notified
+            } catch {
+                // Ignore errors to prevent mission completion failures
+            }
         }
     }
 

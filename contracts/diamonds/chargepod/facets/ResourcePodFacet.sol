@@ -5,16 +5,16 @@ import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibGamingStorage} from "../libraries/LibGamingStorage.sol";
-import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {ColonyHelper} from "../libraries/ColonyHelper.sol";
+import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
 import {LibAchievementTrigger} from "../libraries/LibAchievementTrigger.sol";
-import {AccessControlBase} from "./AccessControlBase.sol";
-import {PodsUtils} from "../../libraries/PodsUtils.sol";
+import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {PodsUtils} from "../../../libraries/PodsUtils.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import {IColonyTerritoryCards} from "../interfaces/IColonyTerritoryCards.sol";
-import {IStakingSystem} from "../interfaces/IStakingInterfaces.sol";
+import {IColonyTerritoryCards} from "../../staking/interfaces/IColonyTerritoryCards.sol";
+import {IStakingSystem} from "../../staking/interfaces/IStakingInterfaces.sol";
 
 /**
  * @notice Minimal interface for ResourceEventFacet inter-facet calls

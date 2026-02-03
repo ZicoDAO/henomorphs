@@ -4,13 +4,13 @@ pragma solidity ^0.8.27;
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
+import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
 import {ResourceHelper} from "../libraries/ResourceHelper.sol";
-import {AccessControlBase} from "./AccessControlBase.sol";
-import {ColonyHelper} from "../libraries/ColonyHelper.sol";
+import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IColonyResourceCards} from "../interfaces/IColonyResourceCards.sol";
+import {IColonyResourceCards} from "../../staking/interfaces/IColonyResourceCards.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 
 /**
@@ -248,6 +248,10 @@ contract ResourceEconomyFacet is AccessControlBase {
         }
         uint256 production = uint256(BASE_PRODUCTION_RATE) * uint256(node.nodeLevel) * hoursSinceHarvest;
 
+        // Apply territory bonus (territory.bonusValue from controlled territories)
+        uint16 territoryBonus = _calculateTerritoryBonus(colonyId, uint8(node.resourceType), node.territoryId);
+        production = (production * territoryBonus) / 100;
+
         // Apply territory equipment bonus (Infrastructure Cards)
         LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[node.territoryId];
         production = (production * (100 + equipment.totalProductionBonus)) / 100;
@@ -400,6 +404,10 @@ contract ResourceEconomyFacet is AccessControlBase {
         uint256 hoursSinceHarvest = (block.timestamp - node.lastHarvestTime) / 1 hours;
         production = BASE_PRODUCTION_RATE * node.nodeLevel * hoursSinceHarvest;
 
+        // Apply territory bonus (territory.bonusValue from controlled territories)
+        uint16 territoryBonus = _calculateTerritoryBonus(colonyId, uint8(node.resourceType), node.territoryId);
+        production = (production * territoryBonus) / 100;
+
         // Apply equipment bonus (Infrastructure Cards)
         LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[node.territoryId];
         production = (production * (100 + equipment.totalProductionBonus)) / 100;
@@ -516,6 +524,7 @@ contract ResourceEconomyFacet is AccessControlBase {
      * @notice Get all production bonuses for an economy node in one call
      * @param nodeId Economy node ID
      * @param user User address (for Rare Catalyst check)
+     * @return territoryBonus Bonus from territory.bonusValue (100 = no bonus)
      * @return equipmentBonus Bonus from Infrastructure Cards (100 = no bonus)
      * @return colonyInfraBonus Bonus from colony infrastructure (100 = no bonus)
      * @return eventBonus Bonus from active events in basis points (10000 = 1x)
@@ -524,6 +533,7 @@ contract ResourceEconomyFacet is AccessControlBase {
      * @return combinedMultiplier Total combined multiplier (10000 = 1x, 15000 = 1.5x)
      */
     function getFullEconomyBonuses(uint256 nodeId, address user) external view returns (
+        uint16 territoryBonus,
         uint16 equipmentBonus,
         uint16 colonyInfraBonus,
         uint256 eventBonus,
@@ -535,31 +545,34 @@ contract ResourceEconomyFacet is AccessControlBase {
         LibColonyWarsStorage.ResourceNode storage node = cws.economyResourceNodes[nodeId];
 
         if (!node.active) {
-            return (100, 100, 10000, 0, 0, 10000);
+            return (100, 100, 100, 10000, 0, 0, 10000);
         }
 
         // Get controlling colony
         bytes32 colonyId = cws.territories[node.territoryId].controllingColony;
 
-        // 1. Equipment bonus (Infrastructure Cards)
+        // 1. Territory bonus (territory.bonusValue from controlled territories)
+        territoryBonus = _calculateTerritoryBonus(colonyId, uint8(node.resourceType), node.territoryId);
+
+        // 2. Equipment bonus (Infrastructure Cards)
         LibColonyWarsStorage.TerritoryEquipment storage equipment = cws.territoryEquipment[node.territoryId];
         equipmentBonus = 100 + equipment.totalProductionBonus;
 
-        // 2. Colony infrastructure bonus
+        // 3. Colony infrastructure bonus
         colonyInfraBonus = LibResourceStorage.getInfrastructureBonus(colonyId, 0);
 
-        // 3. Event bonus (calculate from active events)
+        // 4. Event bonus (calculate from active events)
         eventBonus = _calculateEventMultiplier();
 
-        // 4. Rare Catalyst harvest boost
+        // 5. Rare Catalyst harvest boost
         harvestBoostBps = LibResourceStorage.getActiveHarvestBoost(user);
 
-        // 5. Maintenance penalty
+        // 6. Maintenance penalty
         maintenancePenalty = _calculateMaintenancePenalty(node.lastMaintenancePaid);
 
         // Calculate combined multiplier (in basis points, 10000 = 1x)
-        combinedMultiplier = uint256(equipmentBonus) * colonyInfraBonus * eventBonus;
-        combinedMultiplier = combinedMultiplier / 100000; // Normalize from (100 * 100 * 10000) to basis points
+        combinedMultiplier = uint256(territoryBonus) * equipmentBonus * colonyInfraBonus * eventBonus;
+        combinedMultiplier = combinedMultiplier / 10000000; // Normalize from (100 * 100 * 100 * 10000) to basis points
 
         // Apply harvest boost
         if (harvestBoostBps > 0) {
@@ -775,6 +788,51 @@ contract ResourceEconomyFacet is AccessControlBase {
         }
 
         return baseAmount;
+    }
+
+    /**
+     * @notice Calculate territory bonus from controlled territories
+     * @param colonyId Colony ID
+     * @param resourceType Resource type (0-3)
+     * @return bonusPercent Bonus percentage (100 = no bonus, 109 = 9% bonus)
+     */
+    function _calculateTerritoryBonus(
+        bytes32 colonyId,
+        uint8 resourceType,
+        uint256 /* nodesTerritoryId - unused, kept for API compatibility */
+    ) internal view returns (uint16 bonusPercent) {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        uint256[] memory territories = cws.colonyTerritories[colonyId];
+
+        bonusPercent = 100; // Base 100% (no bonus)
+
+        for (uint256 i = 0; i < territories.length; i++) {
+            LibColonyWarsStorage.Territory storage territory = cws.territories[territories[i]];
+
+            if (_isValidResourceTypeForTerritory(territory.territoryType, resourceType)) {
+                // Add territory.bonusValue (divided by 10 to get percentage points)
+                bonusPercent += territory.bonusValue / 10;
+            }
+        }
+    }
+
+    /**
+     * @notice Check if resource type is valid for territory type
+     * @param territoryType Territory type (1-5)
+     * @param resourceType Resource type (0-3)
+     * @return valid Whether resource type matches territory
+     */
+    function _isValidResourceTypeForTerritory(
+        uint8 territoryType,
+        uint8 resourceType
+    ) internal pure returns (bool) {
+        // Territory type 1 (Mining) -> Basic Materials (0)
+        // Territory type 2 (Energy) -> Energy Crystals (1)
+        // Territory type 3 (Research) -> Bio Compounds (2)
+        // Territory type 4 (Production) -> Rare Elements (3)
+        // Territory type 5 (Strategic) -> All types
+        if (territoryType == 5) return true;
+        return territoryType == resourceType + 1;
     }
 
     /**

@@ -397,7 +397,110 @@ contract MetadataFacet is AccessControlBase {
     }
     
     // ==================== MAIN TOKEN METADATA WITH THEME ====================
-    
+
+    /**
+     * @notice Internal struct to reduce stack depth in _buildMainTokenMetadata
+     */
+    struct AugmentMissionContext {
+        bool hasActiveAugment;
+        string augmentName;
+        uint8 augmentVariant;
+        bool isOnMission;
+        string missionName;
+        uint8 missionVariant;
+    }
+
+    /**
+     * @notice Get augment and mission context for a token
+     */
+    function _getAugmentMissionContext(
+        address contractAddress,
+        uint256 tokenId
+    ) internal view returns (AugmentMissionContext memory ctx) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+
+        // Check augment assignment
+        bytes32 assignmentKey = cs.specimenToAssignment[contractAddress][tokenId];
+        if (assignmentKey != bytes32(0)) {
+            LibCollectionStorage.AugmentAssignment storage assignment = cs.augmentAssignments[assignmentKey];
+            ctx.hasActiveAugment = assignment.active &&
+                (assignment.unlockTime == 0 || block.timestamp < assignment.unlockTime);
+            if (ctx.hasActiveAugment) {
+                ctx.augmentVariant = assignment.augmentVariant;
+                ctx.augmentName = _getAugmentName(assignment.augmentCollection, assignment.augmentTokenId, assignment.augmentVariant);
+            }
+        }
+
+        // Check mission assignment
+        LibCollectionStorage.MissionAssignment storage missionAssignment = cs.specimenMissionAssignments[contractAddress][tokenId];
+        ctx.isOnMission = missionAssignment.active;
+        if (ctx.isOnMission) {
+            ctx.missionVariant = missionAssignment.missionVariant;
+            ctx.missionName = _getMissionName(ctx.missionVariant);
+        }
+    }
+
+    /**
+     * @notice Build modular data with augment information
+     */
+    function _buildModularData(
+        uint256 collectionId,
+        uint8 tier,
+        uint256 tokenId,
+        AugmentMissionContext memory ctx
+    ) internal view returns (MetadataHelper.ModularData memory) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        ModularConfigData storage modularConfig = cs.modularConfigsData[collectionId][tier][tokenId];
+
+        (string memory traitPackName, string memory traitPackUri) = _getTraitPackInfo(modularConfig.activeTraitPackId);
+
+        if (ctx.hasActiveAugment) {
+            traitPackName = ctx.augmentName;
+            traitPackUri = "";
+        }
+
+        return MetadataHelper.ModularData({
+            activeTraitPackId: ctx.hasActiveAugment ? ctx.augmentVariant : modularConfig.activeTraitPackId,
+            traitPackName: traitPackName,
+            traitPackUri: traitPackUri,
+            activeAssetId: modularConfig.activeAssetId,
+            assetUri: _getAssetUri(modularConfig.activeAssetId),
+            equipments: modularConfig.equipments
+        });
+    }
+
+    /**
+     * @notice Generate final JSON based on theme and mission state
+     */
+    function _generateFinalJson(
+        MetadataHelper.CoreTokenData memory coreData,
+        MetadataHelper.SystemData memory systemData,
+        MetadataHelper.ModularData memory modularData,
+        MetadataHelper.ThemeData memory themeData,
+        AugmentMissionContext memory ctx
+    ) internal pure returns (string memory) {
+        if (themeData.hasTheme) {
+            if (ctx.isOnMission) {
+                MetadataHelper.MissionData memory missionData = MetadataHelper.MissionData({
+                    onMission: true,
+                    missionName: ctx.missionName,
+                    missionVariant: ctx.missionVariant
+                });
+                return MetadataHelper.generateTokenMetadataWithThemeAndMission(coreData, systemData, modularData, themeData, missionData);
+            }
+            return MetadataHelper.generateTokenMetadataWithTheme(coreData, systemData, modularData, themeData);
+        }
+        if (ctx.isOnMission) {
+            MetadataHelper.MissionData memory missionData = MetadataHelper.MissionData({
+                onMission: true,
+                missionName: ctx.missionName,
+                missionVariant: ctx.missionVariant
+            });
+            return MetadataHelper.generateTokenMetadataWithMission(coreData, systemData, modularData, missionData);
+        }
+        return MetadataHelper.generateTokenMetadataFromData(coreData, systemData, modularData);
+    }
+
     /**
      * @notice Build main token metadata with theme integration
      * Uses MetadataHelper library functions
@@ -405,24 +508,12 @@ contract MetadataFacet is AccessControlBase {
     function _buildMainTokenMetadata(uint256 collectionId, uint8 tier, uint256 tokenId) internal view returns (string memory) {
         LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
         LibCollectionStorage.CollectionData storage collection = cs.collections[collectionId];
-        
+
         uint8 tokenVariant = _getTokenVariant(collectionId, tier, tokenId);
-        
-        // Check if token has active augment assignment
-        bytes32 assignmentKey = cs.specimenToAssignment[collection.contractAddress][tokenId];
-        bool hasActiveAugment = false;
-        string memory augmentName = "";
-        
-        if (assignmentKey != bytes32(0)) {
-            LibCollectionStorage.AugmentAssignment storage assignment = cs.augmentAssignments[assignmentKey];
-            hasActiveAugment = assignment.active && 
-                            (assignment.unlockTime == 0 || block.timestamp < assignment.unlockTime);
-            
-            if (hasActiveAugment) {
-                augmentName = _getAugmentName(assignment.augmentCollection, assignment.augmentTokenId, assignment.augmentVariant);
-            }
-        }
-        
+
+        // Get augment and mission context (reduces stack depth)
+        AugmentMissionContext memory ctx = _getAugmentMissionContext(collection.contractAddress, tokenId);
+
         // Build core data
         MetadataHelper.CoreTokenData memory coreData = MetadataHelper.CoreTokenData({
             tokenId: tokenId,
@@ -432,7 +523,7 @@ contract MetadataFacet is AccessControlBase {
             externalUrl: "https://zico.network",
             animationUri: _determineAnimationUri(collection, collectionId, tier, tokenVariant, tokenId)
         });
-        
+
         // Build system data
         MetadataHelper.SystemData memory systemData = MetadataHelper.SystemData({
             specimen: _buildSpecimenData(collectionId, tier, tokenVariant),
@@ -442,39 +533,13 @@ contract MetadataFacet is AccessControlBase {
             accessoryBonuses: _calculateAccessoryBonuses(collectionId, tier, tokenId),
             compatibility: _calculateCompatibilityScores(tokenVariant, collectionId, tier, tokenId)
         });
-        
-        // Build modular data with augment information
-        ModularConfigData storage modularConfig = cs.modularConfigsData[collectionId][tier][tokenId];
-        (string memory traitPackName, string memory traitPackUri) = _getTraitPackInfo(modularConfig.activeTraitPackId);
-        string memory assetUri = _getAssetUri(modularConfig.activeAssetId);
-        
-        // Override with augment info if present
-        if (hasActiveAugment) {
-            traitPackName = augmentName;
-            traitPackUri = ""; // Augments use base collection URI
-        }
-        
-        MetadataHelper.ModularData memory modularData = MetadataHelper.ModularData({
-            activeTraitPackId: hasActiveAugment ? cs.augmentAssignments[assignmentKey].augmentVariant : modularConfig.activeTraitPackId,
-            traitPackName: traitPackName,
-            traitPackUri: traitPackUri,
-            activeAssetId: modularConfig.activeAssetId,
-            assetUri: assetUri,
-            equipments: modularConfig.equipments
-        });
-        
-        // Build theme data
+
+        // Build modular and theme data
+        MetadataHelper.ModularData memory modularData = _buildModularData(collectionId, tier, tokenId, ctx);
         MetadataHelper.ThemeData memory themeData = _buildThemeData(collectionId, tier, tokenVariant);
-        
-        // Generate metadata with theme support
-        string memory json;
-        if (themeData.hasTheme) {
-            json = MetadataHelper.generateTokenMetadataWithTheme(coreData, systemData, modularData, themeData);
-        } else {
-            json = MetadataHelper.generateTokenMetadataFromData(coreData, systemData, modularData);
-        }
-        
-        return MetadataHelper.encodeTokenURI(json);
+
+        // Generate and encode final JSON
+        return MetadataHelper.encodeTokenURI(_generateFinalJson(coreData, systemData, modularData, themeData, ctx));
     }
 
     /**
@@ -514,7 +579,20 @@ contract MetadataFacet is AccessControlBase {
         // FALLBACK: Generic naming only if no configuration found
         return string.concat("Augment V", augmentVariant.toString());
     }
-    
+
+    /**
+     * @notice Get mission name from variant
+     * @dev Mission variants: 0=Sentry Station, 1=Mission Mars, 2=Mission Krosno, 3=Mission Tomb, 4=Mission Australia
+     */
+    function _getMissionName(uint8 missionVariant) internal pure returns (string memory) {
+        if (missionVariant == 0) return "Sentry Station";
+        if (missionVariant == 1) return "Mission Mars";
+        if (missionVariant == 2) return "Mission Krosno";
+        if (missionVariant == 3) return "Mission Tomb";
+        if (missionVariant == 4) return "Mission Australia";
+        return string.concat("Mission V", missionVariant.toString());
+    }
+
     /**
      * @notice Build augment token metadata with theme support
      */

@@ -2,15 +2,15 @@
 pragma solidity ^0.8.27;
 
 import {LibRedemptionStorage} from "../../chargepod/libraries/LibRedemptionStorage.sol";
-import {LibStakingStorage} from "../libraries/LibStakingStorage.sol";
+import {LibStakingStorage} from "../../staking/libraries/LibStakingStorage.sol";
 import {PodsUtils} from "../../../libraries/PodsUtils.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {AccessHelper} from "../libraries/AccessHelper.sol";
+import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {StakedSpecimen} from "../../../libraries/StakingModel.sol";
 import {SpecimenCollection} from "../../../libraries/HenomorphsModel.sol";
-import {IStakingBiopodFacet, Calibration} from "../interfaces/IStakingInterfaces.sol";
+import {IStakingBiopodFacet, Calibration} from "../../staking/interfaces/IStakingInterfaces.sol";
 
 /**
  * @title IRewardRedeemable

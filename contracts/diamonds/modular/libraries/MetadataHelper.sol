@@ -55,6 +55,16 @@ library MetadataHelper {
         Equipment[] equipments;
     }
 
+    /**
+     * @notice Mission assignment data for metadata generation
+     * @dev Token is NOT transformed during mission - only metadata reflects status
+     */
+    struct MissionData {
+        bool onMission;
+        string missionName;
+        uint8 missionVariant;
+    }
+
     struct ThemeData {
         bool hasTheme;
         string themeName;
@@ -119,7 +129,34 @@ library MetadataHelper {
     ) public pure returns (string memory) {
         return _processFromStructsWithTheme(coreData, systemData, modularData, themeData);
     }
-    
+
+    /**
+     * @notice Generate token metadata with mission status
+     * @dev For tokens currently assigned to a mission
+     */
+    function generateTokenMetadataWithMission(
+        CoreTokenData memory coreData,
+        SystemData memory systemData,
+        ModularData memory modularData,
+        MissionData memory missionData
+    ) public pure returns (string memory) {
+        return _processFromStructsWithMission(coreData, systemData, modularData, missionData);
+    }
+
+    /**
+     * @notice Generate token metadata with theme and mission status
+     * @dev For themed tokens currently assigned to a mission
+     */
+    function generateTokenMetadataWithThemeAndMission(
+        CoreTokenData memory coreData,
+        SystemData memory systemData,
+        ModularData memory modularData,
+        ThemeData memory themeData,
+        MissionData memory missionData
+    ) public pure returns (string memory) {
+        return _processFromStructsWithThemeAndMission(coreData, systemData, modularData, themeData, missionData);
+    }
+
     // ==================== INTERNAL PROCESSING - ALL ORIGINAL PRESERVED ====================
     
     function _processTokenMetadata(
@@ -199,7 +236,91 @@ library MetadataHelper {
         
         return _assembleJSON(name, description, imageUri, animationUri, coreData.externalUrl, attributes);
     }
-    
+
+    /**
+     * @notice Process metadata with mission status
+     * @dev Adds mission indicator to token name and includes mission attributes
+     */
+    function _processFromStructsWithMission(
+        CoreTokenData memory coreData,
+        SystemData memory systemData,
+        ModularData memory modularData,
+        MissionData memory missionData
+    ) private pure returns (string memory) {
+
+        // Build name with augment support
+        string memory name = string.concat("Henomorph #", coreData.tokenId.toString());
+
+        // Add augment to name if present
+        if (bytes(modularData.traitPackName).length > 0 &&
+            modularData.activeTraitPackId > 0 &&
+            bytes(modularData.traitPackUri).length == 0) {
+            name = string.concat(name, " + ", modularData.traitPackName);
+        }
+
+        // Add mission indicator if on mission
+        if (missionData.onMission) {
+            name = string.concat(name, unicode" 🎯");
+        }
+
+        // Add staking indicator
+        if (systemData.stakingStatus.isStaked) {
+            name = string.concat(name, unicode" ⚡");
+        }
+
+        string memory description = _getDescriptionFromStructs(systemData.specimen, modularData.traitPackName, systemData.compatibility.traitPackCompatibility);
+        string memory imageUri = _getMainImageUriFromStructs(coreData, systemData, modularData);
+        string memory animationUri = _getMainAnimationUriFromStructs(coreData, systemData, modularData);
+        string memory attributes = _getAllAttributesWithMission(coreData, systemData, modularData, missionData);
+
+        return _assembleJSON(name, description, imageUri, animationUri, coreData.externalUrl, attributes);
+    }
+
+    /**
+     * @notice Process metadata with theme and mission status
+     * @dev Adds mission indicator to themed token name and includes mission attributes
+     */
+    function _processFromStructsWithThemeAndMission(
+        CoreTokenData memory coreData,
+        SystemData memory systemData,
+        ModularData memory modularData,
+        ThemeData memory themeData,
+        MissionData memory missionData
+    ) private pure returns (string memory) {
+
+        // Build name with theme support
+        string memory name;
+        if (themeData.hasTheme && bytes(themeData.themeName).length > 0) {
+            name = string.concat(themeData.themeName, " #", coreData.tokenId.toString());
+        } else {
+            name = string.concat("Henomorph #", coreData.tokenId.toString());
+        }
+
+        // Add augment to name if present
+        if (bytes(modularData.traitPackName).length > 0 &&
+            modularData.activeTraitPackId > 0 &&
+            bytes(modularData.traitPackUri).length == 0) {
+            name = string.concat(name, " + ", modularData.traitPackName);
+        }
+
+        // Add mission indicator if on mission
+        if (missionData.onMission) {
+            name = string.concat(name, unicode" 🎯");
+        }
+
+        // Add staking indicator
+        if (systemData.stakingStatus.isStaked) {
+            name = string.concat(name, unicode" ⚡");
+        }
+
+        string memory description = _getDescriptionWithTheme(systemData.specimen, modularData.traitPackName, systemData.compatibility.traitPackCompatibility, themeData);
+        string memory imageUri = _getMainImageUriWithTheme(coreData, systemData, modularData, themeData);
+        string memory animationUri = _getMainAnimationUriWithTheme(coreData, systemData, modularData, themeData);
+        string memory attributes = _getAllAttributesWithThemeAndMission(coreData, systemData, modularData, themeData, missionData);
+
+        return _assembleJSON(name, description, imageUri, animationUri, coreData.externalUrl, attributes);
+    }
+
     // ==================== COMPONENT BUILDERS - ALL ORIGINAL PRESERVED ====================
     
     function _getName(uint256 tokenId, bool isStaked) private pure returns (string memory) {
@@ -555,10 +676,10 @@ library MetadataHelper {
         
         // Add augment attributes if present (following HenomorphsMetadata pattern)
         string memory augmentAttrs = "";
-        if (bytes(modularData.traitPackName).length > 0 && 
-            modularData.activeTraitPackId > 0 && 
+        if (bytes(modularData.traitPackName).length > 0 &&
+            modularData.activeTraitPackId > 0 &&
             bytes(modularData.traitPackUri).length == 0) { // Augments have empty traitPackUri
-            
+
             augmentAttrs = string.concat(
                 ',{"trait_type":"Augment Status","value":"Active"}',
                 ',{"trait_type":"Augment","value":"', modularData.traitPackName, '"}',
@@ -566,8 +687,33 @@ library MetadataHelper {
                 ',{"trait_type":"Enhanced","value":"Yes"}'
             );
         }
-        
+
         return string.concat(coreAttrs, powerAttrs, bonusAttrs, statusAttrs, augmentAttrs);
+    }
+
+    /**
+     * @notice Get all attributes including mission status
+     * @dev Extended version that includes mission assignment info
+     */
+    function _getAllAttributesWithMission(
+        CoreTokenData memory coreData,
+        SystemData memory systemData,
+        ModularData memory modularData,
+        MissionData memory missionData
+    ) internal pure returns (string memory) {
+        string memory baseAttrs = _getAllAttributesFromStructs(coreData, systemData, modularData);
+
+        // Add mission attributes if on mission
+        if (missionData.onMission) {
+            string memory missionAttrs = string.concat(
+                ',{"trait_type":"Mission Status","value":"On Mission"}',
+                ',{"trait_type":"Active Mission","value":"', missionData.missionName, '"}',
+                ',{"trait_type":"Mission Variant","value":"', missionData.missionVariant.toString(), '"}'
+            );
+            return string.concat(baseAttrs, missionAttrs);
+        }
+
+        return baseAttrs;
     }
 
     function _getAllAttributesWithTheme(
@@ -597,7 +743,33 @@ library MetadataHelper {
         
         return string.concat(coreAttrs, powerAttrs, bonusAttrs, statusAttrs, augmentAttrs);
     }
-    
+
+    /**
+     * @notice Get all attributes with theme and mission status
+     * @dev Extended version for themed metadata with mission assignment info
+     */
+    function _getAllAttributesWithThemeAndMission(
+        CoreTokenData memory coreData,
+        SystemData memory systemData,
+        ModularData memory modularData,
+        ThemeData memory themeData,
+        MissionData memory missionData
+    ) internal pure returns (string memory) {
+        string memory baseAttrs = _getAllAttributesWithTheme(coreData, systemData, modularData, themeData);
+
+        // Add mission attributes if on mission
+        if (missionData.onMission) {
+            string memory missionAttrs = string.concat(
+                ',{"trait_type":"Mission Status","value":"On Mission"}',
+                ',{"trait_type":"Active Mission","value":"', missionData.missionName, '"}',
+                ',{"trait_type":"Mission Variant","value":"', missionData.missionVariant.toString(), '"}'
+            );
+            return string.concat(baseAttrs, missionAttrs);
+        }
+
+        return baseAttrs;
+    }
+
     function _getCoreAttributes(
         uint8 tokenVariant,
         string memory formName,

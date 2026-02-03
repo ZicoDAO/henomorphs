@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
-import {ControlFee} from "../../libraries/HenomorphsModel.sol";
+import {ControlFee} from "../../../libraries/HenomorphsModel.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
@@ -243,6 +243,12 @@ library LibResourceStorage {
         uint256 totalBoostsActivated;
         uint256 totalResourcesConsumedByBoosts;
         uint256 totalCardsCrafted;
+
+        // Event participant lists for full ranking pagination (added v2)
+        mapping(string => address[]) eventParticipantsList;
+
+        // All event IDs ever created (planned, active, completed) - never removed
+        string[] allEventIds;
     }
     
     /**

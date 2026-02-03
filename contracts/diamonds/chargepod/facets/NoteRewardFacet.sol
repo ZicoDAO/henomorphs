@@ -5,8 +5,8 @@ import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibNoteStorage} from "../libraries/LibNoteStorage.sol";
-import {AccessControlBase} from "./AccessControlBase.sol";
-import {IColonyReserveNotes} from "../banknotes/IColonyReserveNotes.sol";
+import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
+import {IColonyReserveNotes} from "../../../collections/banknotes/IColonyReserveNotes.sol";
 
 /**
  * @title NoteRewardFacet

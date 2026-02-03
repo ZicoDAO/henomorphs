@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.27;
 
+import {TraitPack, TraitPackEquipment} from "../../../libraries/HenomorphsModel.sol";
 import {LibCollectionStorage} from "../libraries/LibCollectionStorage.sol";
-import {IssueInfo, ItemTier, TierVariant, TraitPack, TraitPackEquipment} from"../libraries/CollectionModel.sol";
+import {ItemType} from "../../../libraries/CollectionModel.sol";
+import {IssueInfo, ItemTier, TierVariant} from "../libraries/CollectionModel.sol";
 import {AccessoryEffects, AccessoryDefinition} from "../libraries/ModularAssetModel.sol";
 
 
@@ -64,6 +66,7 @@ interface ICollectionDiamond {
      * @dev ADD this function signature - used in HenomorphsAugmentsV1
      */
     function getCollectionItemInfo(
+        ItemType itemType,
         uint256 issueId,
         uint8 tier
     ) external view returns (
@@ -95,6 +98,7 @@ interface ICollectionDiamond {
      */
     function shuffleTokenVariant(
         uint256 collectionId,
+        ItemType itemType,
         uint256 issueId,
         uint8 tier,
         uint256 tokenId
@@ -105,6 +109,7 @@ interface ICollectionDiamond {
      * @dev ADD this function signature - used in HenomorphsAugmentsV1
      */
     function getCollectionTierVariant(
+        ItemType itemType,
         uint256 issueId,
         uint8 tier,
         uint8 variant
@@ -131,4 +136,44 @@ interface ICollectionDiamond {
     ) external view returns (bool);
 
     function getExternalSystemAddresses() external view returns (address, address, address);
+
+    // ==================== MISSION SYSTEM ====================
+
+    /**
+     * @notice Handle mission assignment notification from MissionFacet
+     * @param specimenCollection Specimen collection contract address
+     * @param tokenId Token identifier
+     * @param sessionId Mission session ID
+     * @param passCollection Mission Pass collection address
+     * @param passTokenId Mission Pass token ID
+     * @param missionVariant Mission variant (0-4)
+     */
+    function onMissionAssigned(
+        address specimenCollection,
+        uint256 tokenId,
+        bytes32 sessionId,
+        address passCollection,
+        uint256 passTokenId,
+        uint8 missionVariant
+    ) external;
+
+    /**
+     * @notice Handle mission removal notification from MissionFacet
+     * @param specimenCollection Specimen collection contract address
+     * @param tokenId Token identifier
+     * @param sessionId Mission session ID
+     */
+    function onMissionRemoved(
+        address specimenCollection,
+        uint256 tokenId,
+        bytes32 sessionId
+    ) external;
+
+    /**
+     * @notice Check if specimen is currently on a mission
+     * @param specimenCollection Specimen collection contract address
+     * @param tokenId Token identifier
+     * @return onMission True if specimen has active mission
+     */
+    function isSpecimenOnMission(address specimenCollection, uint256 tokenId) external view returns (bool);
 }

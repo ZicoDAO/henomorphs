@@ -3,9 +3,9 @@ pragma solidity ^0.8.27;
 
 import {LibMissionStorage} from "../libraries/LibMissionStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
-import {AccessHelper} from "../libraries/AccessHelper.sol";
-import {ControlFee} from "../../libraries/HenomorphsModel.sol";
-import {AccessControlBase} from "./AccessControlBase.sol";
+import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
+import {ControlFee} from "../../../libraries/HenomorphsModel.sol";
+import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /**

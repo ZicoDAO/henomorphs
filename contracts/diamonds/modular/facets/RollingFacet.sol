@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {LibCollectionStorage} from "../libraries/LibCollectionStorage.sol";
-import {LibMeta} from "../shared/libraries/LibMeta.sol";
+import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {TierVariant, ItemTier} from "../libraries/CollectionModel.sol"; 
 import {AccessControlBase} from "./AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -118,6 +118,7 @@ contract RollingFacet is AccessControlBase {
     error InsufficientPayment(uint256 required, uint256 provided);
     error InvalidConfiguration();
     error InvalidCollectionType();
+    error CouponNotValidForCollection(uint256 couponCollectionId, uint256 targetCollectionId);
     
     // ==================== MAIN FUNCTIONS ====================
     
@@ -273,12 +274,15 @@ contract RollingFacet is AccessControlBase {
         _cleanupExpiredRolls(collectionId, tier);
         
         if (previousRollHash == bytes32(0)) {
-            uint256 paidAmount = _processMainRollingPayment(user, collectionId, tier);
+            uint256 paidAmount = _processMainRollingPayment(user, collectionId, tier, tokenId);
             (rollHash, messageToSign, variant, expiresAt, rerollsRemaining) = _performMainFirstRoll(user, collectionId, tokenId, tier);
             LibCollectionStorage.VariantRoll storage roll = _getVariantRoll(rollHash);
             roll.totalPaid = paidAmount;
         } else {
-            uint256 paidAmount = _processMainRollingPayment(user, collectionId, tier);
+            // For re-roll, get tokenId from previous roll data
+            LibCollectionStorage.VariantRoll storage prevRoll = _getVariantRoll(previousRollHash);
+            uint256 rerollTokenId = prevRoll.couponTokenId;
+            uint256 paidAmount = _processMainRollingPayment(user, collectionId, tier, rerollTokenId);
             uint256 previousTotalPaid;
             (rollHash, messageToSign, variant, expiresAt, rerollsRemaining, previousTotalPaid) = _performMainReroll(user, previousRollHash, signature);
             LibCollectionStorage.VariantRoll storage roll = _getVariantRoll(rollHash);
@@ -319,8 +323,9 @@ contract RollingFacet is AccessControlBase {
         }
 
         _validateCouponToken(request.specimenCollectionId, tier, request.specimenTokenId, user);
+        _validateCouponForTarget(request.specimenCollectionId, request.collectionId);
         _validateTokenState(request.collectionId, request.tokenId, tier);
-        
+
         if (!_getRollingPricing(request.specimenCollectionId, tier).isActive) {
             revert RollingNotActive();
         }
@@ -677,44 +682,77 @@ contract RollingFacet is AccessControlBase {
     // ==================== PAYMENT PROCESSING ====================
     
     /**
-     * @notice Process rolling payment for Main collections (FIXED: Use actual collectionId)
-     * @dev FIXED: Pass collectionId parameter instead of hardcoded value
+     * @notice Process rolling payment for Main collections (FIXED: Support free rolls per-token)
+     * @dev Uses RollCoupon mechanism like augment system for consistency
      */
-    function _processMainRollingPayment(address user, uint256 collectionId, uint8 tier) internal returns (uint256 paidAmount) {
-        // FIXED: Use passed collectionId instead of hardcoded 1
+    function _processMainRollingPayment(address user, uint256 collectionId, uint8 tier, uint256 tokenId) internal returns (uint256 paidAmount) {
         LibCollectionStorage.RollingPricing storage pricing = _getRollingPricing(collectionId, tier);
-        
+
         if (!pricing.isActive) {
             return 0;
         }
-        
-        uint256 requiredPayment = pricing.onSale ? pricing.discounted : pricing.regular;
-        
-        if (requiredPayment == 0) {
+
+        // Use RollCoupon mechanism (same as augment collections) - per-token tracking
+        uint256 combinedId = PodsUtils.combineIds(collectionId, tokenId);
+        LibCollectionStorage.RollCoupon storage coupon = _getRollCoupon(combinedId);
+        LibCollectionStorage.CouponConfiguration storage couponConfig = _getCouponConfig();
+
+        // Initialize coupon if first use
+        if (!coupon.active) {
+            coupon.collectionId = collectionId;
+            coupon.tokenId = tokenId;
+            coupon.active = true;
+        }
+
+        // Calculate payment - free if within free rolls limit
+        uint256 requiredPayment;
+        if (coupon.freeRollsUsed < couponConfig.freeRollsPerCoupon) {
+            // Free roll
+            requiredPayment = 0;
+        } else {
+            // Paid roll
+            requiredPayment = pricing.onSale ? pricing.discounted : pricing.regular;
+        }
+
+        paidAmount = 0;
+
+        if (requiredPayment > 0) {
+            if (pricing.chargeNative) {
+                if (msg.value < requiredPayment) {
+                    revert InsufficientPayment(requiredPayment, msg.value);
+                }
+                Address.sendValue(payable(pricing.beneficiary), requiredPayment);
+                if (msg.value > requiredPayment) {
+                    Address.sendValue(payable(user), msg.value - requiredPayment);
+                }
+            } else {
+                pricing.currency.safeTransferFrom(user, pricing.beneficiary, requiredPayment);
+            }
+            paidAmount = requiredPayment;
+        } else {
+            // Track free roll usage
+            if (coupon.freeRollsUsed < couponConfig.freeRollsPerCoupon) {
+                coupon.freeRollsUsed++;
+            }
+            // Refund any native tokens sent
             if (msg.value > 0) {
                 Address.sendValue(payable(user), msg.value);
             }
-            return 0;
         }
-        
-        if (pricing.chargeNative) {
-            if (msg.value < requiredPayment) {
-                revert InsufficientPayment(requiredPayment, msg.value);
-            }
-            
-            Address.sendValue(payable(pricing.beneficiary), requiredPayment);
-            
-            if (msg.value > requiredPayment) {
-                Address.sendValue(payable(user), msg.value - requiredPayment);
-            }
-        } else {
-            pricing.currency.safeTransferFrom(user, pricing.beneficiary, requiredPayment);
+
+        // Update coupon statistics
+        coupon.totalRollsEver++;
+        coupon.usedRolls++;
+        coupon.lastRollTime = block.timestamp;
+
+        if (paidAmount > 0) {
+            bool usedExchange = pricing.useExchangeRate && pricing.chargeNative;
+            emit PaymentProcessed(user, paidAmount, pricing.chargeNative, usedExchange, [uint80(0), uint80(0)], pricing.beneficiary);
         }
-        
-        bool usedExchange = pricing.useExchangeRate && pricing.chargeNative;
-        emit PaymentProcessed(user, requiredPayment, pricing.chargeNative, usedExchange, [uint80(0), uint80(0)], pricing.beneficiary);
-        
-        return requiredPayment;
+
+        emit SpecimenUsed(collectionId, tokenId, user, coupon.usedRolls);
+
+        return paidAmount;
     }
         
     function _processRollingPayment(
@@ -847,6 +885,26 @@ contract RollingFacet is AccessControlBase {
         (bool isValid,) = _validateAccess(collectionId, tokenId, user);
         if (!isValid) {
             revert SpecimenNotAccessible();
+        }
+    }
+
+    /**
+     * @notice Validate that coupon collection is valid for target minting collection
+     * @param couponCollectionId The coupon collection being used
+     * @param targetCollectionId The target collection for minting
+     */
+    function _validateCouponForTarget(uint256 couponCollectionId, uint256 targetCollectionId) internal view {
+        LibCollectionStorage.CouponCollection storage coupon = _getCouponCollection(couponCollectionId);
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+
+        // If no restrictions, coupon is valid for any collection
+        if (!coupon.hasTargetRestrictions) {
+            return;
+        }
+
+        // Check if this coupon is valid for the target collection
+        if (!cs.couponValidForTarget[couponCollectionId][targetCollectionId]) {
+            revert CouponNotValidForCollection(couponCollectionId, targetCollectionId);
         }
     }
 

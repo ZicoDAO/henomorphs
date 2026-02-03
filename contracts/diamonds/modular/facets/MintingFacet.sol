@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {LibCollectionStorage} from "../libraries/LibCollectionStorage.sol";
-import {LibMeta} from "../shared/libraries/LibMeta.sol";
+import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {TierVariant, ItemTier} from "../libraries/CollectionModel.sol"; 
 import {AccessControlBase} from "./AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -1055,8 +1055,17 @@ contract MintingFacet is AccessControlBase {
             if (_tokenIds.length == 0) {
                 revert TargetCollectionError();
             }
+
+            // Update variant counters directly (onVariantAssigned already set itemsVariants
+            // but did NOT update hitVariantsCounters to avoid double-counting)
+            // Note: We can't use updateVariantCounters() here because it checks if
+            // itemsVariants already has the variant and exits early
+            if (variant > 0) {
+                _incrementVariantCounters(collectionId, tier, variant, _tokenIds.length);
+            }
+
             return _tokenIds;
-            
+
         } catch {
             try ISpecimenCollection(targetCollection).mintVariant(
                 issueId,
@@ -1068,12 +1077,39 @@ contract MintingFacet is AccessControlBase {
                 if (_tokenIds.length == 0) {
                     revert TargetCollectionError();
                 }
+
+                // Update variant counters directly (see note above)
+                if (variant > 0) {
+                    _incrementVariantCounters(collectionId, tier, variant, _tokenIds.length);
+                }
+
                 return _tokenIds;
-                
+
             } catch {
                 revert TargetCollectionError();
             }
         }
+    }
+
+    /**
+     * @notice Directly increment variant counters after minting
+     * @dev Called after mintWithVariantAssignment/mintVariant because onVariantAssigned
+     *      sets itemsVariants but does NOT update hitVariantsCounters (by design).
+     *      We can't use updateVariantCounters() because it exits early when
+     *      itemsVariants already has the target variant set.
+     * @param collectionId Collection ID
+     * @param tier Tier level
+     * @param variant Variant number
+     * @param count Number of tokens minted
+     */
+    function _incrementVariantCounters(
+        uint256 collectionId,
+        uint8 tier,
+        uint8 variant,
+        uint256 count
+    ) internal {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        cs.hitVariantsCounters[collectionId][tier][variant] += count;
     }
     
     function _updateCounters(address user, uint256 collectionId, uint8 tier, uint256 quantity) internal {

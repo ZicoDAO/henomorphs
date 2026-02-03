@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {InfrastructureSVGLib} from "../../libraries/InfrastructureSVGLib.sol";
+import {InfrastructureSVGLib} from "../../../../diamonds/modular/libraries/InfrastructureSVGLib.sol";
 
 /// @title IInfrastructureDescriptor
 /// @notice Interface for Infrastructure Card metadata and SVG generation

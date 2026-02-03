@@ -20,7 +20,10 @@ contract IntegrationFacet is AccessControlBase {
     event TokenMinted(uint256 indexed collectionId, uint256 indexed tokenId, address indexed owner);
     event TokenTransferred(uint256 indexed collectionId, uint256 indexed tokenId, address indexed from, address to);
     event VariantAssigned(uint256 indexed collectionId, uint256 indexed tokenId, uint8 variant);
+    event ExternalMint(uint256 indexed collectionId, uint256 indexed tokenId, uint8 tier, uint8 variant);
     event AugmentChanged(uint256 indexed collectionId, uint256 indexed tokenId, uint8 oldAugment, uint8 newAugment);
+    event MissionAssigned(address indexed specimenCollection, uint256 indexed tokenId, bytes32 indexed sessionId, uint8 missionVariant);
+    event MissionRemoved(address indexed specimenCollection, uint256 indexed tokenId, bytes32 indexed sessionId);
     
     // ==================== ERRORS ====================
     
@@ -185,7 +188,48 @@ contract IntegrationFacet is AccessControlBase {
 
         emit VariantAssigned(collectionId, tokenId, variant);
     }
-    
+
+    /**
+     * @notice Handle external mint notification (NOT from MintingFacet)
+     * @dev Called by collections when minted via DardionDropManager, adminMint, or other external paths.
+     *      Updates ALL counters: itemsVariants, hitVariantsCounters, and currentMints.
+     *      MintingFacet should NOT trigger this - it handles counters internally.
+     * @param collectionId Collection identifier in the Diamond system
+     * @param tokenId Token identifier
+     * @param tier Tier level
+     * @param variant Assigned variant (0-4)
+     */
+    function onExternalMint(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint8 tier,
+        uint8 variant
+    ) external onlySystem {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+
+        // Verify collection exists and is enabled
+        LibCollectionStorage.CollectionData storage collection = cs.collections[collectionId];
+        if (!collection.enabled) {
+            revert CollectionNotFound(collectionId);
+        }
+
+        // 1. Update variant mapping (same as onVariantAssigned)
+        cs.itemsVariants[collectionId][tier][tokenId] = variant;
+        cs.collectionItemsVarianted[collectionId][tokenId] = block.number;
+
+        // 2. Update hitVariantsCounters (variant supply tracking)
+        // Note: We increment for all variants including 0, since V0 is a valid starting state
+        cs.hitVariantsCounters[collectionId][tier][variant]++;
+
+        // 3. Update MintingConfig.currentMints (tier mint count)
+        cs.mintingConfigs[collectionId][tier].currentMints++;
+
+        // Update last activity timestamp
+        collection.lastUpdateTime = block.timestamp;
+
+        emit ExternalMint(collectionId, tokenId, tier, variant);
+    }
+
     /**
      * @notice Handle augment change notification from external collections
      * @param collectionId Collection identifier in the Diamond system
@@ -211,10 +255,90 @@ contract IntegrationFacet is AccessControlBase {
         
         // Update last activity timestamp
         collection.lastUpdateTime = block.timestamp;
-        
+
         emit AugmentChanged(collectionId, tokenId, oldAugment, newAugment);
     }
-    
+
+    /**
+     * @notice Handle mission assignment notification from MissionFacet
+     * @param specimenCollection Specimen collection contract address
+     * @param tokenId Token identifier
+     * @param sessionId Mission session ID
+     * @param passCollection Mission Pass collection address
+     * @param passTokenId Mission Pass token ID
+     * @param missionVariant Mission variant (0-4)
+     * @dev Token is NOT transformed - only metadata tracking for mission status
+     */
+    function onMissionAssigned(
+        address specimenCollection,
+        uint256 tokenId,
+        bytes32 sessionId,
+        address passCollection,
+        uint256 passTokenId,
+        uint8 missionVariant
+    ) external onlySystem {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+
+        // Store mission assignment (lightweight, no transformation)
+        cs.specimenMissionAssignments[specimenCollection][tokenId] = LibCollectionStorage.MissionAssignment({
+            sessionId: sessionId,
+            passCollection: passCollection,
+            passTokenId: passTokenId,
+            missionVariant: missionVariant,
+            assignmentTime: block.timestamp,
+            active: true
+        });
+
+        emit MissionAssigned(specimenCollection, tokenId, sessionId, missionVariant);
+    }
+
+    /**
+     * @notice Handle mission removal notification from MissionFacet
+     * @param specimenCollection Specimen collection contract address
+     * @param tokenId Token identifier
+     * @param sessionId Mission session ID (for validation)
+     * @dev Clears mission assignment when mission ends
+     */
+    function onMissionRemoved(
+        address specimenCollection,
+        uint256 tokenId,
+        bytes32 sessionId
+    ) external onlySystem {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+
+        // Validate session matches (prevent unauthorized removal)
+        LibCollectionStorage.MissionAssignment storage assignment = cs.specimenMissionAssignments[specimenCollection][tokenId];
+        if (assignment.sessionId == sessionId) {
+            // Clear mission assignment
+            delete cs.specimenMissionAssignments[specimenCollection][tokenId];
+
+            emit MissionRemoved(specimenCollection, tokenId, sessionId);
+        }
+    }
+
+    /**
+     * @notice Get mission assignment for a specimen token
+     * @param specimenCollection Specimen collection contract address
+     * @param tokenId Token identifier
+     * @return assignment MissionAssignment data (empty if not on mission)
+     */
+    function getSpecimenMission(address specimenCollection, uint256 tokenId)
+        external view returns (LibCollectionStorage.MissionAssignment memory assignment) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        return cs.specimenMissionAssignments[specimenCollection][tokenId];
+    }
+
+    /**
+     * @notice Check if specimen is currently on a mission
+     * @param specimenCollection Specimen collection contract address
+     * @param tokenId Token identifier
+     * @return onMission True if specimen has active mission
+     */
+    function isSpecimenOnMission(address specimenCollection, uint256 tokenId) external view returns (bool) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        return cs.specimenMissionAssignments[specimenCollection][tokenId].active;
+    }
+
     // ==================== QUERY FUNCTIONS ====================
 
     function getCollection(uint256 collectionId) external view returns (LibCollectionStorage.CollectionData memory) {
@@ -313,7 +437,7 @@ contract IntegrationFacet is AccessControlBase {
      * @return totalAugments Total number of registered augment collections
      * @return totalAccessories Total number of defined accessories
      */
-    function getSystemStatus() external view returns (
+    function getCollectionSystemStatus() external view returns (
         bool isActive,
         uint256 totalCollections,
         uint256 totalAugments,

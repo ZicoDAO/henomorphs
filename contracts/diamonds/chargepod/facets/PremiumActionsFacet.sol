@@ -3,10 +3,10 @@ pragma solidity ^0.8.27;
 
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibPremiumStorage} from "../../chargepod/libraries/LibPremiumStorage.sol";
-import {LibStakingStorage} from "../libraries/LibStakingStorage.sol";
+import {LibStakingStorage} from "../../staking/libraries/LibStakingStorage.sol";
 import {ResourceHelper} from "../../chargepod/libraries/ResourceHelper.sol";
 import {PodsUtils} from "../../../libraries/PodsUtils.sol";
-import {IExternalBiopod} from "../interfaces/IStakingInterfaces.sol";
+import {IExternalBiopod} from "../../staking/interfaces/IStakingInterfaces.sol";
 import {Calibration, SpecimenCollection} from "../../../libraries/HenomorphsModel.sol";
 import {StakedSpecimen} from "../../../libraries/StakingModel.sol";
 import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";

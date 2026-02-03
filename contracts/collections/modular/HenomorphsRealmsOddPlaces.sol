@@ -10,10 +10,10 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {ModularSpecimen} from "../base/ModularSpecimen.sol";
-import {IssueInfo, ItemTier, TierVariant, TraitPackEquipment} from "../libraries/CollectionModel.sol";
-import {ICollectionDiamond} from "../interfaces/ICollectionDiamond.sol";
-import {IMintableCollection} from "../interfaces/IMintableCollection.sol";
+import {ModularSpecimen} from "../../diamonds/modular/base/ModularSpecimen.sol";
+import {IssueInfo, ItemTier, TierVariant, TraitPackEquipment} from "../../diamonds/modular/libraries/CollectionModel.sol";
+import {ICollectionDiamond} from "../../diamonds/modular/interfaces/ICollectionDiamond.sol";
+import {IMintableCollection} from "../../diamonds/modular/interfaces/IMintableCollection.sol";
 
 /**
  * @title HenomorphsRealmsOddPlaces - THE ODD PLACES
@@ -73,6 +73,21 @@ contract HenomorphsRealmsOddPlaces is
     error DiamondSyncFailed(uint256 tokenId, uint8 variant);
     error RollingNotSupported();
 
+    // ==================== MODIFIERS ====================
+
+    /**
+     * @notice Track if mint originates from Diamond (MintingFacet)
+     * @dev Sets _mintFromDiamond flag based on msg.sender
+     *      Used to determine which callback to use:
+     *      - From Diamond: use onVariantAssigned (MintingFacet handles counters)
+     *      - External: use onExternalMint (updates all counters)
+     */
+    modifier trackMintOrigin() {
+        _mintFromDiamond = (msg.sender == address(diamond));
+        _;
+        _mintFromDiamond = false;
+    }
+
     // ==================== STATE VARIABLES ====================
 
     // URI configuration
@@ -94,6 +109,10 @@ contract HenomorphsRealmsOddPlaces is
     // DardionDropManager support
     uint256 public dropId;
     bool public rollingEnabled;
+
+    // Track if current mint is from Diamond (MintingFacet)
+    // Used to determine which callback to use for counter updates
+    bool private _mintFromDiamond;
 
     // Internal struct to reduce stack depth in _mintVariant
     struct MintContext {
@@ -182,7 +201,7 @@ contract HenomorphsRealmsOddPlaces is
         address to,
         uint8 tier,
         uint8 variant
-    ) external override onlyRole(MINTER_ROLE) nonReentrant whenNotPaused returns (uint256 tokenId) {
+    ) external override onlyRole(MINTER_ROLE) nonReentrant whenNotPaused trackMintOrigin returns (uint256 tokenId) {
         if (to == address(0)) {
             revert InvalidMintParameters();
         }
@@ -315,7 +334,7 @@ contract HenomorphsRealmsOddPlaces is
         address to,
         uint256 quantity,
         bytes calldata /*data*/
-    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused returns (uint256[] memory tokenIds) {
+    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused trackMintOrigin returns (uint256[] memory tokenIds) {
         (tokenIds,) = _mintVariant(defaultIssue, defaultTier, 0, to, quantity);
         return tokenIds;
     }
@@ -334,7 +353,7 @@ contract HenomorphsRealmsOddPlaces is
         uint256 variantId,
         bytes32 /* reservationId */,
         bytes calldata /*data*/
-    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused returns (uint256[] memory tokenIds) {
+    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused trackMintOrigin returns (uint256[] memory tokenIds) {
         if (!rollingEnabled) {
             revert RollingNotSupported();
         }
@@ -408,7 +427,7 @@ contract HenomorphsRealmsOddPlaces is
         uint8 variant,
         address recipient,
         uint256 quantity
-    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused returns (uint256[] memory tokenIds) {
+    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused trackMintOrigin returns (uint256[] memory tokenIds) {
         (tokenIds,) = _mintVariant(issueId, tier, variant, recipient, quantity);
         return tokenIds;
     }
@@ -422,7 +441,7 @@ contract HenomorphsRealmsOddPlaces is
         uint8 variant,
         address recipient,
         uint256 quantity
-    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused returns (
+    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused trackMintOrigin returns (
         uint256[] memory tokenIds,
         uint8 assignedVariant,
         uint256 totalPaid
@@ -452,7 +471,7 @@ contract HenomorphsRealmsOddPlaces is
         uint256 quantity,
         address /* specimenCollection */,
         uint256 /* specimenTokenId */
-    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused returns (
+    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused trackMintOrigin returns (
         uint256[] memory tokenIds,
         uint8[] memory variants
     ) {
@@ -535,7 +554,7 @@ contract HenomorphsRealmsOddPlaces is
         uint256[] calldata tokenIds,
         uint8[] calldata variants,
         address[] calldata recipients
-    ) external onlyRole(ADMIN_ROLE) nonReentrant whenNotPaused {
+    ) external onlyRole(ADMIN_ROLE) nonReentrant whenNotPaused trackMintOrigin {
         if (tokenIds.length == 0) {
             revert InvalidMintParameters();
         }
@@ -671,10 +690,25 @@ contract HenomorphsRealmsOddPlaces is
 
         success = true;
         if (address(diamond) != address(0) && collectionId != 0) {
-            try diamond.onVariantAssigned(collectionId, tokenId, variant) {
-                // Diamond sync successful
-            } catch {
-                success = false;
+            if (_mintFromDiamond) {
+                // Mint from MintingFacet - counters are already handled by the facet
+                // Only sync variant mapping
+                try diamond.onVariantAssigned(collectionId, tokenId, variant) {
+                    // Diamond sync successful
+                } catch {
+                    success = false;
+                }
+            } else {
+                // External mint (DardionDropManager, adminMint, etc.)
+                // Use onExternalMint to update ALL counters:
+                // - variant mapping (itemsVariants)
+                // - hitVariantsCounters
+                // - MintingConfig.currentMints
+                try diamond.onExternalMint(collectionId, tokenId, tier, variant) {
+                    // All counters updated
+                } catch {
+                    success = false;
+                }
             }
         }
 

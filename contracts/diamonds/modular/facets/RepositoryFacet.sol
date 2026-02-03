@@ -1110,7 +1110,11 @@ contract RepositoryFacet is AccessControlBase {
         uint8 tier,
         uint8 variant
     ) external view returns (TierVariant memory) {
-        return LibCollectionStorage.collectionStorage().tierVariants[collectionId][tier][variant];
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        TierVariant memory result = cs.tierVariants[collectionId][tier][variant];
+        // Populate currentSupply from hitVariantsCounters (actual minted count)
+        result.currentSupply = cs.hitVariantsCounters[collectionId][tier][variant];
+        return result;
     }
     
     // FIXED: Get all variants for specific tier (includes variant 0 if exists)
@@ -1144,18 +1148,20 @@ contract RepositoryFacet is AccessControlBase {
         // Add variant 0 if exists
         if (cs.tierVariants[collectionId][tier][0].maxSupply > 0) {
             variants[foundVariants] = cs.tierVariants[collectionId][tier][0];
+            variants[foundVariants].currentSupply = cs.hitVariantsCounters[collectionId][tier][0];
             foundVariants++;
         }
-        
+
         // Add variants 1-N
         for (uint8 variantId = 1; variantId <= MAX_VARIANTS_PER_TIER && foundVariants < totalVariantsCount; variantId++) {
             TierVariant storage variant = cs.tierVariants[collectionId][tier][variantId];
             if (variant.tier == tier && variant.maxSupply > 0) {
                 variants[foundVariants] = variant;
+                variants[foundVariants].currentSupply = cs.hitVariantsCounters[collectionId][tier][variantId];
                 foundVariants++;
             }
         }
-        
+
         return variants;
     }
 

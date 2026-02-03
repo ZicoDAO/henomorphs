@@ -5,10 +5,10 @@ import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibPremiumStorage} from "../libraries/LibPremiumStorage.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibGamingStorage} from "../libraries/LibGamingStorage.sol";
-import {AccessControlBase} from "./AccessControlBase.sol";
+import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IResourcePodFacet} from "../interfaces/IStakingInterfaces.sol";
+import {IResourcePodFacet} from "../../staking/interfaces/IStakingInterfaces.sol";
 
 /**
  * @notice Interface for mintable reward token (YLW)

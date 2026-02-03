@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
-import {LibMeta} from "../shared/libraries/LibMeta.sol";
+import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibCollectionStorage} from "../libraries/LibCollectionStorage.sol";
 import {CollectionType} from "../libraries/ModularAssetModel.sol";
 import {AccessControlBase} from "./AccessControlBase.sol";
@@ -101,7 +101,10 @@ contract ConfigurationFacet is AccessControlBase {
     event RollingConfigured(uint256 reservationTime, uint8 maxRerolls, uint256 cooldown, bool enabled);
     event CouponConfigured(uint256 maxRolls, uint256 freeRolls, bool rateLimiting, uint256 cooldown);
     event CouponCollectionConfigured(uint256 indexed collectionId, address stakingContract, bool requireStaking);
+    event CouponTargetsUpdated(uint256 indexed couponCollectionId, uint256[] targetCollectionIds, bool enabled);
+    event CouponTargetRestrictionsChanged(uint256 indexed couponCollectionId, bool hasRestrictions);
     event MintingRollingAllowedChanged(uint256 indexed collectionId, uint8 indexed tier, bool allowed);
+    event MintingConfigFixed(uint256 indexed collectionId, uint8 indexed tier, string changes);
 
     // ==================== ERRORS ====================
     
@@ -404,6 +407,95 @@ contract ConfigurationFacet is AccessControlBase {
         emit MintingRollingAllowedChanged(collectionId, tier, allowed);
     }
 
+    /**
+     * @notice Set both minting options in one call
+     * @param collectionId The collection ID
+     * @param tier The tier level
+     * @param traditionalMinting Enable/disable traditional minting
+     * @param rollingMinting Enable/disable rolling minting
+     */
+    function setMintingOptions(
+        uint256 collectionId,
+        uint8 tier,
+        bool traditionalMinting,
+        bool rollingMinting
+    ) external onlyAuthorized whenNotPaused validInternalCollection(collectionId) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+
+        cs.mintingConfigs[collectionId][tier].isActive = traditionalMinting;
+        cs.mintPricingByTier[collectionId][tier].isActive = traditionalMinting;
+        cs.mintingConfigs[collectionId][tier].allowRolling = rollingMinting;
+
+        emit PricingStatusChanged(collectionId, tier, "minting", traditionalMinting);
+        emit MintingRollingAllowedChanged(collectionId, tier, rollingMinting);
+    }
+
+    /**
+     * @notice Admin function to fix/repair MintingConfig values
+     * @dev Used to correct state discrepancies after bug fixes or migrations
+     *      Only updates fields that are explicitly set (non-zero or true for bools)
+     * @param collectionId The collection ID
+     * @param tier The tier level
+     * @param currentMints New value for currentMints (0 = don't change, use resetCurrentMints for setting to 0)
+     * @param maxMints New value for maxMints (0 = don't change)
+     * @param defaultVariant New value for defaultVariant (255 = don't change)
+     * @param resetCurrentMints If true, sets currentMints to 0 (overrides currentMints param)
+     */
+    function fixMintingConfig(
+        uint256 collectionId,
+        uint8 tier,
+        uint256 currentMints,
+        uint256 maxMints,
+        uint8 defaultVariant,
+        bool resetCurrentMints
+    ) external onlyAuthorized whenNotPaused validInternalCollection(collectionId) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        LibCollectionStorage.MintingConfig storage config = cs.mintingConfigs[collectionId][tier];
+
+        string memory changes = "";
+
+        // Fix currentMints
+        if (resetCurrentMints) {
+            uint256 oldValue = config.currentMints;
+            config.currentMints = 0;
+            changes = string(abi.encodePacked(changes, "currentMints:", _uint2str(oldValue), "->0;"));
+        } else if (currentMints > 0) {
+            uint256 oldValue = config.currentMints;
+            config.currentMints = currentMints;
+            changes = string(abi.encodePacked(changes, "currentMints:", _uint2str(oldValue), "->", _uint2str(currentMints), ";"));
+        }
+
+        // Fix maxMints
+        if (maxMints > 0) {
+            uint256 oldValue = config.maxMints;
+            config.maxMints = maxMints;
+            changes = string(abi.encodePacked(changes, "maxMints:", _uint2str(oldValue), "->", _uint2str(maxMints), ";"));
+        }
+
+        // Fix defaultVariant (255 = sentinel for "don't change")
+        if (defaultVariant != 255) {
+            uint8 oldValue = config.defaultVariant;
+            config.defaultVariant = defaultVariant;
+            changes = string(abi.encodePacked(changes, "defaultVariant:", _uint2str(oldValue), "->", _uint2str(defaultVariant), ";"));
+        }
+
+        emit MintingConfigFixed(collectionId, tier, changes);
+    }
+
+    /**
+     * @dev Helper to convert uint to string for event logging
+     */
+    function _uint2str(uint256 _i) internal pure returns (string memory) {
+        if (_i == 0) return "0";
+        uint256 j = _i;
+        uint256 length;
+        while (j != 0) { length++; j /= 10; }
+        bytes memory bstr = new bytes(length);
+        uint256 k = length;
+        while (_i != 0) { bstr[--k] = bytes1(uint8(48 + _i % 10)); _i /= 10; }
+        return string(bstr);
+    }
+
     // ==================== SYSTEM PARAMETERS CONFIGURATION ====================
 
     function configureRollingSystem(
@@ -462,6 +554,46 @@ contract ConfigurationFacet is AccessControlBase {
         couponCollection.allowSelfRolling = config.allowSelfRolling;
 
         emit CouponCollectionConfigured(config.collectionId, config.stakingContract, config.requireStaking);
+    }
+
+    /**
+     * @notice Set valid target collections for a coupon
+     * @param couponCollectionId The coupon collection ID
+     * @param targetCollectionIds Array of valid target collection IDs
+     * @param enabled Enable or disable these targets
+     */
+    function setCouponTargets(
+        uint256 couponCollectionId,
+        uint256[] calldata targetCollectionIds,
+        bool enabled
+    ) external onlyAuthorized whenNotPaused {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+
+        for (uint256 i = 0; i < targetCollectionIds.length; i++) {
+            cs.couponValidForTarget[couponCollectionId][targetCollectionIds[i]] = enabled;
+        }
+
+        // Enable restrictions if adding targets
+        if (enabled && targetCollectionIds.length > 0) {
+            cs.couponCollections[couponCollectionId].hasTargetRestrictions = true;
+        }
+
+        emit CouponTargetsUpdated(couponCollectionId, targetCollectionIds, enabled);
+    }
+
+    /**
+     * @notice Enable/disable target restrictions for a coupon collection
+     * @param couponCollectionId The coupon collection ID
+     * @param hasRestrictions Whether to enforce target restrictions
+     */
+    function setCouponTargetRestrictions(
+        uint256 couponCollectionId,
+        bool hasRestrictions
+    ) external onlyAuthorized whenNotPaused {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        cs.couponCollections[couponCollectionId].hasTargetRestrictions = hasRestrictions;
+
+        emit CouponTargetRestrictionsChanged(couponCollectionId, hasRestrictions);
     }
 
     // ==================== ACCESS CONTROL ====================
@@ -866,6 +998,29 @@ contract ConfigurationFacet is AccessControlBase {
                 configs[index] = config;
                 index++;
             }
+        }
+    }
+
+    /**
+     * @notice Check if coupon is valid for target collection
+     * @param couponCollectionId The coupon collection ID
+     * @param targetCollectionId The target collection ID
+     * @return isValid Whether the coupon can be used for this target
+     * @return hasRestrictions Whether this coupon has any target restrictions
+     */
+    function isCouponValidForTarget(
+        uint256 couponCollectionId,
+        uint256 targetCollectionId
+    ) external view returns (bool isValid, bool hasRestrictions) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        LibCollectionStorage.CouponCollection storage coupon = cs.couponCollections[couponCollectionId];
+
+        hasRestrictions = coupon.hasTargetRestrictions;
+
+        if (!hasRestrictions) {
+            isValid = true;
+        } else {
+            isValid = cs.couponValidForTarget[couponCollectionId][targetCollectionId];
         }
     }
 

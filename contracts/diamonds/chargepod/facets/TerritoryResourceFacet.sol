@@ -4,12 +4,12 @@ pragma solidity ^0.8.27;
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
-import {AccessControlBase} from "./AccessControlBase.sol";
+import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {LibFeeCollection} from "../libraries/LibFeeCollection.sol";
-import {IResourcePodFacet} from "../interfaces/IStakingInterfaces.sol";
-import {IColonyResourceCards} from "../interfaces/IColonyResourceCards.sol";
-import {IColonyTerritoryCards} from "../interfaces/IColonyTerritoryCards.sol";
+import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
+import {IResourcePodFacet} from "../../staking/interfaces/IStakingInterfaces.sol";
+import {IColonyResourceCards} from "../../staking/interfaces/IColonyResourceCards.sol";
+import {IColonyTerritoryCards} from "../../staking/interfaces/IColonyTerritoryCards.sol";
 
 /**
  * @title TerritoryResourceFacet
@@ -617,10 +617,37 @@ contract TerritoryResourceFacet is AccessControlBase {
         uint16 resourceCardBonus = _getResourceCardBonus(node.territoryId, uint8(node.resourceType));
         uint256 finalAmount = (bonusAmount * resourceCardBonus) / 100;
 
-        // 5. Apply Rare Catalyst harvest boost (if active)
+        // 5. Apply active event bonus (Resource Rush, Harvest Bonanza)
+        finalAmount = _applyEventBonus(finalAmount);
+
+        // 6. Apply Rare Catalyst harvest boost (if active)
         finalAmount = LibResourceStorage.applyHarvestBoost(LibMeta.msgSender(), finalAmount);
 
         return finalAmount;
+    }
+
+    /**
+     * @notice Apply active event production bonus
+     * @param baseAmount Base production amount
+     * @return Amount after applying event bonuses
+     */
+    function _applyEventBonus(uint256 baseAmount) private view returns (uint256) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+            if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
+                // Type 1: Resource Rush - all resources get bonus
+                // Type 4: Harvest Bonanza - production bonus
+                if (evt.eventType == 1 || evt.eventType == 4) {
+                    baseAmount = (baseAmount * evt.productionMultiplier) / 10000;
+                }
+            }
+        }
+
+        return baseAmount;
     }
 
     function _calculateTerritoryBonus(
@@ -876,6 +903,7 @@ contract TerritoryResourceFacet is AccessControlBase {
      * @return colonyInfraBonus Bonus from colony infrastructure (100 = no bonus)
      * @return infraCardBonus Bonus from Infrastructure Cards (100 = no bonus)
      * @return resourceCardBonus Bonus from Resource Cards (100 = no bonus)
+     * @return eventBonus Bonus from active events in basis points (10000 = 1x)
      * @return harvestBoostBps Rare Catalyst boost in basis points (0 = no boost)
      * @return combinedMultiplier Total combined multiplier (10000 = 1x, 15000 = 1.5x)
      */
@@ -884,6 +912,7 @@ contract TerritoryResourceFacet is AccessControlBase {
         uint16 colonyInfraBonus,
         uint16 infraCardBonus,
         uint16 resourceCardBonus,
+        uint256 eventBonus,
         uint16 harvestBoostBps,
         uint256 combinedMultiplier
     ) {
@@ -891,7 +920,7 @@ contract TerritoryResourceFacet is AccessControlBase {
         LibColonyWarsStorage.ResourceNode storage node = cws.territoryResourceNodes[territoryId];
 
         if (!node.active) {
-            return (100, 100, 100, 100, 0, 10000);
+            return (100, 100, 100, 100, 10000, 0, 10000);
         }
 
         // Get controlling colony
@@ -909,16 +938,40 @@ contract TerritoryResourceFacet is AccessControlBase {
         // 4. Resource Card bonus
         resourceCardBonus = _getResourceCardBonus(territoryId, uint8(node.resourceType));
 
-        // 5. Rare Catalyst harvest boost
+        // 5. Event bonus (calculate from active events)
+        eventBonus = _calculateEventMultiplier();
+
+        // 6. Rare Catalyst harvest boost
         harvestBoostBps = LibResourceStorage.getActiveHarvestBoost(user);
 
         // Calculate combined multiplier (in basis points, 10000 = 1x)
-        combinedMultiplier = uint256(territoryBonus) * colonyInfraBonus * infraCardBonus * resourceCardBonus;
-        combinedMultiplier = combinedMultiplier / 1000000; // Normalize from (100^4) to basis points
+        combinedMultiplier = uint256(territoryBonus) * colonyInfraBonus * infraCardBonus * resourceCardBonus * eventBonus;
+        combinedMultiplier = combinedMultiplier / 10000000000; // Normalize from (100^4 * 10000) to basis points
 
         // Apply harvest boost
         if (harvestBoostBps > 0) {
             combinedMultiplier = combinedMultiplier + (combinedMultiplier * harvestBoostBps / 10000);
+        }
+    }
+
+    /**
+     * @notice Calculate total event multiplier from active events
+     * @return multiplier Event multiplier in basis points (10000 = 1x)
+     */
+    function _calculateEventMultiplier() private view returns (uint256 multiplier) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        multiplier = 10000; // Base 1x
+
+        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+            if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
+                // Type 1: Resource Rush, Type 4: Harvest Bonanza
+                if (evt.eventType == 1 || evt.eventType == 4) {
+                    multiplier = (multiplier * evt.productionMultiplier) / 10000;
+                }
+            }
         }
     }
 

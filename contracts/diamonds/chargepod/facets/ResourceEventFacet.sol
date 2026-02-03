@@ -5,7 +5,7 @@ import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibGamingStorage} from "../libraries/LibGamingStorage.sol";
-import {AccessControlBase} from "./AccessControlBase.sol";
+import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -97,6 +97,7 @@ contract ResourceEventFacet is AccessControlBase {
         });
 
         rs.activeEventIds.push(eventId);
+        rs.allEventIds.push(eventId);
 
         emit ResourceEventStarted(eventId, uint32(actualStartTime), uint32(endTime));
     }
@@ -213,6 +214,53 @@ contract ResourceEventFacet is AccessControlBase {
         delete rs.resourceEvents[eventHash];
     }
 
+    /**
+     * @notice Update minimum contribution required to claim rewards
+     * @dev Allows fixing events where users participated via actions but not direct contributions
+     */
+    function setEventMinContribution(string calldata eventId, uint256 minContribution) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        bytes32 eventHash = keccak256(bytes(eventId));
+        LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+        if (bytes(evt.name).length == 0) revert InvalidEventId();
+
+        evt.minContribution = minContribution;
+    }
+
+    /**
+     * @notice Admin function to distribute rewards to eligible users manually
+     * @dev For users who participated via actions but can't claim due to minContribution
+     */
+    function adminDistributeEventReward(
+        string calldata eventId,
+        address user,
+        uint256 amount
+    ) external onlyAuthorized nonReentrant {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        bytes32 eventHash = keccak256(bytes(eventId));
+        LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+        if (bytes(evt.name).length == 0) revert InvalidEventId();
+
+        LibResourceStorage.EventParticipant storage participant = rs.eventParticipants[eventId][user];
+
+        // User must have participated (either contribution or actions)
+        require(participant.contribution > 0 || participant.actionsCompleted > 0, "User did not participate");
+        require(!participant.rewardClaimed, "Already claimed");
+
+        participant.rewardClaimed = true;
+
+        // Distribute reward
+        _distributeYlwReward(rs.config.utilityToken, rs.config.paymentBeneficiary, user, amount);
+
+        unchecked {
+            rs.totalRewardsDistributed += amount;
+        }
+
+        emit EventRewardClaimed(user, eventId, amount);
+    }
+
     // ==================== PARTICIPATION ====================
     
     /**
@@ -257,11 +305,12 @@ contract ResourceEventFacet is AccessControlBase {
         
         participant.contribution += amount;
         participant.actionsCompleted++;
-        
+
         rs.totalEventContributions[eventId] += amount;
-        
-        // Update leaderboard
-        _updateLeaderboard(eventId, user, participant.contribution);
+
+        // Update leaderboard with full score (contribution + actions bonus)
+        uint256 score = participant.contribution + (participant.actionsCompleted * 10);
+        _updateLeaderboard(eventId, user, score);
         
         emit EventParticipation(user, eventId, amount);
     }
@@ -310,13 +359,30 @@ contract ResourceEventFacet is AccessControlBase {
         LibResourceStorage.EventParticipant storage participant = rs.eventParticipants[eventId][user];
         
         if (participant.rewardClaimed) revert RewardsNotAvailable();
-        if (participant.contribution < evt.minContribution) {
-            revert InsufficientContribution(evt.minContribution, participant.contribution);
+
+        // Check eligibility: either sufficient contribution OR active participation via actions
+        // actionsCompleted * 10 converts actions to equivalent contribution value (matching leaderboard scoring)
+        uint256 effectiveContribution = participant.contribution + (participant.actionsCompleted * 10);
+        if (effectiveContribution < evt.minContribution) {
+            revert InsufficientContribution(evt.minContribution, effectiveContribution);
         }
-        
-        // Calculate reward based on contribution percentage
-        uint256 userShare = (participant.contribution * 10000) / rs.totalEventContributions[eventId];
-        uint256 baseReward = (evt.rewardPool * userShare) / 10000;
+
+        // Calculate reward based on effective contribution (contribution + actions)
+        // Use leaderboard score as the basis for fair reward distribution
+        uint256 userScore = participant.contribution + (participant.actionsCompleted * 10);
+        uint256 totalContributions = rs.totalEventContributions[eventId];
+
+        uint256 baseReward = 0;
+        if (totalContributions > 0 && participant.contribution > 0) {
+            // User contributed resources - calculate share based on contribution
+            uint256 userShare = (participant.contribution * 10000) / totalContributions;
+            baseReward = (evt.rewardPool * userShare) / 10000;
+        } else if (userScore > 0) {
+            // User only did actions - give minimum participation reward (1% of pool per 1000 score, capped at 10%)
+            uint256 scoreBonus = (userScore * 100) / 1000; // 0.1% per 100 score
+            if (scoreBonus > 1000) scoreBonus = 1000; // Cap at 10%
+            baseReward = (evt.rewardPool * scoreBonus) / 10000;
+        }
         
         // Leaderboard bonuses (top 10 get extra)
         uint256 leaderboardBonus = _calculateLeaderboardBonus(eventId, user, baseReward);
@@ -524,12 +590,12 @@ contract ResourceEventFacet is AccessControlBase {
     }
 
     /**
-     * @notice Get all event IDs in the active array (including expired)
-     * @dev For admin cleanup purposes
+     * @notice Get all event IDs (scheduled, active, and completed)
+     * @dev Returns all events ever created - use getResourceEventDetails to check status
      */
     function getAllResourceEventIds() external view returns (string[] memory) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        return rs.activeEventIds;
+        return rs.allEventIds;
     }
 
     /**
@@ -541,8 +607,8 @@ contract ResourceEventFacet is AccessControlBase {
 
         // Count scheduled events
         uint256 scheduledCount = 0;
-        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
-            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+        for (uint256 i = 0; i < rs.allEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.allEventIds[i]));
             LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
             if (evt.active && block.timestamp < evt.startTime) {
                 scheduledCount++;
@@ -552,11 +618,43 @@ contract ResourceEventFacet is AccessControlBase {
         // Build filtered array
         string[] memory result = new string[](scheduledCount);
         uint256 idx = 0;
-        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
-            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+        for (uint256 i = 0; i < rs.allEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.allEventIds[i]));
             LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
             if (evt.active && block.timestamp < evt.startTime) {
-                result[idx++] = rs.activeEventIds[i];
+                result[idx++] = rs.allEventIds[i];
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * @notice Get completed events (ended or expired)
+     * @dev Returns events where active=false OR block.timestamp > endTime
+     */
+    function getCompletedResourceEvents() external view returns (string[] memory) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        // Count completed events
+        uint256 completedCount = 0;
+        for (uint256 i = 0; i < rs.allEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.allEventIds[i]));
+            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+            // Event is completed if: not active OR past end time
+            if (!evt.active || block.timestamp > evt.endTime) {
+                completedCount++;
+            }
+        }
+
+        // Build filtered array
+        string[] memory result = new string[](completedCount);
+        uint256 idx = 0;
+        for (uint256 i = 0; i < rs.allEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.allEventIds[i]));
+            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
+            if (!evt.active || block.timestamp > evt.endTime) {
+                result[idx++] = rs.allEventIds[i];
             }
         }
 
@@ -692,11 +790,30 @@ contract ResourceEventFacet is AccessControlBase {
         actions = participant.actionsCompleted;
         rewardClaimed = participant.rewardClaimed;
         
-        // Calculate estimated reward
+        // Calculate estimated reward (matching claimEventReward logic)
         bytes32 eventHash = keccak256(bytes(eventId));
-        if (rs.totalEventContributions[eventId] > 0) {
+        uint256 userScore = contribution + (actions * 10);
+        uint256 rewardPool = rs.resourceEvents[eventHash].rewardPool;
+
+        if (rs.totalEventContributions[eventId] > 0 && contribution > 0) {
+            // User contributed - calculate share
             uint256 userShare = (contribution * 10000) / rs.totalEventContributions[eventId];
-            estimatedReward = (rs.resourceEvents[eventHash].rewardPool * userShare) / 10000;
+            estimatedReward = (rewardPool * userShare) / 10000;
+        } else if (userScore > 0) {
+            // User only did actions - calculate score-based reward
+            uint256 scoreBonus = (userScore * 100) / 1000;
+            if (scoreBonus > 1000) scoreBonus = 1000;
+            estimatedReward = (rewardPool * scoreBonus) / 10000;
+        }
+
+        // Add leaderboard bonus estimate if in top 10
+        LibResourceStorage.EventLeaderboard storage leaderboard = rs.eventLeaderboards[eventId];
+        for (uint256 i = 0; i < leaderboard.topParticipants.length; i++) {
+            if (leaderboard.topParticipants[i] == user) {
+                uint256 bonusPercent = 100 - (i * 10);
+                estimatedReward += (estimatedReward * bonusPercent) / 100;
+                break;
+            }
         }
     }
 
@@ -745,6 +862,23 @@ contract ResourceEventFacet is AccessControlBase {
     }
 
     // ==================== HELPERS ====================
+
+    /**
+     * @notice Migrate existing events to allEventIds array
+     * @dev One-time migration for events created before allEventIds was added
+     * @param eventIds Array of event IDs to add to allEventIds
+     */
+    function migrateEventsToAllEventIds(string[] calldata eventIds) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        for (uint256 i = 0; i < eventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(eventIds[i]));
+            // Only add if event exists (has a name)
+            if (bytes(rs.resourceEvents[eventHash].name).length > 0) {
+                rs.allEventIds.push(eventIds[i]);
+            }
+        }
+    }
 
     function _removeFromActiveEvents(string calldata eventId) internal {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
