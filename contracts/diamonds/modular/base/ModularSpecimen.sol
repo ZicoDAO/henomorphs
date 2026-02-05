@@ -144,11 +144,12 @@ abstract contract ModularSpecimen is Initializable {
     /**
      * @notice Notify Diamond about variant assignment
      * @param tokenId Token ID
+     * @param tier Tier level
      * @param variant Assigned variant
      */
-    function _notifyVariantAssigned(uint256 tokenId, uint8 variant) internal {
+    function _notifyVariantAssigned(uint256 tokenId, uint8 tier, uint8 variant) internal {
         if (address(diamond) != address(0) && collectionId != 0) {
-            try diamond.onVariantAssigned(collectionId, tokenId, variant) {
+            try diamond.onVariantAssigned(collectionId, tokenId, tier, variant) {
                 // Success - notification sent
             } catch {
                 // Ignore errors to prevent operation failures

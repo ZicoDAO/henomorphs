@@ -253,7 +253,8 @@ contract HenomorphsRealmsOddPlaces is
             revert InvalidVariant(variant);
         }
 
-        bool success = _assignVariantToToken(defaultIssue, tier, tokenId, variant);
+        // Use _updateVariantOnly for existing tokens - never increments currentMints
+        bool success = _updateVariantOnly(defaultIssue, tier, tokenId, variant);
         if (!success) {
             revert DiamondSyncFailed(tokenId, variant);
         }
@@ -645,7 +646,8 @@ contract HenomorphsRealmsOddPlaces is
             revert InvalidVariant(currentVariant);
         }
 
-        bool success = _assignVariantToToken(issueId, tier, tokenId, variant);
+        // Use _updateVariantOnly for existing tokens - never increments currentMints
+        bool success = _updateVariantOnly(issueId, tier, tokenId, variant);
         if (!success) {
             revert DiamondSyncFailed(tokenId, variant);
         }
@@ -680,6 +682,12 @@ contract HenomorphsRealmsOddPlaces is
 
     // ==================== VARIANT MANAGEMENT ====================
 
+    /**
+     * @dev Assign variant during MINTING (new token)
+     *      Uses different callbacks based on mint origin:
+     *      - Diamond (MintingFacet): onVariantAssigned (counters handled by facet)
+     *      - External (DardionDropManager, adminMint): onExternalMint (updates all counters)
+     */
     function _assignVariantToToken(
         uint256 issueId,
         uint8 tier,
@@ -693,7 +701,7 @@ contract HenomorphsRealmsOddPlaces is
             if (_mintFromDiamond) {
                 // Mint from MintingFacet - counters are already handled by the facet
                 // Only sync variant mapping
-                try diamond.onVariantAssigned(collectionId, tokenId, variant) {
+                try diamond.onVariantAssigned(collectionId, tokenId, tier, variant) {
                     // Diamond sync successful
                 } catch {
                     success = false;
@@ -709,6 +717,33 @@ contract HenomorphsRealmsOddPlaces is
                 } catch {
                     success = false;
                 }
+            }
+        }
+
+        return success;
+    }
+
+    /**
+     * @dev Update variant on EXISTING token (no new mint)
+     *      Always uses onVariantAssigned - never increments currentMints
+     *      Used by: assignVariant (RollingFacet, manual assignment)
+     */
+    function _updateVariantOnly(
+        uint256 issueId,
+        uint8 tier,
+        uint256 tokenId,
+        uint8 variant
+    ) internal returns (bool success) {
+        _itemsVariants[issueId][tier][tokenId] = variant;
+
+        success = true;
+        if (address(diamond) != address(0) && collectionId != 0) {
+            // Always use onVariantAssigned for existing tokens
+            // This only updates variant mapping, NOT counters
+            try diamond.onVariantAssigned(collectionId, tokenId, tier, variant) {
+                // Diamond sync successful
+            } catch {
+                success = false;
             }
         }
 

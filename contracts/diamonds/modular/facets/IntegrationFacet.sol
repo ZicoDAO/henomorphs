@@ -153,12 +153,13 @@ contract IntegrationFacet is AccessControlBase {
      * @notice Handle variant assignment notification from external collections
      * @param collectionId Collection identifier in the Diamond system
      * @param tokenId Token identifier
+     * @param tier Tier level
      * @param variant Assigned variant (1-4)
      * @dev NOTE: This function does NOT update hitVariantsCounters to avoid double-counting.
      *      Counter updates are handled by RepositoryFacet.updateVariantCounters() which is
      *      called separately by RollingFacet after assignVariant completes.
      */
-    function onVariantAssigned(uint256 collectionId, uint256 tokenId, uint8 variant) external onlySystem {
+    function onVariantAssigned(uint256 collectionId, uint256 tokenId, uint8 tier, uint8 variant) external onlySystem {
         LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
 
         // Verify collection exists
@@ -167,7 +168,10 @@ contract IntegrationFacet is AccessControlBase {
             revert CollectionNotFound(collectionId);
         }
 
-        ItemTier storage itemTier = cs.itemTiers[collectionId][collection.defaultTier];
+        // Use passed tier, fallback to defaultTier if tier is 0
+        uint8 effectiveTier = tier > 0 ? tier : collection.defaultTier;
+
+        ItemTier storage itemTier = cs.itemTiers[collectionId][effectiveTier];
         uint256 variantCount = itemTier.variantsCount > 0 ? itemTier.variantsCount : DEFAULT_VARIANT_COUNT;
 
         // Validate variant range (1-4 typical for Henomorphs)
@@ -178,8 +182,8 @@ contract IntegrationFacet is AccessControlBase {
         // Store variant mapping using collectionId->tier->tokenId structure
         // NOTE: hitVariantsCounters is NOT updated here - it's handled by
         // RepositoryFacet.updateVariantCounters() to avoid double-counting bug
-        if (collection.defaultTier > 0) {
-            cs.itemsVariants[collectionId][collection.defaultTier][tokenId] = variant;
+        if (effectiveTier > 0) {
+            cs.itemsVariants[collectionId][effectiveTier][tokenId] = variant;
             cs.collectionItemsVarianted[collectionId][tokenId] = block.number;
         }
 

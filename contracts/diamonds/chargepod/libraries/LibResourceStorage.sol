@@ -249,6 +249,68 @@ library LibResourceStorage {
 
         // All event IDs ever created (planned, active, completed) - never removed
         string[] allEventIds;
+
+        // ============================================
+        // SUPPLY CAPS SYSTEM (APPEND-ONLY v3)
+        // ============================================
+
+        /**
+         * @notice Per-resource-type supply caps
+         * @dev resourceType => max supply (0 = unlimited)
+         */
+        mapping(uint8 => uint256) resourceSupplyCaps;
+
+        /**
+         * @notice Current global supply per resource type
+         * @dev resourceType => current total supply across all users/colonies
+         */
+        mapping(uint8 => uint256) resourceGlobalSupply;
+
+        /**
+         * @notice Supply caps enabled flag
+         */
+        bool supplyCapEnabled;
+
+        /**
+         * @notice Emergency circuit breaker - halts all resource generation
+         */
+        bool resourceGenerationPaused;
+
+        /**
+         * @notice Colony decay configuration (colonies didn't have decay before)
+         */
+        bool colonyDecayEnabled;
+        uint16 colonyDecayRate;  // basis points per day
+        mapping(bytes32 => uint32) colonyLastDecayUpdate;
+
+        // ============================================
+        // COLLABORATIVE CRAFTING PAYMENT TRACKING (v4)
+        // ============================================
+
+        /**
+         * @notice Total payment contributed to each project
+         * @dev projectId => total payment amount contributed
+         */
+        mapping(bytes32 => uint256) projectTotalPaymentContributed;
+
+        /**
+         * @notice Per-user payment contributions to projects
+         * @dev projectId => contributor => payment amount
+         */
+        mapping(bytes32 => mapping(address => uint256)) projectPaymentContributions;
+
+        // ============================================
+        // COLONY RESOURCE REQUISITION (APPEND-ONLY)
+        // ============================================
+
+        uint16 requisitionTaxBps;              // % stays in colony (default 2000 = 20%)
+        uint16 extractionFeeBps;               // extra fee for processing extraction (default 1500 = 15%)
+        uint32 requisitionCooldown;            // seconds between requisitions (default 4h)
+        uint256 requisitionDailyCap;           // max resources per user per day
+        bool requisitionEnabled;
+
+        mapping(address => uint32) lastRequisitionTime;
+        mapping(address => mapping(uint32 => uint256)) dailyRequisitioned; // user => day => amount
     }
     
     /**
@@ -267,7 +329,7 @@ library LibResourceStorage {
      *      - Linear decay punishes large balances too harshly
      *      - Sqrt decay: decayAmount = sqrt(currentAmount) * rate * days / scaleFactor
      *      - This makes decay proportionally smaller for larger balances
-     *      - Example at 1% rate: 100 resources → 1 decay, 10000 resources → 10 decay (not 100)
+     *      - Example at 1% rate: 100 resources â†’ 1 decay, 10000 resources â†’ 10 decay (not 100)
      * @param user User address
      */
     function applyResourceDecay(address user) internal {
@@ -546,5 +608,176 @@ library LibResourceStorage {
             discountBasisPoints: 2000,     // 20% cheaper than token repair
             enabled: true
         });
+    }
+
+    // ============================================
+    // SUPPLY CAPS HELPER FUNCTIONS (v3)
+    // ============================================
+
+    error SupplyCapExceeded(uint8 resourceType, uint256 requested, uint256 available);
+    error ResourceGenerationPaused();
+
+    /**
+     * @notice Check if adding resources would exceed supply cap
+     * @param resourceType Resource type (0-3)
+     * @param amount Amount to add
+     * @return allowed True if addition is allowed
+     */
+    function checkSupplyCap(uint8 resourceType, uint256 amount) internal view returns (bool allowed) {
+        ResourceStorage storage rs = resourceStorage();
+
+        if (!rs.supplyCapEnabled) return true;
+        if (rs.resourceGenerationPaused) return false;
+
+        uint256 cap = rs.resourceSupplyCaps[resourceType];
+        if (cap == 0) return true; // 0 = unlimited
+
+        return rs.resourceGlobalSupply[resourceType] + amount <= cap;
+    }
+
+    /**
+     * @notice Add to global supply (call when resources are generated)
+     * @param resourceType Resource type (0-3)
+     * @param amount Amount being generated
+     */
+    function incrementGlobalSupply(uint8 resourceType, uint256 amount) internal {
+        ResourceStorage storage rs = resourceStorage();
+
+        if (rs.resourceGenerationPaused) revert ResourceGenerationPaused();
+
+        if (rs.supplyCapEnabled) {
+            uint256 cap = rs.resourceSupplyCaps[resourceType];
+            if (cap > 0) {
+                uint256 newSupply = rs.resourceGlobalSupply[resourceType] + amount;
+                if (newSupply > cap) {
+                    revert SupplyCapExceeded(
+                        resourceType,
+                        amount,
+                        cap - rs.resourceGlobalSupply[resourceType]
+                    );
+                }
+            }
+        }
+
+        rs.resourceGlobalSupply[resourceType] += amount;
+    }
+
+    /**
+     * @notice Subtract from global supply (call when resources are consumed/burned)
+     * @param resourceType Resource type (0-3)
+     * @param amount Amount being consumed
+     */
+    function decrementGlobalSupply(uint8 resourceType, uint256 amount) internal {
+        ResourceStorage storage rs = resourceStorage();
+
+        if (rs.resourceGlobalSupply[resourceType] >= amount) {
+            rs.resourceGlobalSupply[resourceType] -= amount;
+        } else {
+            rs.resourceGlobalSupply[resourceType] = 0;
+        }
+    }
+
+    /**
+     * @notice Get available supply before cap is hit
+     * @param resourceType Resource type (0-3)
+     * @return available Amount that can still be generated (type(uint256).max if unlimited)
+     */
+    function getAvailableSupply(uint8 resourceType) internal view returns (uint256 available) {
+        ResourceStorage storage rs = resourceStorage();
+
+        if (!rs.supplyCapEnabled) return type(uint256).max;
+        if (rs.resourceGenerationPaused) return 0;
+
+        uint256 cap = rs.resourceSupplyCaps[resourceType];
+        if (cap == 0) return type(uint256).max;
+
+        uint256 current = rs.resourceGlobalSupply[resourceType];
+        return current >= cap ? 0 : cap - current;
+    }
+
+    // ============================================
+    // COLONY DECAY HELPER FUNCTIONS (v3)
+    // ============================================
+
+    /**
+     * @notice Apply resource decay to colony's resources
+     * @dev Similar to user decay but for colony balances
+     * @param colonyId Colony identifier
+     * @param colonyResources Colony resource balance mapping reference
+     */
+    function applyColonyResourceDecay(
+        bytes32 colonyId,
+        mapping(uint8 => uint256) storage colonyResources
+    ) internal {
+        ResourceStorage storage rs = resourceStorage();
+
+        if (!rs.colonyDecayEnabled || rs.colonyDecayRate == 0) {
+            return;
+        }
+
+        uint32 currentTime = uint32(block.timestamp);
+        uint32 lastUpdate = rs.colonyLastDecayUpdate[colonyId];
+
+        if (lastUpdate == 0) {
+            rs.colonyLastDecayUpdate[colonyId] = currentTime;
+            return;
+        }
+
+        if (currentTime <= lastUpdate) {
+            return;
+        }
+
+        uint32 timePassed = currentTime - lastUpdate;
+        if (timePassed < 86400) return; // Skip if less than 1 day
+
+        uint32 daysPassed = timePassed / 86400;
+
+        // Apply SQRT-based decay to each resource type (same formula as user decay)
+        unchecked {
+            for (uint8 i = 0; i < 4; i++) {
+                uint256 currentAmount = colonyResources[i];
+                if (currentAmount > 0) {
+                    uint256 sqrtAmount = currentAmount.sqrt();
+                    uint256 decayAmount = (sqrtAmount * rs.colonyDecayRate * daysPassed) / 100;
+
+                    if (decayAmount == 0 && currentAmount > 0) {
+                        decayAmount = 1;
+                    }
+
+                    if (decayAmount > currentAmount) {
+                        colonyResources[i] = 0;
+                    } else {
+                        colonyResources[i] = currentAmount - decayAmount;
+                    }
+
+                    // Track in global supply (decay = resources leaving circulation)
+                    decrementGlobalSupply(i, decayAmount);
+                }
+            }
+        }
+
+        rs.colonyLastDecayUpdate[colonyId] = currentTime;
+    }
+
+    /**
+     * @notice Initialize supply caps with default values
+     * @dev Called during storage upgrade to v3
+     */
+    function initializeSupplyCaps() internal {
+        ResourceStorage storage rs = resourceStorage();
+
+        // Default caps (can be adjusted by admin)
+        // Resources are WHOLE UNITS (no decimals), e.g. balance=382 means 382 units
+        rs.resourceSupplyCaps[BASIC_MATERIALS] = 100_000_000;   // 100M Basic
+        rs.resourceSupplyCaps[ENERGY_CRYSTALS] = 50_000_000;    // 50M Energy
+        rs.resourceSupplyCaps[BIO_COMPOUNDS] = 25_000_000;      // 25M Bio
+        rs.resourceSupplyCaps[RARE_ELEMENTS] = 10_000_000;      // 10M Rare
+
+        rs.supplyCapEnabled = true;
+        rs.resourceGenerationPaused = false;
+
+        // Colony decay - lighter than user decay
+        rs.colonyDecayEnabled = true;
+        rs.colonyDecayRate = 25; // 0.25% per day (half of user rate)
     }
 }

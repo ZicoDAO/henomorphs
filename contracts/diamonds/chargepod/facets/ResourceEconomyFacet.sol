@@ -12,6 +12,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IColonyResourceCards} from "../../staking/interfaces/IColonyResourceCards.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
+import {LibBuildingsStorage} from "../libraries/LibBuildingsStorage.sol";
 
 /**
  * @notice Interface for mintable reward token (YLW)
@@ -23,7 +24,7 @@ interface IRewardToken is IERC20 {
 /**
  * @title ResourceEconomyFacet
  * @notice Manages resource nodes, harvesting, and colony resource balances
- * @dev MODUŁ 6 - Dual Token Economy Implementation
+ * @dev MODUĹ 6 - Dual Token Economy Implementation
  *
  * NOTE: This facet uses economyResourceNodes (keyed by auto-increment economyNodeId),
  * separate from territoryResourceNodes used by TerritoryResourceFacet (keyed by territoryId).
@@ -296,7 +297,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         }
 
         // Reward auxiliary currency (Utility token for daily activities)
-        // Uses Treasury → Mint fallback pattern for sustainable tokenomics
+        // Uses Treasury â†’ Mint fallback pattern for sustainable tokenomics
         address auxiliaryCurrency = ResourceHelper.getAuxiliaryCurrency();
         if (auxiliaryCurrency != address(0) && tokenReward > 0) {
             _distributeYlwReward(auxiliaryCurrency, LibMeta.msgSender(), tokenReward);
@@ -348,6 +349,157 @@ contract ResourceEconomyFacet is AccessControlBase {
         node.lastMaintenancePaid = uint32(block.timestamp);
         
         emit NodeMaintenancePaid(nodeId, colonyId, maintenanceCost);
+    }
+
+    // ============================================================================
+    // COLONY RESOURCE REQUISITION
+    // ============================================================================
+
+    event ResourcesRequisitioned(
+        bytes32 indexed colonyId,
+        address indexed user,
+        uint8 resourceType,
+        uint256 requested,
+        uint256 received,
+        uint256 taxRetained
+    );
+
+    error RequisitionDisabled();
+    error RequisitionCooldown(uint32 remaining);
+    error RequisitionDailyCap(uint256 remaining);
+    error RequisitionInsufficientColonyResources(uint8 resourceType, uint256 requested, uint256 available);
+
+    /**
+     * @notice Requisition resources from colony pool to personal balance
+     * @dev Tax % stays in colony. Trade Hub building reduces tax.
+     * @param resourceType Resource type (0=Basic, 1=Energy, 2=Bio, 3=Rare)
+     * @param amount Amount to requisition from colony
+     */
+    function requisitionResources(
+        uint8 resourceType,
+        uint256 amount
+    ) external whenNotPaused nonReentrant {
+        require(amount > 0, "Zero amount");
+        require(resourceType <= 3, "Invalid type");
+
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        if (!rs.requisitionEnabled) revert RequisitionDisabled();
+
+        address caller = LibMeta.msgSender();
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
+        require(colonyId != bytes32(0), "No colony");
+
+        // Cooldown check
+        uint32 lastTime = rs.lastRequisitionTime[caller];
+        if (lastTime > 0 && block.timestamp < lastTime + rs.requisitionCooldown) {
+            revert RequisitionCooldown(
+                uint32(lastTime + rs.requisitionCooldown - block.timestamp)
+            );
+        }
+
+        // Daily cap check
+        uint32 today = uint32(block.timestamp / 86400);
+        if (rs.requisitionDailyCap > 0) {
+            uint256 usedToday = rs.dailyRequisitioned[caller][today];
+            if (usedToday + amount > rs.requisitionDailyCap) {
+                revert RequisitionDailyCap(rs.requisitionDailyCap - usedToday);
+            }
+        }
+
+        // Check colony has enough
+        LibColonyWarsStorage.ResourceBalance storage balance = cws.colonyResources[colonyId];
+        uint256 available = ResourceHelper.getResourceAmount(
+            balance,
+            LibColonyWarsStorage.ResourceType(resourceType)
+        );
+        if (available < amount) {
+            revert RequisitionInsufficientColonyResources(resourceType, amount, available);
+        }
+
+        // Calculate tax (Trade Hub reduces it)
+        uint16 taxBps = rs.requisitionTaxBps;
+        {
+            LibBuildingsStorage.ColonyBuildingEffects memory effects =
+                LibBuildingsStorage.getColonyBuildingEffects(colonyId);
+            if (effects.marketFeeReductionBps > 0 && taxBps > 0) {
+                uint16 reduction = uint16((uint256(taxBps) * effects.marketFeeReductionBps) / 10000);
+                taxBps = taxBps > reduction ? taxBps - reduction : 0;
+            }
+        }
+
+        uint256 taxAmount = (amount * taxBps) / 10000;
+        uint256 received = amount - taxAmount;
+
+        // Deduct full amount from colony (tax portion stays implicitly - we only deduct what user gets + tax that's burned)
+        ResourceHelper.deductResources(
+            balance,
+            LibColonyWarsStorage.ResourceType(resourceType),
+            received // only deduct what user receives; tax stays in colony
+        );
+
+        // Collect YLW fee
+        LibColonyWarsStorage.OperationFee storage fee =
+            LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_PROCESSING);
+        if (fee.enabled) {
+            LibFeeCollection.processConfiguredFee(fee, caller, "resource_requisition");
+        }
+
+        // Credit user
+        LibResourceStorage.applyResourceDecay(caller);
+        rs.userResources[caller][resourceType] += received;
+
+        // Track
+        rs.lastRequisitionTime[caller] = uint32(block.timestamp);
+        rs.dailyRequisitioned[caller][today] += amount;
+
+        emit ResourcesRequisitioned(colonyId, caller, resourceType, amount, received, taxAmount);
+    }
+
+    /**
+     * @notice Configure requisition system
+     */
+    function setRequisitionConfig(
+        bool enabled,
+        uint16 taxBps,
+        uint16 extractionFeeBps,
+        uint32 cooldown,
+        uint256 dailyCap
+    ) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        rs.requisitionEnabled = enabled;
+        rs.requisitionTaxBps = taxBps;
+        rs.extractionFeeBps = extractionFeeBps;
+        rs.requisitionCooldown = cooldown;
+        rs.requisitionDailyCap = dailyCap;
+    }
+
+    /**
+     * @notice Get requisition info for user
+     */
+    function getRequisitionInfo(address user) external view returns (
+        bool enabled,
+        uint16 taxBps,
+        uint32 cooldownRemaining,
+        uint256 dailyRemaining,
+        uint256 dailyCap
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        enabled = rs.requisitionEnabled;
+        taxBps = rs.requisitionTaxBps;
+        dailyCap = rs.requisitionDailyCap;
+
+        uint32 lastTime = rs.lastRequisitionTime[user];
+        uint32 cooldownEnd = lastTime + rs.requisitionCooldown;
+        cooldownRemaining = block.timestamp < cooldownEnd
+            ? uint32(cooldownEnd - block.timestamp)
+            : 0;
+
+        uint32 today = uint32(block.timestamp / 86400);
+        uint256 usedToday = rs.dailyRequisitioned[user][today];
+        dailyRemaining = dailyCap > usedToday ? dailyCap - usedToday : 0;
     }
 
     // ============================================================================
@@ -868,7 +1020,7 @@ contract ResourceEconomyFacet is AccessControlBase {
     // ============================================================================
 
     /**
-     * @notice Distribute YLW reward with Treasury → Mint fallback
+     * @notice Distribute YLW reward with Treasury â†’ Mint fallback
      * @dev Priority: 1) Transfer from treasury, 2) Mint if treasury insufficient
      * @param rewardToken YLW token address
      * @param recipient User receiving the reward
@@ -1659,11 +1811,11 @@ contract ResourceEconomyFacet is AccessControlBase {
     /**
      * @notice Initialize default crafting tiers (ADMIN ONLY)
      * @dev Sets default tier thresholds:
-     *      - Tier 0: 5,000 → Common
-     *      - Tier 1: 10,000 → Uncommon
-     *      - Tier 2: 25,000 → Rare
-     *      - Tier 3: 50,000 → Epic
-     *      - Tier 4: 100,000 → Legendary
+     *      - Tier 0: 5,000 â†’ Common
+     *      - Tier 1: 10,000 â†’ Uncommon
+     *      - Tier 2: 25,000 â†’ Rare
+     *      - Tier 3: 50,000 â†’ Epic
+     *      - Tier 4: 100,000 â†’ Legendary
      */
     function initializeCraftingTiers() external onlyAuthorized {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();

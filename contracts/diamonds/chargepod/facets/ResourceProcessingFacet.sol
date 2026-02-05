@@ -6,6 +6,8 @@ import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
 import {ResourceHelper} from "../libraries/ResourceHelper.sol";
+import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
+import {LibBuildingsStorage} from "../libraries/LibBuildingsStorage.sol";
 import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -50,6 +52,14 @@ contract ResourceProcessingFacet is AccessControlBase {
         uint256 inputAmount,
         uint256 outputAmount
     );
+    event ProcessingExtracted(
+        bytes32 indexed orderId,
+        bytes32 indexed colonyId,
+        address indexed recipient,
+        uint8 outputType,
+        uint256 outputAmount,
+        uint256 fee
+    );
 
     /**
      * @notice Start processing order
@@ -75,8 +85,8 @@ contract ResourceProcessingFacet is AccessControlBase {
             }
         }
 
-        // Calculate costs
-        uint256 totalInputNeeded = recipe.inputAmount * (inputAmount / recipe.outputAmount);
+        // Calculate costs (fixed: multiply before divide to preserve precision)
+        uint256 totalInputNeeded = (recipe.inputAmount * inputAmount) / recipe.outputAmount;
         
         // Verify and deduct resources using ResourceHelper
         LibColonyWarsStorage.ResourceBalance storage balance = cws.colonyResources[colonyId];
@@ -97,7 +107,7 @@ contract ResourceProcessingFacet is AccessControlBase {
         LibColonyWarsStorage.ProcessingOrder storage order = cws.processingOrders[orderId];
         order.colonyId = colonyId;
         order.recipeId = recipeId;
-        order.inputAmount = inputAmount;
+        order.inputAmount = totalInputNeeded;
         order.startTime = uint32(block.timestamp);
         order.completionTime = uint32(block.timestamp + recipe.processingTime);
         order.completed = false;
@@ -106,7 +116,7 @@ contract ResourceProcessingFacet is AccessControlBase {
         // Track order for UI/user queries
         cws.colonyProcessingOrders[colonyId].push(orderId);
 
-        emit ProcessingStarted(orderId, colonyId, recipeId, inputAmount, order.completionTime);
+        emit ProcessingStarted(orderId, colonyId, recipeId, totalInputNeeded, order.completionTime);
 
         return orderId;
     }
@@ -133,8 +143,8 @@ contract ResourceProcessingFacet is AccessControlBase {
         // Get recipe
         LibColonyWarsStorage.ProcessingRecipe storage recipe = cws.processingRecipes[order.recipeId];
         
-        // Calculate output
-        uint256 outputAmount = (order.inputAmount / recipe.inputAmount) * recipe.outputAmount;
+        // Calculate output (multiply before divide to preserve precision)
+        uint256 outputAmount = (order.inputAmount * recipe.outputAmount) / recipe.inputAmount;
         
         // Add output resources to colony using ResourceHelper
         LibColonyWarsStorage.ResourceBalance storage balance = cws.colonyResources[colonyId];
@@ -145,6 +155,63 @@ contract ResourceProcessingFacet is AccessControlBase {
         order.claimed = true;
         
         emit ProcessingCompleted(orderId, colonyId, outputAmount);
+        emit ResourcesProcessed(colonyId, recipe.inputType, recipe.outputType, order.inputAmount, outputAmount);
+    }
+
+    /**
+     * @notice Complete processing and extract output to user resources
+     * @dev Same as completeProcessing but output goes to caller's personal balance
+     *      Charges extraction fee. Refinery building bonus improves yield.
+     * @param orderId Order to complete and extract
+     */
+    function extractProcessing(bytes32 orderId) external whenNotPaused nonReentrant {
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibColonyWarsStorage.ProcessingOrder storage order = cws.processingOrders[orderId];
+
+        if (order.colonyId == bytes32(0)) revert OrderNotFound();
+        if (order.claimed) revert OrderAlreadyClaimed();
+
+        address caller = LibMeta.msgSender();
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
+        require(order.colonyId == colonyId, "Not your order");
+
+        if (block.timestamp < order.completionTime) revert ProcessingNotComplete();
+
+        LibColonyWarsStorage.ProcessingRecipe storage recipe = cws.processingRecipes[order.recipeId];
+
+        // Calculate base output
+        uint256 outputAmount = (order.inputAmount * recipe.outputAmount) / recipe.inputAmount;
+
+        // Apply Refinery building bonus
+        LibBuildingsStorage.ColonyBuildingEffects memory effects =
+            LibBuildingsStorage.getColonyBuildingEffects(colonyId);
+        if (effects.processingBonusBps > 0) {
+            outputAmount += (outputAmount * effects.processingBonusBps) / 10000;
+        }
+
+        // Collect extraction fee (YLW)
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        uint256 fee = 0;
+        if (rs.extractionFeeBps > 0) {
+            fee = (outputAmount * rs.extractionFeeBps) / 10000;
+            if (fee > 0) {
+                LibColonyWarsStorage.OperationFee storage processingFee =
+                    LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_PROCESSING);
+                if (processingFee.enabled) {
+                    LibFeeCollection.processConfiguredFee(processingFee, caller, "processing_extraction");
+                }
+            }
+        }
+
+        // Deliver to user resources
+        uint8 outputType = uint8(recipe.outputType);
+        LibResourceStorage.applyResourceDecay(caller);
+        rs.userResources[caller][outputType] += outputAmount;
+
+        order.completed = true;
+        order.claimed = true;
+
+        emit ProcessingExtracted(orderId, colonyId, caller, outputType, outputAmount, fee);
         emit ResourcesProcessed(colonyId, recipe.inputType, recipe.outputType, order.inputAmount, outputAmount);
     }
 
@@ -317,17 +384,17 @@ contract ResourceProcessingFacet is AccessControlBase {
         // Get recipe to calculate resources to return
         LibColonyWarsStorage.ProcessingRecipe storage recipe = cws.processingRecipes[order.recipeId];
 
-        // Calculate input resources used
-        uint256 totalInputNeeded = recipe.inputAmount * (order.inputAmount / recipe.outputAmount);
+        // Return exact amount of input resources that were deducted at start
+        uint256 totalInputToReturn = order.inputAmount;
 
         // Return resources to colony using ResourceHelper
         LibColonyWarsStorage.ResourceBalance storage balance = cws.colonyResources[colonyId];
-        ResourceHelper.addResources(balance, recipe.inputType, totalInputNeeded);
+        ResourceHelper.addResources(balance, recipe.inputType, totalInputToReturn);
 
         // Mark as claimed to prevent completeProcessing()
         order.claimed = true;
 
-        emit ProcessingCancelled(orderId, colonyId, caller, totalInputNeeded);
+        emit ProcessingCancelled(orderId, colonyId, caller, totalInputToReturn);
     }
 
     // ==================== VIEW FUNCTIONS ====================

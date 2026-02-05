@@ -212,19 +212,19 @@ contract CollaborativeCraftingFacet is AccessControlBase {
         uint256 amount
     ) external whenNotPaused nonReentrant {
         if (amount == 0) revert InvalidContributionAmount(0);
-        
+
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         address contributor = LibMeta.msgSender();
-        
+
         // Validate project
         LibResourceStorage.CollaborativeProject storage project = rs.collaborativeProjects[projectId];
         _validateActiveProject(project, projectId);
-        
+
         // Check payment requirement exists
         if (project.paymentRequirement == 0) {
             revert InvalidContributionAmount(amount);
         }
-        
+
         // Transfer project payment from contributor to treasury
         LibFeeCollection.collectFee(
             IERC20(rs.config.utilityToken),
@@ -233,11 +233,18 @@ contract CollaborativeCraftingFacet is AccessControlBase {
             amount,
             "crafting_project_payment"
         );
-        
+
+        // Track payment contribution (v4 storage)
+        rs.projectPaymentContributions[projectId][contributor] += amount;
+        rs.projectTotalPaymentContributed[projectId] += amount;
+
         emit PaymentContributed(projectId, contributor, amount);
-        
+
         // Add to contributors list if first contribution
         _addContributorIfNew(project, contributor);
+
+        // Check if project can be completed (including payment requirement)
+        _checkAndCompleteProject(projectId, project, rs);
     }
     
     /**
@@ -246,7 +253,7 @@ contract CollaborativeCraftingFacet is AccessControlBase {
      * @param resourceTypes Array of resource types
      * @param amounts Array of amounts (must match resourceTypes length)
      */
-    function contributeBatch(
+    function contributeResourceBatch(
         bytes32 projectId,
         uint8[] calldata resourceTypes,
         uint256[] calldata amounts
@@ -293,11 +300,14 @@ contract CollaborativeCraftingFacet is AccessControlBase {
         
         // Add to contributors list if first contribution
         _addContributorIfNew(project, contributor);
-        
+
+        // Trigger contribution achievement (v4 fix - was missing in batch)
+        LibAchievementTrigger.triggerContribution(contributor);
+
         // Check if project can be completed
         _checkAndCompleteProject(projectId, project, rs);
     }
-    
+
     // ==================== PROJECT MANAGEMENT ====================
     
     /**
@@ -412,7 +422,18 @@ contract CollaborativeCraftingFacet is AccessControlBase {
     // ==================== VIEW FUNCTIONS ====================
     
     /**
-     * @notice Get detailed project information
+     * @notice Get detailed project information including payment tracking
+     * @param projectId Project identifier
+     * @return colonyId Colony that owns this project
+     * @return projectType Type of project (1=Infrastructure, 2=Research, 3=Defense)
+     * @return initiator Address that created the project
+     * @return deadline Unix timestamp when contributions close
+     * @return paymentRequirement Required payment token amount
+     * @return totalPaymentContributed Actual payment contributed so far (v4)
+     * @return status Current project status
+     * @return contributorCount Number of unique contributors
+     * @return requirements Array of resource requirements
+     * @return totalContributions Resources contributed by type [Basic, Energy, Bio, Rare]
      */
     function getProjectDetails(bytes32 projectId) external view returns (
         bytes32 colonyId,
@@ -420,6 +441,7 @@ contract CollaborativeCraftingFacet is AccessControlBase {
         address initiator,
         uint32 deadline,
         uint256 paymentRequirement,
+        uint256 totalPaymentContributed,
         LibResourceStorage.ProjectStatus status,
         uint256 contributorCount,
         LibResourceStorage.ResourceRequirement[] memory requirements,
@@ -427,34 +449,72 @@ contract CollaborativeCraftingFacet is AccessControlBase {
     ) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         LibResourceStorage.CollaborativeProject storage project = rs.collaborativeProjects[projectId];
-        
-        return (
-            project.colonyId,
-            project.projectType,
-            project.initiator,
-            project.deadline,
-            project.paymentRequirement,
-            project.status,
-            project.contributors.length,
-            project.resourceRequirements,
-            project.totalContributions
-        );
+
+        if (project.initiator == address(0)) {
+            revert ProjectNotFound(projectId);
+        }
+
+        // Use named returns to avoid stack too deep
+        colonyId = project.colonyId;
+        projectType = project.projectType;
+        initiator = project.initiator;
+        deadline = project.deadline;
+        paymentRequirement = project.paymentRequirement;
+        totalPaymentContributed = rs.projectTotalPaymentContributed[projectId];
+        status = project.status;
+        contributorCount = project.contributors.length;
+        requirements = project.resourceRequirements;
+        totalContributions = project.totalContributions;
+    }
+
+    /**
+     * @notice Get project payment status (v4)
+     * @param projectId Project identifier
+     * @return paymentRequirement Required payment token amount
+     * @return totalPaymentContributed Actual payment contributed so far
+     * @return isPaymentMet Whether payment requirement is fulfilled
+     */
+    function getProjectPaymentStatus(bytes32 projectId) external view returns (
+        uint256 paymentRequirement,
+        uint256 totalPaymentContributed,
+        bool isPaymentMet
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        LibResourceStorage.CollaborativeProject storage project = rs.collaborativeProjects[projectId];
+
+        if (project.initiator == address(0)) {
+            revert ProjectNotFound(projectId);
+        }
+
+        paymentRequirement = project.paymentRequirement;
+        totalPaymentContributed = rs.projectTotalPaymentContributed[projectId];
+        isPaymentMet = paymentRequirement == 0 || totalPaymentContributed >= paymentRequirement;
+
+        return (paymentRequirement, totalPaymentContributed, isPaymentMet);
     }
     
     /**
-     * @notice Get user's contributions to a project
+     * @notice Get user's contributions to a project (resources + payment)
+     * @param projectId Project identifier
+     * @param user User address
+     * @return resourceContributions Resources contributed by type [Basic, Energy, Bio, Rare]
+     * @return paymentContribution Payment tokens contributed (v4)
      */
-    function getUserContributions(
+    function getUserProjectContributions(
         bytes32 projectId,
         address user
-    ) external view returns (uint256[4] memory contributions) {
+    ) external view returns (
+        uint256[4] memory resourceContributions,
+        uint256 paymentContribution
+    ) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        
+
         for (uint8 i = 0; i < 4; i++) {
-            contributions[i] = rs.projectContributions[projectId][user][i];
+            resourceContributions[i] = rs.projectContributions[projectId][user][i];
         }
-        
-        return contributions;
+        paymentContribution = rs.projectPaymentContributions[projectId][user];
+
+        return (resourceContributions, paymentContribution);
     }
     
     /**
@@ -555,20 +615,32 @@ contract CollaborativeCraftingFacet is AccessControlBase {
     }
     
     /**
-     * @notice Check if all requirements are met
+     * @notice Check if all requirements are met (resources AND payment)
+     * @param projectId Project identifier (needed for payment tracking lookup)
+     * @param project Project storage reference
      */
     function _checkRequirementsMet(
+        bytes32 projectId,
         LibResourceStorage.CollaborativeProject storage project
     ) internal view returns (bool) {
+        // Check resource requirements
         for (uint256 i = 0; i < project.resourceRequirements.length; i++) {
             uint8 resourceType = project.resourceRequirements[i].resourceType;
             uint256 required = project.resourceRequirements[i].amount;
-            
+
             if (project.totalContributions[resourceType] < required) {
                 return false;
             }
         }
-        
+
+        // Check payment requirement (v4 - payment tracking)
+        if (project.paymentRequirement > 0) {
+            LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+            if (rs.projectTotalPaymentContributed[projectId] < project.paymentRequirement) {
+                return false;
+            }
+        }
+
         return true;
     }
     
@@ -580,7 +652,7 @@ contract CollaborativeCraftingFacet is AccessControlBase {
         LibResourceStorage.CollaborativeProject storage project,
         LibResourceStorage.ResourceStorage storage rs
     ) internal {
-        if (!_checkRequirementsMet(project)) {
+        if (!_checkRequirementsMet(projectId, project)) {
             return;
         }
         
@@ -696,7 +768,7 @@ contract CollaborativeCraftingFacet is AccessControlBase {
     
     /**
      * @notice Distribute reward tokens to contributors proportionally
-     * @dev Uses Treasury → Mint fallback pattern for sustainable token distribution
+     * @dev Uses Treasury â†’ Mint fallback pattern for sustainable token distribution
      */
     function _distributeRewardTokens(
         bytes32 projectId,
@@ -725,7 +797,7 @@ contract CollaborativeCraftingFacet is AccessControlBase {
             uint256 rewardAmount = (totalRewardPool * contributorValue) / totalContributions;
             
             if (rewardAmount > 0) {
-                // Use Treasury → Mint fallback pattern
+                // Use Treasury â†’ Mint fallback pattern
                 _distributeYlwReward(rs.config.primaryRewardToken, rs.config.paymentBeneficiary, contributor, rewardAmount);
                 emit RewardDistributed(projectId, contributor, rewardAmount);
             }
@@ -733,7 +805,7 @@ contract CollaborativeCraftingFacet is AccessControlBase {
     }
     
     /**
-     * @notice Distribute YLW reward with Treasury → Mint fallback
+     * @notice Distribute YLW reward with Treasury â†’ Mint fallback
      * @dev Priority: 1) Transfer from treasury, 2) Mint if treasury insufficient
      * @param rewardToken YLW token address
      * @param treasury Treasury address
@@ -783,57 +855,25 @@ contract CollaborativeCraftingFacet is AccessControlBase {
         return true;
     }
     
-    // ==================== VIEW FUNCTIONS ====================
-    
+    // ==================== ADDITIONAL VIEW FUNCTIONS ====================
+
     /**
-     * @notice Get project details
-     */
-    function getProject(bytes32 projectId) external view returns (
-        bytes32 colonyId,
-        uint8 projectType,
-        address initiator,
-        uint32 deadline,
-        uint256 paymentRequirement,
-        LibResourceStorage.ProjectStatus status,
-        uint256 contributorCount,
-        uint256[4] memory totalContributions
-    ) {
-        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        LibResourceStorage.CollaborativeProject storage project = rs.collaborativeProjects[projectId];
-        
-        if (project.initiator == address(0)) {
-            revert ProjectNotFound(projectId);
-        }
-        
-        return (
-            project.colonyId,
-            project.projectType,
-            project.initiator,
-            project.deadline,
-            project.paymentRequirement,
-            project.status,
-            project.contributors.length,
-            project.totalContributions
-        );
-    }
-    
-    /**
-     * @notice Get user's contribution to a project
+     * @notice Get user's resource contribution to a project (legacy)
+     * @dev Kept for backward compatibility - returns only resources, not payment
+     *      Use getUserContributions() for full data including payment
      */
     function getUserProjectContribution(
         bytes32 projectId,
         address user
     ) external view returns (uint256[4] memory contributions) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        
         for (uint8 i = 0; i < 4; i++) {
             contributions[i] = rs.projectContributions[projectId][user][i];
         }
-        
         return contributions;
     }
 
-    
+
     /**
      * @notice Get project requirements
      */
@@ -856,18 +896,18 @@ contract CollaborativeCraftingFacet is AccessControlBase {
     function isProjectComplete(bytes32 projectId) external view returns (bool) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         LibResourceStorage.CollaborativeProject storage project = rs.collaborativeProjects[projectId];
-        
+
         if (project.initiator == address(0)) {
             revert ProjectNotFound(projectId);
         }
-        
-        return _checkRequirementsMet(project);
+
+        return _checkRequirementsMet(projectId, project);
     }
     
     /**
      * @notice Get collaborative crafting statistics
      */
-    function getStatistics() external view returns (
+    function getCraftingStatistics() external view returns (
         uint256 totalProjectsCompleted,
         uint256 totalResourcesGenerated,
         uint256 totalInfrastructureBuilt,

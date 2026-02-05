@@ -988,6 +988,7 @@ library LibColonyWarsStorage {
          * Used by getUserProcessingOrders() to list active processing operations
          */
         mapping(bytes32 => bytes32[]) colonyProcessingOrders;
+
     }
 
     function colonyWarsStorage() internal pure returns (ColonyWarsStorage storage cws) {

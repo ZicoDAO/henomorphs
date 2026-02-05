@@ -300,7 +300,7 @@ contract HenomorphsMatrix is
         // NOTE: We only call _notifyVariantAssigned which internally calls diamond.onVariantAssigned
         // Previously there was a direct call here + _notifyVariantAssigned = double notification
         // This caused triple-counting of hitVariantsCounters (2x here + 1x in updateVariantCounters)
-        _notifyVariantAssigned(tokenId, variant);
+        _notifyVariantAssigned(tokenId, tier, variant);
 
         return success;
     }

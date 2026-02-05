@@ -589,14 +589,14 @@ contract RollingFacet is AccessControlBase {
             " with nonce: ",
             Strings.toString(updatedNonce)
         ));
-        
+
         previousTotalPaid = savedRoll.totalPaid;
-        
+
         emit VariantRerollChanged(user, rollHash, messageToSign, previousRollHash, variant, 0);
-        
+
         return (rollHash, messageToSign, variant, expiresAt, rerollsRemaining, previousTotalPaid);
     }
-    
+
     function _performAugmentReroll(
         address user,
         bytes32 previousRollHash,
@@ -609,76 +609,89 @@ contract RollingFacet is AccessControlBase {
         uint8 rerollsRemaining,
         uint256 previousTotalPaid
     ) {
-        LibCollectionStorage.VariantRoll storage previousRoll = _getVariantRoll(previousRollHash);
-        
-        if (!previousRoll.exists) revert RollNotFound();
-        if (previousRoll.user != user) revert InvalidRerollAttempt();
-        if (block.timestamp > previousRoll.expiresAt) revert RollExpired();
-        
-        LibCollectionStorage.RollingConfiguration storage config = _getRollingConfig();
-        if (previousRoll.rerollsUsed >= config.maxRerollsPerUser) {
-            revert MaxRerollsExceeded();
+        // Use RollContext to reduce stack depth
+        RollContext memory ctx;
+        ctx.user = user;
+
+        {
+            LibCollectionStorage.VariantRoll storage previousRoll = _getVariantRoll(previousRollHash);
+
+            if (!previousRoll.exists) revert RollNotFound();
+            if (previousRoll.user != user) revert InvalidRerollAttempt();
+            if (block.timestamp > previousRoll.expiresAt) revert RollExpired();
+
+            LibCollectionStorage.RollingConfiguration storage config = _getRollingConfig();
+            if (previousRoll.rerollsUsed >= config.maxRerollsPerUser) {
+                revert MaxRerollsExceeded();
+            }
+
+            if (_isRollConsumed(previousRollHash)) {
+                revert RollAlreadyAssigned();
+            }
+
+            _verifyRollSignature(user, previousRollHash, signature);
+
+            // Cache into context
+            ctx.variant = previousRoll.variant;
+            ctx.rerollsRemaining = config.maxRerollsPerUser - previousRoll.rerollsUsed - 1;
+            ctx.issueId = previousRoll.issueId;
+            previousTotalPaid = previousRoll.totalPaid;
+
+            // Store coupon info for tracking
+            uint256 couponCollectionId = previousRoll.couponCollectionId;
+            uint256 couponTokenId = previousRoll.couponTokenId;
+            uint8 tier = previousRoll.tier;
+
+            ctx.currentNonce = LibCollectionStorage.getCurrentNonce(user);
+            variant = _selectVariantForRoll(couponCollectionId, tier, user, couponTokenId);
+
+            rollHash = keccak256(abi.encodePacked(
+                user,
+                variant,
+                block.timestamp,
+                ctx.currentNonce,
+                couponCollectionId,
+                couponTokenId
+            ));
+
+            ctx.expiresAt = block.timestamp + config.reservationTimeSeconds;
+            expiresAt = ctx.expiresAt;
+            rerollsRemaining = ctx.rerollsRemaining;
+
+            _createTempReservation(ctx.issueId, tier, variant, rollHash, ctx.expiresAt);
+            _releaseTempReservation(ctx.issueId, tier, ctx.variant, previousRollHash);
+            _clearVariantRoll(previousRollHash);
+
+            // Store new roll data
+            LibCollectionStorage.VariantRoll storage newRoll = _getVariantRoll(rollHash);
+            newRoll.user = user;
+            newRoll.variant = variant;
+            newRoll.expiresAt = ctx.expiresAt;
+            newRoll.rerollsUsed = config.maxRerollsPerUser - ctx.rerollsRemaining;
+            newRoll.exists = true;
+            newRoll.issueId = ctx.issueId;
+            newRoll.tier = tier;
+            newRoll.couponCollectionId = couponCollectionId;
+            newRoll.couponTokenId = couponTokenId;
+            newRoll.totalPaid = previousTotalPaid;
+            newRoll.nonce = ctx.currentNonce;
+
+            _removeRollFromTracking(couponCollectionId, couponTokenId, previousRollHash);
+            _addRollToTracking(couponCollectionId, couponTokenId, rollHash);
         }
 
-        if (_isRollConsumed(previousRollHash)) {
-            revert RollAlreadyAssigned();
-        }
-        
-        _verifyRollSignature(user, previousRollHash, signature);
-        
-        LibCollectionStorage.VariantRoll memory savedRoll = previousRoll;
-        uint256 updatedNonce = LibCollectionStorage.getCurrentNonce(user);
-        
-        variant = _selectVariantForRoll(savedRoll.couponCollectionId, savedRoll.tier, user, savedRoll.couponTokenId);
-        
-        rollHash = keccak256(abi.encodePacked(
-            user,
-            variant,
-            block.timestamp,
-            updatedNonce,
-            savedRoll.couponCollectionId,
-            savedRoll.couponTokenId
-        ));
-        
-        expiresAt = block.timestamp + config.reservationTimeSeconds;
-        
-        _createTempReservation(savedRoll.issueId, savedRoll.tier, variant, rollHash, expiresAt);
-        _releaseTempReservation(savedRoll.issueId, savedRoll.tier, savedRoll.variant, previousRollHash);
-        _clearVariantRoll(previousRollHash);
-        
-        uint8 newRerollsUsed = savedRoll.rerollsUsed + 1;
-        rerollsRemaining = config.maxRerollsPerUser - newRerollsUsed;
-        
-        LibCollectionStorage.VariantRoll storage newVariantRoll = _getVariantRoll(rollHash);
-        newVariantRoll.user = user;
-        newVariantRoll.variant = variant;
-        newVariantRoll.expiresAt = expiresAt;
-        newVariantRoll.rerollsUsed = newRerollsUsed;
-        newVariantRoll.exists = true;
-        newVariantRoll.issueId = savedRoll.issueId;
-        newVariantRoll.tier = savedRoll.tier;
-        newVariantRoll.couponCollectionId = savedRoll.couponCollectionId;
-        newVariantRoll.couponTokenId = savedRoll.couponTokenId;
-        newVariantRoll.totalPaid = savedRoll.totalPaid;
-        newVariantRoll.nonce = updatedNonce;
-        
         messageToSign = string(abi.encodePacked(
             "Apply variant roll: ",
             Strings.toHexString(uint256(rollHash)),
             " with nonce: ",
-            Strings.toString(updatedNonce)
+            Strings.toString(ctx.currentNonce)
         ));
-        
-        previousTotalPaid = savedRoll.totalPaid;
 
-        _removeRollFromTracking(savedRoll.couponCollectionId, savedRoll.couponTokenId, previousRollHash);
-        _addRollToTracking(savedRoll.couponCollectionId, savedRoll.couponTokenId, rollHash);
-        
         emit VariantRerollChanged(user, rollHash, messageToSign, previousRollHash, variant, 0);
-        
+
         return (rollHash, messageToSign, variant, expiresAt, rerollsRemaining, previousTotalPaid);
     }
-    
+
     // ==================== PAYMENT PROCESSING ====================
     
     /**
@@ -1144,7 +1157,7 @@ contract RollingFacet is AccessControlBase {
         uint256 nonce
     ) internal {
         uint256 issueId = _getIssueIdForRoll(collectionId);
-        
+
         LibCollectionStorage.VariantRoll storage variantRoll = _getVariantRoll(rollHash);
         variantRoll.user = user;
         variantRoll.variant = variant;
@@ -1172,7 +1185,7 @@ contract RollingFacet is AccessControlBase {
         uint256 nonce
     ) internal {
         uint256 issueId = _getIssueIdForRoll(collectionId);
-        
+
         LibCollectionStorage.VariantRoll storage variantRoll = _getVariantRoll(rollHash);
         variantRoll.user = user;
         variantRoll.variant = variant;
@@ -1458,7 +1471,7 @@ contract RollingFacet is AccessControlBase {
     function _getVariantRoll(bytes32 rollHash) internal view returns (LibCollectionStorage.VariantRoll storage) {
         return LibCollectionStorage.collectionStorage().variantRollsByHash[rollHash];
     }
-    
+
     function _setTokenRollHash(uint256 collectionId, uint8 tier, uint256 tokenId, bytes32 rollHash) internal {
         LibCollectionStorage.collectionStorage().tokenToRollHash[collectionId][tier][tokenId] = rollHash;
     }
@@ -1689,7 +1702,7 @@ contract RollingFacet is AccessControlBase {
     function getRoll(bytes32 rollHash) external view returns (LibCollectionStorage.VariantRoll memory roll) {
         return _getVariantRoll(rollHash);
     }
-    
+
     function checkRoll(bytes32 rollHash) external view returns (bool valid, uint8 variant, uint256 timeRemaining) {
         LibCollectionStorage.VariantRoll storage roll = _getVariantRoll(rollHash);
         

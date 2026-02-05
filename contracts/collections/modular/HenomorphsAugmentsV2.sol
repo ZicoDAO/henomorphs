@@ -520,16 +520,16 @@ contract HenomorphsAugmentsV2 is
         uint8 variant
     ) internal returns (bool success) {
         _itemsVariants[issueId][tier][tokenId] = variant;
-        
+
         success = true;
         if (address(diamond) != address(0) && collectionId != 0) {
-            try diamond.onVariantAssigned(collectionId, tokenId, variant) {
+            try diamond.onVariantAssigned(collectionId, tokenId, tier, variant) {
                 // Diamond sync successful
             } catch {
                 success = false;
             }
         }
-        
+
         return success;
     }
 
