@@ -614,6 +614,13 @@ library LibMissionStorage {
 
         // Lending system pause flag
         bool lendingSystemPaused;
+
+        // ============ COLLECTION LOOKUPS (added for efficient queries) ============
+        // Reverse mapping: collection address → collection ID (0 = not registered)
+        mapping(address => uint16) passCollectionByAddress;
+
+        // Reverse mapping: specimen collection ID → array of pass collection IDs that support it
+        mapping(uint16 => uint16[]) passesForSpecimen;
     }
 
     // ============================================================

@@ -17,7 +17,20 @@ interface ICollectionDiamond {
     function onVariantAssigned(uint256 collectionId, uint256 tokenId, uint8 tier, uint8 variant) external;
     function onExternalMint(uint256 collectionId, uint256 tokenId, uint8 tier, uint8 variant) external;
     function onAugmentChanged(uint256 collectionId, uint256 tokenId, uint8 oldAugment, uint8 newAugment) external;
-    
+    function onMissionAssigned(
+        address specimenCollection,
+        uint256 tokenId,
+        bytes32 sessionId,
+        address passCollection,
+        uint256 passTokenId,
+        uint8 missionVariant
+    ) external;
+    function onMissionRemoved(
+        address specimenCollection,
+        uint256 tokenId,
+        bytes32 sessionId
+    ) external;
+
     // Token queries
     function getTokenVariant(uint256 collectionId, uint256 tokenId) external view returns (uint8);
     function getSpecimenEquipment(address specimenCollection, uint256 tokenId) external view returns (TraitPackEquipment memory);
