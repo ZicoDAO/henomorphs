@@ -11,6 +11,8 @@ import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IColonyBoosterCards} from "../../staking/interfaces/IColonyBoosterCards.sol";
+import {LibPremiumStorage} from "../libraries/LibPremiumStorage.sol";
 
 /**
  * @title ResourceVentureFacet
@@ -104,6 +106,22 @@ contract ResourceVentureFacet is AccessControlBase {
     error CardLocked();
     error InvalidCardCollection(uint16 collectionId);
     error VentureInProgress(address user, uint8 ventureType);
+
+    // Booster card errors
+    error BoosterCardsNotSet();
+    error NotBoosterOwner(uint256 tokenId);
+
+    // Booster card events
+    event BoosterAttachedToVenture(
+        uint256 indexed boosterTokenId,
+        uint8 indexed ventureType,
+        address indexed caller
+    );
+
+    event BoosterDetachedFromVenture(
+        uint256 indexed boosterTokenId,
+        address indexed caller
+    );
 
     // ============================================
     // STRUCTS
@@ -318,6 +336,17 @@ contract ResourceVentureFacet is AccessControlBase {
                         uint256 cardBonus = (rewards[i] * card.rewardBoostBps) / 10000;
                         rewards[i] += cardBonus;
                     }
+                }
+            }
+        }
+
+        // DOUBLE_REWARDS premium (duration-based, 2x all rewards)
+        {
+            LibPremiumStorage.PremiumStorage storage pps = LibPremiumStorage.premiumStorage();
+            LibPremiumStorage.PremiumAction storage premAction = pps.userActions[caller][LibPremiumStorage.ActionType.DOUBLE_REWARDS];
+            if (premAction.active && premAction.expiresAt > block.timestamp) {
+                for (uint8 i = 0; i < 4; i++) {
+                    rewards[i] = rewards[i] * 2;
                 }
             }
         }
@@ -1091,5 +1120,80 @@ contract ResourceVentureFacet is AccessControlBase {
         }
 
         return (estimate, cardBonusApplied);
+    }
+
+    // ============================================
+    // BOOSTER CARDS FUNCTIONS
+    // ============================================
+
+    /**
+     * @notice Attach a booster card to a venture slot
+     * @param boosterTokenId Booster card token ID
+     * @param ventureType Venture type (0-4)
+     */
+    function attachBoosterToVenture(
+        uint256 boosterTokenId,
+        uint8 ventureType
+    ) external whenNotPaused nonReentrant {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        IColonyBoosterCards boosterContract = IColonyBoosterCards(boosterAddr);
+        address caller = LibMeta.msgSender();
+
+        if (boosterContract.ownerOf(boosterTokenId) != caller) revert NotBoosterOwner(boosterTokenId);
+
+        // Construct Venture target and delegate to external contract
+        IColonyBoosterCards.AttachmentTarget memory target = IColonyBoosterCards.AttachmentTarget({
+            system: 2,              // Venture
+            colonyId: bytes32(0),
+            buildingType: 0,
+            collectionId: 0,
+            tokenId: 0,
+            user: caller,
+            ventureType: ventureType
+        });
+
+        boosterContract.attachBooster(boosterTokenId, target);
+
+        emit BoosterAttachedToVenture(boosterTokenId, ventureType, caller);
+    }
+
+    /**
+     * @notice Detach a booster card from a venture slot
+     * @param boosterTokenId Booster card token ID
+     */
+    function detachBoosterFromVenture(uint256 boosterTokenId) external whenNotPaused nonReentrant {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        IColonyBoosterCards boosterContract = IColonyBoosterCards(boosterAddr);
+        address caller = LibMeta.msgSender();
+
+        if (boosterContract.ownerOf(boosterTokenId) != caller) revert NotBoosterOwner(boosterTokenId);
+
+        boosterContract.detachBooster(boosterTokenId);
+
+        emit BoosterDetachedFromVenture(boosterTokenId, caller);
+    }
+
+    /**
+     * @notice Get booster bonuses for a venture slot
+     * @param user User address
+     * @param ventureType Venture type (0-4)
+     * @return successBps Success rate bonus in basis points
+     * @return rewardBps Reward bonus in basis points
+     */
+    function getVentureBoosterBonus(
+        address user,
+        uint8 ventureType
+    ) external view returns (uint16 successBps, uint16 rewardBps) {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) return (0, 0);
+
+        return IColonyBoosterCards(boosterAddr).getVentureBonus(user, ventureType);
     }
 }

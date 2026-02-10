@@ -382,4 +382,66 @@ library LibPremiumStorage {
             ps.slot := position
         }
     }
+
+    // ==================== EVENTS (for use by any facet) ====================
+
+    event PremiumActionUsed(
+        address indexed user,
+        ActionType indexed actionType,
+        uint16 usesRemaining
+    );
+
+    event PremiumActionExpired(
+        address indexed user,
+        ActionType indexed actionType
+    );
+
+    // ==================== SHARED HELPERS ====================
+
+    /**
+     * @notice Consume one use of a use-based premium action
+     * @dev Handles decrement, deactivation, array cleanup, and events.
+     *      Call from any facet that needs to consume premium uses.
+     * @param ps Premium storage reference
+     * @param user User address
+     * @param actionType Action type to consume
+     */
+    function consumeUse(
+        PremiumStorage storage ps,
+        address user,
+        ActionType actionType
+    ) internal {
+        PremiumAction storage action = ps.userActions[user][actionType];
+        action.usesRemaining--;
+        ps.actionsRedeemed[actionType]++;
+
+        emit PremiumActionUsed(user, actionType, action.usesRemaining);
+
+        if (action.usesRemaining == 0) {
+            action.active = false;
+            _removeActiveAction(ps, user, actionType);
+            emit PremiumActionExpired(user, actionType);
+        }
+    }
+
+    /**
+     * @notice Remove action type from user's active actions list
+     * @param ps Premium storage reference
+     * @param user User address
+     * @param actionType Action type to remove
+     */
+    function _removeActiveAction(
+        PremiumStorage storage ps,
+        address user,
+        ActionType actionType
+    ) private {
+        ActionType[] storage activeActions = ps.userActiveActionTypes[user];
+        for (uint256 i = 0; i < activeActions.length; i++) {
+            if (activeActions[i] == actionType) {
+                activeActions[i] = activeActions[activeActions.length - 1];
+                activeActions.pop();
+                return;
+            }
+        }
+    }
 }

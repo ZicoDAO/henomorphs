@@ -408,6 +408,9 @@ contract MetadataFacet is AccessControlBase {
         bool isOnMission;
         string missionName;
         uint8 missionVariant;
+        string missionBaseUri;
+        string missionAnimationBaseUri;
+        uint8 missionTier;
     }
 
     /**
@@ -437,6 +440,15 @@ contract MetadataFacet is AccessControlBase {
         if (ctx.isOnMission) {
             ctx.missionVariant = missionAssignment.missionVariant;
             ctx.missionName = _getMissionName(ctx.missionVariant);
+            // Resolve pass collection URIs for mission-specific images
+            uint256 passCollectionId = LibCollectionStorage.getCollectionIdByAddress(missionAssignment.passCollection);
+            if (passCollectionId > 0) {
+                LibCollectionStorage.CollectionData storage passData = cs.collections[passCollectionId];
+                ctx.missionBaseUri = passData.baseURI;
+                ctx.missionAnimationBaseUri = bytes(passData.animationBaseURI).length > 0
+                    ? passData.animationBaseURI : passData.baseURI;
+                ctx.missionTier = passData.defaultTier;
+            }
         }
     }
 
@@ -484,7 +496,12 @@ contract MetadataFacet is AccessControlBase {
                 MetadataHelper.MissionData memory missionData = MetadataHelper.MissionData({
                     onMission: true,
                     missionName: ctx.missionName,
-                    missionVariant: ctx.missionVariant
+                    missionVariant: ctx.missionVariant,
+                    missionBaseUri: ctx.missionBaseUri,
+                    missionAnimationBaseUri: ctx.missionAnimationBaseUri,
+                    missionTier: ctx.missionTier,
+                    henoVariant: coreData.tokenVariant,
+                    augmentVariant: ctx.hasActiveAugment ? ctx.augmentVariant : 0
                 });
                 return MetadataHelper.generateTokenMetadataWithThemeAndMission(coreData, systemData, modularData, themeData, missionData);
             }
@@ -494,7 +511,12 @@ contract MetadataFacet is AccessControlBase {
             MetadataHelper.MissionData memory missionData = MetadataHelper.MissionData({
                 onMission: true,
                 missionName: ctx.missionName,
-                missionVariant: ctx.missionVariant
+                missionVariant: ctx.missionVariant,
+                missionBaseUri: ctx.missionBaseUri,
+                missionAnimationBaseUri: ctx.missionAnimationBaseUri,
+                missionTier: ctx.missionTier,
+                henoVariant: coreData.tokenVariant,
+                augmentVariant: ctx.hasActiveAugment ? ctx.augmentVariant : 0
             });
             return MetadataHelper.generateTokenMetadataWithMission(coreData, systemData, modularData, missionData);
         }

@@ -8,6 +8,7 @@ import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
 import {ResourceHelper} from "../libraries/ResourceHelper.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibBuildingsStorage} from "../libraries/LibBuildingsStorage.sol";
+import {LibPremiumStorage} from "../libraries/LibPremiumStorage.sol";
 import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -93,11 +94,14 @@ contract ResourceProcessingFacet is AccessControlBase {
         ResourceHelper.requireAndDeduct(balance, recipe.inputType, totalInputNeeded);
 
         // Pay configured processing fee (uses YELLOW token with burn)
+        // Apply active event cost reduction (e.g. Crafting Festival / Resource Rush with discount)
         LibColonyWarsStorage.OperationFee storage processingFee = LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_PROCESSING);
         if (processingFee.enabled) {
-            LibFeeCollection.processConfiguredFee(
+            uint16 costReduction = LibResourceStorage.getActiveCostReduction();
+            LibFeeCollection.processConfiguredFeeWithDiscount(
                 processingFee,
                 LibMeta.msgSender(),
+                costReduction,
                 "resource_processing"
             );
         }
@@ -137,23 +141,31 @@ contract ResourceProcessingFacet is AccessControlBase {
         bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
         require(order.colonyId == colonyId, "Not your order");
         
-        // Check if processing complete
-        if (block.timestamp < order.completionTime) revert ProcessingNotComplete();
-        
+        // Check if processing complete (INSTANT_PROCESS premium can skip cooldown)
+        if (block.timestamp < order.completionTime) {
+            LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+            LibPremiumStorage.PremiumAction storage premAction = ps.userActions[caller][LibPremiumStorage.ActionType.INSTANT_PROCESS];
+            if (premAction.active && premAction.usesRemaining > 0) {
+                LibPremiumStorage.consumeUse(ps, caller, LibPremiumStorage.ActionType.INSTANT_PROCESS);
+            } else {
+                revert ProcessingNotComplete();
+            }
+        }
+
         // Get recipe
         LibColonyWarsStorage.ProcessingRecipe storage recipe = cws.processingRecipes[order.recipeId];
-        
+
         // Calculate output (multiply before divide to preserve precision)
         uint256 outputAmount = (order.inputAmount * recipe.outputAmount) / recipe.inputAmount;
-        
+
         // Add output resources to colony using ResourceHelper
         LibColonyWarsStorage.ResourceBalance storage balance = cws.colonyResources[colonyId];
         ResourceHelper.addResources(balance, recipe.outputType, outputAmount);
-        
+
         // Mark as claimed
         order.completed = true;
         order.claimed = true;
-        
+
         emit ProcessingCompleted(orderId, colonyId, outputAmount);
         emit ResourcesProcessed(colonyId, recipe.inputType, recipe.outputType, order.inputAmount, outputAmount);
     }
@@ -175,7 +187,16 @@ contract ResourceProcessingFacet is AccessControlBase {
         bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
         require(order.colonyId == colonyId, "Not your order");
 
-        if (block.timestamp < order.completionTime) revert ProcessingNotComplete();
+        // Check if processing complete (INSTANT_PROCESS premium can skip cooldown)
+        if (block.timestamp < order.completionTime) {
+            LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
+            LibPremiumStorage.PremiumAction storage premAction = ps.userActions[caller][LibPremiumStorage.ActionType.INSTANT_PROCESS];
+            if (premAction.active && premAction.usesRemaining > 0) {
+                LibPremiumStorage.consumeUse(ps, caller, LibPremiumStorage.ActionType.INSTANT_PROCESS);
+            } else {
+                revert ProcessingNotComplete();
+            }
+        }
 
         LibColonyWarsStorage.ProcessingRecipe storage recipe = cws.processingRecipes[order.recipeId];
 

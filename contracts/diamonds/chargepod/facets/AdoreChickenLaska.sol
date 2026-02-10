@@ -92,6 +92,7 @@ contract AdoreChickenLaska is AccessControlBase {
     error MessageTooLong(uint256 length, uint256 maxLength);
     error InvalidCollectionId(uint256 collectionId);
     error InsufficientPayment(uint256 required, uint256 provided);
+    error LoveStreakMaxReached();
 
     /**
      * @notice Kiss a chicken (most expensive affection - 10 ZICO)
@@ -374,12 +375,16 @@ contract AdoreChickenLaska is AccessControlBase {
         profile.favoriteChickenCollection = collectionId;
         profile.favoriteChickenToken = tokenId;
 
-        // Update love streak
+        // Update love streak (max 20 consecutive days, then resets)
         uint32 currentDay = uint32(block.timestamp / 86400);
         if (profile.lastAffectionDay == currentDay - 1) {
-            profile.loveStreak++;
+            if (profile.loveStreak >= 20) {
+                profile.loveStreak = 1; // Max reached, start new cycle
+            } else {
+                profile.loveStreak++;
+            }
         } else if (profile.lastAffectionDay != currentDay) {
-            profile.loveStreak = 1; // Reset streak
+            profile.loveStreak = 1; // Skipped day, reset streak
         }
         profile.lastAffectionDay = currentDay;
     }

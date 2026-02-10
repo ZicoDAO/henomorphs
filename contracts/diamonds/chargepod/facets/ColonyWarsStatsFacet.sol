@@ -395,7 +395,8 @@ contract ColonyWarsStatsFacet is AccessControlBase {
             LibColonyWarsStorage.Territory storage territory = cws.territories[territories[i]];
             if (territory.active && territory.controllingColony == colonyId) {
                 activeCount++;
-                uint256 effectiveBonus = territory.bonusValue - (territory.bonusValue * territory.damageLevel / 100);
+                uint256 damageReduction = (uint256(territory.bonusValue) * territory.damageLevel) / 100;
+                uint256 effectiveBonus = damageReduction >= territory.bonusValue ? 0 : territory.bonusValue - damageReduction;
                 totalBonus += effectiveBonus;
             }
         }
@@ -403,19 +404,16 @@ contract ColonyWarsStatsFacet is AccessControlBase {
         stats.territoriesControlled = activeCount;
         stats.totalTerritoryBonus = totalBonus;
 
-        // COMPLETE BATTLE/SIEGE/RAID STATISTICS
+        // BATTLE/SIEGE/RAID STATISTICS (gas-limited, uses same approach as _getColonyTotalWarStats)
         _calculateCompleteWarStats(colonyId, cws, stats);
 
         // REWARD STATISTICS
         stats.totalEarnedThisSeason = _estimateSeasonEarnings(colonyId, cws);
-        stats.totalEarnedAllTime = stats.totalEarnedThisSeason; // Simplified - would need historical tracking
+        stats.totalEarnedAllTime = stats.totalEarnedThisSeason;
 
-        // Calculate estimated season prize
-        (uint256 prize, , ) = calculateTopSeasonPrize(colonyId, 0, 10);
-        stats.estimatedSeasonPrize = prize;
-
-        // Note: lastRewardAmount, lastRewardTime, lastRewardType would require
-        // explicit reward event tracking in storage - currently not available
+        // Estimated season prize - use lightweight O(n) calculation instead of O(n²) calculateTopSeasonPrize
+        // Full prize details available via getColonyWarRewardStats()
+        stats.estimatedSeasonPrize = _estimateSeasonPrizeLightweight(colonyId, cws);
     }
 
     /**
@@ -1203,29 +1201,37 @@ contract ColonyWarsStatsFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws,
         ColonyWarStats memory stats
     ) internal view {
-        // Colony battles
+        // Colony battles - limit to last 500 for gas safety
         bytes32[] storage battleHistory = cws.colonyBattleHistory[colonyId];
-        stats.colonyBattlesTotal = battleHistory.length;
+        uint256 battleLen = battleHistory.length;
+        uint256 battleStart = battleLen > 500 ? battleLen - 500 : 0;
+        stats.colonyBattlesTotal = battleLen;
 
         uint256 colonyWins = 0;
-        for (uint256 i = 0; i < battleHistory.length; i++) {
-            LibColonyWarsStorage.BattleInstance storage battle = cws.battles[battleHistory[i]];
-            if (battle.winner == colonyId && cws.battleResolved[battleHistory[i]]) {
-                colonyWins++;
+        for (uint256 i = battleStart; i < battleLen; i++) {
+            bytes32 battleId = battleHistory[i];
+            if (cws.battleResolved[battleId]) {
+                LibColonyWarsStorage.BattleInstance storage battle = cws.battles[battleId];
+                if (battle.winner == colonyId) {
+                    colonyWins++;
+                }
             }
         }
         stats.colonyBattlesWon = colonyWins;
-        stats.colonyBattlesLost = stats.colonyBattlesTotal - colonyWins;
+        stats.colonyBattlesLost = (battleLen - battleStart) > colonyWins ? (battleLen - battleStart) - colonyWins : 0;
 
-        // Territory sieges - calculate from colonySiegeHistory
+        // Territory sieges - limit to last 500 for gas safety
         bytes32[] storage siegeHistory = cws.colonySiegeHistory[colonyId];
+        uint256 siegeLen = siegeHistory.length;
+        uint256 siegeStart = siegeLen > 500 ? siegeLen - 500 : 0;
         uint256 siegesResolved = 0;
         uint256 siegesWon = 0;
 
-        for (uint256 i = 0; i < siegeHistory.length; i++) {
-            LibColonyWarsStorage.TerritorySiege storage siege = cws.territorySieges[siegeHistory[i]];
-            if (cws.siegeResolved[siegeHistory[i]]) {
+        for (uint256 i = siegeStart; i < siegeLen; i++) {
+            bytes32 siegeId = siegeHistory[i];
+            if (cws.siegeResolved[siegeId]) {
                 siegesResolved++;
+                LibColonyWarsStorage.TerritorySiege storage siege = cws.territorySieges[siegeId];
                 if (siege.winner == colonyId) {
                     siegesWon++;
                 }
@@ -1236,23 +1242,8 @@ contract ColonyWarsStatsFacet is AccessControlBase {
         stats.territorySiegesWon = siegesWon;
         stats.territorySiegesLost = siegesResolved > siegesWon ? siegesResolved - siegesWon : 0;
 
-        // Territory raids - estimate from controlled territories and damage events
-        // Note: For accurate raid tracking, storage would need explicit raid history per colony
-        // Current estimation based on territories owned and their damage patterns
-        uint256[] storage colonyTerritories = cws.colonyTerritories[colonyId];
-        uint256 estimatedRaidsDefended = 0;
-
-        for (uint256 i = 0; i < colonyTerritories.length; i++) {
-            LibColonyWarsStorage.Territory storage territory = cws.territories[colonyTerritories[i]];
-            if (territory.controllingColony == colonyId && territory.damageLevel > 0) {
-                // Estimate raids based on damage (each successful raid does ~8-15% damage)
-                estimatedRaidsDefended += territory.damageLevel / 10;
-            }
-        }
-
-        // For raids initiated, we estimate based on battle activity ratio
-        // This is an approximation - for precise tracking, explicit raid history would be needed
-        uint256 estimatedRaidsInitiated = battleHistory.length > 0 ? battleHistory.length / 2 : 0;
+        // Raid estimates based on battle activity
+        uint256 estimatedRaidsInitiated = battleLen > 0 ? battleLen / 2 : 0;
         uint256 estimatedRaidsSuccess = estimatedRaidsInitiated > 0 ? estimatedRaidsInitiated / 3 : 0;
 
         stats.territoryRaidsTotal = estimatedRaidsInitiated;
@@ -1262,7 +1253,7 @@ contract ColonyWarsStatsFacet is AccessControlBase {
 
         // Combined totals
         stats.totalVictories = stats.colonyBattlesWon + stats.territorySiegesWon + stats.territoryRaidsSuccess;
-        stats.totalActions = stats.colonyBattlesTotal + stats.territorySiegesTotal + stats.territoryRaidsTotal;
+        stats.totalActions = (battleLen - battleStart) + siegesResolved + stats.territoryRaidsTotal;
     }
     
     function _getColonyTotalWarStats(bytes32 colonyId, LibColonyWarsStorage.ColonyWarsStorage storage cws)
@@ -1391,14 +1382,44 @@ contract ColonyWarsStatsFacet is AccessControlBase {
         }
     }
 
-    function _estimateSeasonEarnings(bytes32 colonyId, LibColonyWarsStorage.ColonyWarsStorage storage cws) 
-        internal 
-        view 
-        returns (uint256 earnings) 
+    function _estimateSeasonEarnings(bytes32 colonyId, LibColonyWarsStorage.ColonyWarsStorage storage cws)
+        internal
+        view
+        returns (uint256 earnings)
     {
-        return _estimateColonyBattleRewards(colonyId, cws) + 
-            _estimateColonySiegeRewards(colonyId, cws) + 
+        return _estimateColonyBattleRewards(colonyId, cws) +
+            _estimateColonySiegeRewards(colonyId, cws) +
             _estimateColonyRaidBonuses(colonyId, cws);
+    }
+
+    /**
+     * @notice O(n) prize estimate - avoids the O(n²) calculateTopSeasonPrize
+     * @dev Single pass: get colony score and sum of all scores, then proportional share
+     */
+    function _estimateSeasonPrizeLightweight(bytes32 colonyId, LibColonyWarsStorage.ColonyWarsStorage storage cws)
+        internal
+        view
+        returns (uint256)
+    {
+        uint32 seasonId = cws.currentSeason;
+        LibColonyWarsStorage.Season storage season = cws.seasons[seasonId];
+        uint256 totalPrize = season.prizePool;
+        if (totalPrize == 0) return 0;
+
+        uint256 colonyScore = LibColonyWarsStorage.getColonyScore(seasonId, colonyId);
+        if (colonyScore == 0) return 0;
+
+        // Single O(n) pass: sum all scores
+        uint256 totalScore = 0;
+        uint256 len = season.registeredColonies.length;
+        for (uint256 i = 0; i < len; i++) {
+            totalScore += LibColonyWarsStorage.getColonyScore(seasonId, season.registeredColonies[i]);
+        }
+
+        if (totalScore == 0) return 0;
+
+        // Proportional share of prize pool
+        return (colonyScore * totalPrize) / totalScore;
     }
 
     function _estimateGlobalBattleRewards(LibColonyWarsStorage.ColonyWarsStorage storage cws) 

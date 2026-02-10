@@ -15,6 +15,7 @@ import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
 import {ChargeCalculator} from "../libraries/ChargeCalculator.sol";
 import {IStakingSystem, IExternalCollection} from "../../staking/interfaces/IStakingInterfaces.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
+import {LibPremiumStorage} from "../libraries/LibPremiumStorage.sol";
 
 /**
  * @title RepairFacet 
@@ -617,6 +618,12 @@ contract RepairFacet is AccessControlBase {
         return (repairSuccess, repairSuccess ? actualReduced : 0);
     }
 
+    function _hasFreeRepairsPremium(address user) internal view returns (bool) {
+        LibPremiumStorage.PremiumAction storage premAction =
+            LibPremiumStorage.premiumStorage().userActions[user][LibPremiumStorage.ActionType.FREE_REPAIRS];
+        return premAction.active && premAction.expiresAt > block.timestamp;
+    }
+
     function _calculateAndCollectFee(
         uint256 chargeRepaired,
         uint256 wearReduced,
@@ -626,34 +633,37 @@ contract RepairFacet is AccessControlBase {
         LibColonyWarsStorage.OperationFee storage wearRepairFee = LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_WEAR_REPAIR);
         address user = LibMeta.msgSender();
 
-        // Process charge repair fee (YELLOW with burn)
-        if (chargeRepaired > 0) {
-            LibFeeCollection.processOperationFee(
-                chargeRepairFee.currency,
-                chargeRepairFee.beneficiary,
-                chargeRepairFee.baseAmount,
-                chargeRepairFee.multiplier,
-                chargeRepairFee.burnOnCollect,
-                chargeRepairFee.enabled,
-                user,
-                chargeRepaired,  // multiplier per point
-                "charge_repair"
-            );
-        }
+        // FREE_REPAIRS premium (duration-based, skips all repair fees)
+        if (!_hasFreeRepairsPremium(user)) {
+            // Process charge repair fee (YELLOW with burn)
+            if (chargeRepaired > 0) {
+                LibFeeCollection.processOperationFee(
+                    chargeRepairFee.currency,
+                    chargeRepairFee.beneficiary,
+                    chargeRepairFee.baseAmount,
+                    chargeRepairFee.multiplier,
+                    chargeRepairFee.burnOnCollect,
+                    chargeRepairFee.enabled,
+                    user,
+                    chargeRepaired,  // multiplier per point
+                    "charge_repair"
+                );
+            }
 
-        // Process wear repair fee (YELLOW with burn, 2x multiplier)
-        if (wearReduced > 0) {
-            LibFeeCollection.processOperationFee(
-                wearRepairFee.currency,
-                wearRepairFee.beneficiary,
-                wearRepairFee.baseAmount,
-                wearRepairFee.multiplier,  // Already 2x (200)
-                wearRepairFee.burnOnCollect,
-                wearRepairFee.enabled,
-                user,
-                wearReduced,  // multiplier per point
-                "wear_repair"
-            );
+            // Process wear repair fee (YELLOW with burn, 2x multiplier)
+            if (wearReduced > 0) {
+                LibFeeCollection.processOperationFee(
+                    wearRepairFee.currency,
+                    wearRepairFee.beneficiary,
+                    wearRepairFee.baseAmount,
+                    wearRepairFee.multiplier,  // Already 2x (200)
+                    wearRepairFee.burnOnCollect,
+                    wearRepairFee.enabled,
+                    user,
+                    wearReduced,  // multiplier per point
+                    "wear_repair"
+                );
+            }
         }
 
         // Calculate total for return (for events/tracking)

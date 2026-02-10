@@ -5,6 +5,7 @@ import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibGamingStorage} from "../libraries/LibGamingStorage.sol";
+import {LibPremiumStorage} from "../libraries/LibPremiumStorage.sol";
 import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -387,7 +388,16 @@ contract ResourceEventFacet is AccessControlBase {
         // Leaderboard bonuses (top 10 get extra)
         uint256 leaderboardBonus = _calculateLeaderboardBonus(eventId, user, baseReward);
         uint256 totalReward = baseReward + leaderboardBonus;
-        
+
+        // DOUBLE_REWARDS premium (duration-based, 2x total reward)
+        {
+            LibPremiumStorage.PremiumStorage storage pps = LibPremiumStorage.premiumStorage();
+            LibPremiumStorage.PremiumAction storage premAction = pps.userActions[user][LibPremiumStorage.ActionType.DOUBLE_REWARDS];
+            if (premAction.active && premAction.expiresAt > block.timestamp) {
+                totalReward = totalReward * 2;
+            }
+        }
+
         participant.rewardClaimed = true;
         
         // Distribute reward using Treasury → Mint fallback pattern
@@ -537,24 +547,7 @@ contract ResourceEventFacet is AccessControlBase {
      * @notice Get active cost reduction for resource processing
      */
     function getActiveCostReduction() external view returns (uint16 reduction) {
-        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        reduction = 0;
-        
-        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
-            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
-            LibResourceStorage.ResourceEvent storage evt = rs.resourceEvents[eventHash];
-            
-            if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
-                // Crafting Festival (type 3) - reduce costs
-                if (evt.eventType == 3) {
-                    if (evt.processingDiscount > reduction) {
-                        reduction = evt.processingDiscount;
-                    }
-                }
-            }
-        }
-        
-        return reduction;
+        return LibResourceStorage.getActiveCostReduction();
     }
     
     // ==================== VIEW FUNCTIONS ====================

@@ -593,6 +593,7 @@ contract ChargeFacet is AccessControlBase {
         uint256 baseReward = _processActionReward(collectionId, tokenId, actionId, combinedId);
         uint256 enhancedReward = _applyAllRewardBonuses(baseReward, collectionId, tokenId, actionId, user);
 
+        _updateGameState(user, collectionId, tokenId, actionId, enhancedReward);
         ActionHelper.updateAfterAction(user, collectionId, tokenId, actionId);
 
         bytes32 tokenColony = hs.specimenColonies[combinedId];

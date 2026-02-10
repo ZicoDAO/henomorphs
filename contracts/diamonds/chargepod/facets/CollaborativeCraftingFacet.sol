@@ -100,11 +100,14 @@ contract CollaborativeCraftingFacet is AccessControlBase {
         }
         
         // Pay crafting fee (YELLOW with burn mechanism)
+        // Apply active event cost reduction (e.g. Crafting Festival / Resource Rush with discount)
         LibColonyWarsStorage.OperationFee storage craftingFee = LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_CRAFTING);
         if (craftingFee.enabled) {
-            LibFeeCollection.processConfiguredFee(
+            uint16 costReduction = LibResourceStorage.getActiveCostReduction();
+            LibFeeCollection.processConfiguredFeeWithDiscount(
                 craftingFee,
                 initiator,
+                costReduction,
                 "collaborative_crafting_creation"
             );
         }
@@ -151,6 +154,86 @@ contract CollaborativeCraftingFacet is AccessControlBase {
         return projectId;
     }
     
+    /**
+     * @notice Simplified project creation with flat resource amounts
+     * @param colonyId Colony initiating the project
+     * @param projectType 1=Infrastructure, 2=Research, 3=Defense
+     * @param basicAmount Required Basic resource (0 to skip)
+     * @param energyAmount Required Energy resource (0 to skip)
+     * @param bioAmount Required Bio resource (0 to skip)
+     * @param rareAmount Required Rare resource (0 to skip)
+     * @param paymentRequirement Payment token amount required
+     * @param duration Project duration in seconds (0 = use default)
+     * @return projectId Unique project identifier
+     */
+    function createProjectSimple(
+        bytes32 colonyId,
+        uint8 projectType,
+        uint256 basicAmount,
+        uint256 energyAmount,
+        uint256 bioAmount,
+        uint256 rareAmount,
+        uint256 paymentRequirement,
+        uint32 duration
+    ) external whenNotPaused nonReentrant returns (bytes32 projectId) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        address initiator = LibMeta.msgSender();
+
+        if (projectType == 0 || projectType > 3) {
+            revert InvalidProjectType(projectType);
+        }
+
+        // At least one resource must be required
+        if (basicAmount == 0 && energyAmount == 0 && bioAmount == 0 && rareAmount == 0) {
+            revert InvalidContributionAmount(0);
+        }
+
+        if (!_hasColonyPermission(colonyId, initiator)) {
+            revert InsufficientPermissions(initiator, "create project");
+        }
+
+        // Pay crafting fee
+        LibColonyWarsStorage.OperationFee storage craftingFee = LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_CRAFTING);
+        if (craftingFee.enabled) {
+            LibFeeCollection.processConfiguredFee(craftingFee, initiator, "collaborative_crafting_creation");
+        }
+
+        projectId = keccak256(
+            abi.encodePacked(colonyId, projectType, block.timestamp, initiator, uint256(4))
+        );
+
+        uint32 projectDuration = duration > 0 ? duration : rs.config.defaultProjectDuration;
+
+        LibResourceStorage.CollaborativeProject storage project = rs.collaborativeProjects[projectId];
+        project.colonyId = colonyId;
+        project.projectType = projectType;
+        project.initiator = initiator;
+        project.deadline = uint32(block.timestamp) + projectDuration;
+        project.paymentRequirement = paymentRequirement;
+        project.status = LibResourceStorage.ProjectStatus.Active;
+
+        // Store non-zero resource requirements
+        if (basicAmount > 0) {
+            project.resourceRequirements.push(LibResourceStorage.ResourceRequirement(0, basicAmount));
+        }
+        if (energyAmount > 0) {
+            project.resourceRequirements.push(LibResourceStorage.ResourceRequirement(1, energyAmount));
+        }
+        if (bioAmount > 0) {
+            project.resourceRequirements.push(LibResourceStorage.ResourceRequirement(2, bioAmount));
+        }
+        if (rareAmount > 0) {
+            project.resourceRequirements.push(LibResourceStorage.ResourceRequirement(3, rareAmount));
+        }
+
+        rs.activeProjects.push(projectId);
+
+        emit ProjectCreated(projectId, colonyId, projectType, initiator);
+        LibAchievementTrigger.triggerCollaborativeProject(initiator);
+
+        return projectId;
+    }
+
     // ==================== CONTRIBUTIONS ====================
     
     /**
@@ -768,7 +851,7 @@ contract CollaborativeCraftingFacet is AccessControlBase {
     
     /**
      * @notice Distribute reward tokens to contributors proportionally
-     * @dev Uses Treasury â†’ Mint fallback pattern for sustainable token distribution
+     * @dev Uses Treasury → Mint fallback pattern for sustainable token distribution
      */
     function _distributeRewardTokens(
         bytes32 projectId,
@@ -797,7 +880,7 @@ contract CollaborativeCraftingFacet is AccessControlBase {
             uint256 rewardAmount = (totalRewardPool * contributorValue) / totalContributions;
             
             if (rewardAmount > 0) {
-                // Use Treasury â†’ Mint fallback pattern
+                // Use Treasury → Mint fallback pattern
                 _distributeYlwReward(rs.config.primaryRewardToken, rs.config.paymentBeneficiary, contributor, rewardAmount);
                 emit RewardDistributed(projectId, contributor, rewardAmount);
             }
@@ -805,7 +888,7 @@ contract CollaborativeCraftingFacet is AccessControlBase {
     }
     
     /**
-     * @notice Distribute YLW reward with Treasury â†’ Mint fallback
+     * @notice Distribute YLW reward with Treasury → Mint fallback
      * @dev Priority: 1) Transfer from treasury, 2) Mint if treasury insufficient
      * @param rewardToken YLW token address
      * @param treasury Treasury address

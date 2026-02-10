@@ -663,6 +663,7 @@ contract HenomorphsRealmsOddPlaces is
             revert ERC721NonexistentToken(tokenId);
         }
 
+        emit VariantAssigned(tokenId, 0, true);
         _itemsVariants[issueId][tier][tokenId] = 0;
     }
 
@@ -747,6 +748,7 @@ contract HenomorphsRealmsOddPlaces is
             }
         }
 
+        emit VariantAssigned(tokenId, variant, success);
         return success;
     }
 

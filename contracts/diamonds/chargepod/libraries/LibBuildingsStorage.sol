@@ -405,6 +405,12 @@ library LibBuildingsStorage {
         uint256 totalSpecimenCardsAttached;
         uint256 totalVentureCardsAttached;
         mapping(CardCompatibleSystem => uint256) cardsPerSystem;
+
+        // ============================================
+        // BOOSTER CARDS CONTRACT (APPEND-ONLY)
+        // ============================================
+
+        address boosterCardsContract;
     }
 
     // ============================================

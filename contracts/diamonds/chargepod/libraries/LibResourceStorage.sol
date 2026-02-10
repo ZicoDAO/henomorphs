@@ -329,7 +329,7 @@ library LibResourceStorage {
      *      - Linear decay punishes large balances too harshly
      *      - Sqrt decay: decayAmount = sqrt(currentAmount) * rate * days / scaleFactor
      *      - This makes decay proportionally smaller for larger balances
-     *      - Example at 1% rate: 100 resources â†’ 1 decay, 10000 resources â†’ 10 decay (not 100)
+     *      - Example at 1% rate: 100 resources → 1 decay, 10000 resources → 10 decay (not 100)
      * @param user User address
      */
     function applyResourceDecay(address user) internal {
@@ -533,6 +533,26 @@ library LibResourceStorage {
             return rs.harvestBoostMultiplier[user];
         }
         return 0;
+    }
+
+    /**
+     * @notice Get active event cost reduction for processing/crafting fees
+     * @return reduction Cost reduction in basis points (e.g. 2500 = 25% discount)
+     */
+    function getActiveCostReduction() internal view returns (uint16 reduction) {
+        ResourceStorage storage rs = resourceStorage();
+        reduction = 0;
+
+        for (uint256 i = 0; i < rs.activeEventIds.length; i++) {
+            bytes32 eventHash = keccak256(bytes(rs.activeEventIds[i]));
+            ResourceEvent storage evt = rs.resourceEvents[eventHash];
+
+            if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
+                if (evt.processingDiscount > reduction) {
+                    reduction = evt.processingDiscount;
+                }
+            }
+        }
     }
 
     /**

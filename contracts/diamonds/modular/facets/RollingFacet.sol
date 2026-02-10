@@ -1369,11 +1369,27 @@ contract RollingFacet is AccessControlBase {
 
     function _resetSpecimenOnExpiry(bytes32 rollHash) internal {
         LibCollectionStorage.VariantRoll storage roll = _getVariantRoll(rollHash);
-        
+
         if (roll.exists && roll.couponCollectionId > 0) {
+            // Refund usedRolls so expired rolls don't permanently exhaust the coupon
+            uint256 combinedId = PodsUtils.combineIds(roll.couponCollectionId, roll.couponTokenId);
+            LibCollectionStorage.RollCoupon storage specimen = _getRollCoupon(combinedId);
+
+            uint256 rollsToRefund = uint256(roll.rerollsUsed) + 1;
+            if (specimen.usedRolls >= rollsToRefund) {
+                specimen.usedRolls -= rollsToRefund;
+            } else {
+                specimen.usedRolls = 0;
+            }
+
+            // Refund free roll if entire chain was free
+            if (roll.totalPaid == 0 && specimen.freeRollsUsed > 0) {
+                specimen.freeRollsUsed--;
+            }
+
             _removeRollFromTracking(roll.couponCollectionId, roll.couponTokenId, rollHash);
             _clearVariantRoll(rollHash);
-            
+
             emit SpecimenResetOnExpiry(roll.couponCollectionId, roll.couponTokenId, rollHash);
         }
     }

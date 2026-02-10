@@ -9,7 +9,7 @@ import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
 import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IColonyBoosterCards} from "../../staking/interfaces/IColonyBoosterCards.sol";
 
 /**
  * @title ColonyBuildingsFacet
@@ -68,22 +68,22 @@ contract ColonyBuildingsFacet is AccessControlBase {
 
     event BuildingsSystemToggled(bool enabled);
 
-    event BuildingCardAttached(
-        bytes32 indexed colonyId,
-        uint8 indexed buildingType,
+    event BoosterCardAttached(
         uint256 indexed tokenId,
-        address owner,
-        uint16 rarityBonusBps
+        bytes32 indexed colonyId,
+        uint8 buildingType,
+        address indexed caller
     );
 
-    event BuildingCardDetached(
-        bytes32 indexed colonyId,
-        uint8 indexed buildingType,
+    event BoosterCardDetached(
         uint256 indexed tokenId,
-        address owner
+        address indexed caller
     );
 
-    event BuildingCardsContractUpdated(address indexed oldAddress, address indexed newAddress);
+    event BoosterBlueprintActivated(
+        uint256 indexed tokenId,
+        address indexed caller
+    );
 
     // Multi-system card events
     event CardSystemInitialized();
@@ -94,6 +94,8 @@ contract ColonyBuildingsFacet is AccessControlBase {
     event CardTypeRegistered(uint8 indexed typeId, string name, uint8 system);
     event CardTypeToggled(uint8 indexed typeId, bool enabled);
     event MultiSystemCardConfigUpdated(uint8 maxCardsPerSpecimen, uint8 maxCardsPerVentureSlot);
+    event BoosterCardsUpgraded(uint256[] burnedTokenIds, uint256 indexed newTokenId, address indexed caller);
+    event BoosterCardsContractUpdated(address indexed oldAddress, address indexed newAddress);
 
     // ============================================
     // ERRORS
@@ -112,13 +114,9 @@ contract ColonyBuildingsFacet is AccessControlBase {
     error NotColonyOwner();
     error NothingToClaim();
     error BuildingTypeNotEnabled(uint8 buildingType);
-    error CardModeDisabled();
-    error BuildingCardsContractNotSet();
-    error CardAlreadyAttached(uint256 tokenId);
-    error CardNotAttached(bytes32 colonyId, uint8 buildingType);
     error NotCardOwner(uint256 tokenId);
-    error CardTypeMismatch(uint8 expected, uint8 actual);
-    error CardNotConstructed();
+    error InvalidUpgradeInput();
+    error BoosterCardsNotSet();
 
     // ============================================
     // MAIN FUNCTIONS
@@ -446,105 +444,179 @@ contract ColonyBuildingsFacet is AccessControlBase {
     }
 
     // ============================================
-    // BUILDING CARDS FUNCTIONS
+    // BOOSTER CARDS FUNCTIONS
     // ============================================
 
     /**
-     * @notice Attach a building card to enhance a colony building
-     * @param tokenId Building card token ID
-     * @param buildingType Type of building to attach to
-     * @param rarityBonusBps Rarity bonus in basis points (from card traits)
+     * @notice Attach a booster card to a colony building
+     * @param tokenId Booster card token ID
+     * @param buildingType Type of building to attach to (0-7)
      */
-    function attachBuildingCard(
+    function attachBoosterToBuilding(
         uint256 tokenId,
-        uint8 buildingType,
-        uint16 rarityBonusBps
+        uint8 buildingType
     ) external whenNotPaused nonReentrant {
         LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
 
-        if (!bs.cardModeEnabled) revert CardModeDisabled();
-        if (bs.buildingCardsContract == address(0)) revert BuildingCardsContractNotSet();
-        if (buildingType > LibBuildingsStorage.MAX_BUILDING_TYPE) {
-            revert InvalidBuildingType(buildingType);
-        }
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
 
+        IColonyBoosterCards boosterContract = IColonyBoosterCards(boosterAddr);
         address caller = LibMeta.msgSender();
+
+        if (boosterContract.ownerOf(tokenId) != caller) revert NotCardOwner(tokenId);
+
         bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
         require(colonyId != bytes32(0), "No colony");
 
-        // Verify caller owns the card
-        IERC721 buildingCards = IERC721(bs.buildingCardsContract);
-        if (buildingCards.ownerOf(tokenId) != caller) {
-            revert NotCardOwner(tokenId);
-        }
+        // Delegate to external contract (handles: system compat, blueprint, already attached, target slot)
+        boosterContract.attachToColony(tokenId, colonyId, buildingType);
 
-        // Check card is not already attached somewhere
-        if (bs.cardToColony[tokenId] != bytes32(0)) {
-            revert CardAlreadyAttached(tokenId);
-        }
-
-        // Building must exist and be active
-        LibBuildingsStorage.Building storage building = bs.colonyBuildings[colonyId][buildingType];
-        if (!building.active) {
-            revert BuildingNotFound(colonyId, buildingType);
-        }
-
-        // Attach the card
-        LibBuildingsStorage.attachBuildingCard(colonyId, buildingType, tokenId, rarityBonusBps);
-
-        emit BuildingCardAttached(colonyId, buildingType, tokenId, caller, rarityBonusBps);
+        emit BoosterCardAttached(tokenId, colonyId, buildingType, caller);
     }
 
     /**
-     * @notice Detach a building card from a colony building
-     * @param buildingType Type of building to detach from
+     * @notice Detach a booster card from a colony building
+     * @param tokenId Booster card token ID
      */
-    function detachBuildingCard(uint8 buildingType) external whenNotPaused nonReentrant {
-        if (buildingType > LibBuildingsStorage.MAX_BUILDING_TYPE) {
-            revert InvalidBuildingType(buildingType);
-        }
+    function detachBoosterFromBuilding(uint256 tokenId) external whenNotPaused nonReentrant {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
 
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        IColonyBoosterCards boosterContract = IColonyBoosterCards(boosterAddr);
         address caller = LibMeta.msgSender();
-        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
-        require(colonyId != bytes32(0), "No colony");
 
-        // Check card is attached
-        uint256 tokenId = LibBuildingsStorage.getAttachedCard(colonyId, buildingType);
-        if (tokenId == 0) {
-            revert CardNotAttached(colonyId, buildingType);
-        }
+        if (boosterContract.ownerOf(tokenId) != caller) revert NotCardOwner(tokenId);
 
-        // Detach the card
-        LibBuildingsStorage.detachBuildingCard(colonyId, buildingType);
+        // Delegate to external contract (handles: not attached, locked, cleanup)
+        boosterContract.detachFromColony(tokenId);
 
-        emit BuildingCardDetached(colonyId, buildingType, tokenId, caller);
+        emit BoosterCardDetached(tokenId, caller);
     }
 
     /**
-     * @notice Get attached building card info
+     * @notice Activate a booster blueprint (converts to active booster)
+     * @param tokenId Blueprint token ID
+     */
+    function activateBoosterBlueprint(uint256 tokenId) external whenNotPaused nonReentrant {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        IColonyBoosterCards boosterContract = IColonyBoosterCards(boosterAddr);
+        address caller = LibMeta.msgSender();
+
+        if (boosterContract.ownerOf(tokenId) != caller) revert NotCardOwner(tokenId);
+
+        // Delegate to external contract (handles: blueprint validation)
+        boosterContract.activateBlueprint(tokenId);
+
+        emit BoosterBlueprintActivated(tokenId, caller);
+    }
+
+    /**
+     * @notice Get booster bonuses for a building
      * @param colonyId Colony identifier
-     * @param buildingType Building type
-     * @return tokenId Attached card token ID (0 if none)
-     * @return rarityBonusBps Rarity bonus in basis points
+     * @param buildingType Building type (0-7)
+     * @return primaryBps Primary bonus in basis points
+     * @return secondaryBps Secondary bonus in basis points
      */
-    function getAttachedBuildingCard(
+    function getBuildingBoosterBonus(
         bytes32 colonyId,
         uint8 buildingType
-    ) external view returns (uint256 tokenId, uint16 rarityBonusBps) {
-        tokenId = LibBuildingsStorage.getAttachedCard(colonyId, buildingType);
-        rarityBonusBps = LibBuildingsStorage.getCardRarityBonus(colonyId, buildingType);
-        return (tokenId, rarityBonusBps);
+    ) external view returns (uint16 primaryBps, uint16 secondaryBps) {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) return (0, 0);
+
+        return IColonyBoosterCards(boosterAddr).getBuildingBonus(colonyId, buildingType);
     }
 
     /**
-     * @notice Get colony building effects including card bonuses
-     * @param colonyId Colony identifier
-     * @return effects Building effects with card bonuses applied
+     * @notice Upgrade 3 booster cards of same type/rarity into 1 higher rarity
+     * @param tokenIds Array of exactly 3 booster token IDs to combine
+     * @return newTokenId The newly minted upgraded booster
      */
-    function getColonyBuildingEffectsWithCards(bytes32 colonyId) external view returns (
-        LibBuildingsStorage.ColonyBuildingEffects memory effects
-    ) {
-        return LibBuildingsStorage.getColonyBuildingEffectsWithCards(colonyId);
+    function upgradeBoosterCards(uint256[] calldata tokenIds) external whenNotPaused nonReentrant returns (uint256 newTokenId) {
+        if (tokenIds.length != 3) revert InvalidUpgradeInput();
+
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        IColonyBoosterCards boosterContract = IColonyBoosterCards(boosterAddr);
+        address caller = LibMeta.msgSender();
+
+        // Validate ownership
+        for (uint256 i = 0; i < 3; i++) {
+            if (boosterContract.ownerOf(tokenIds[i]) != caller) revert NotCardOwner(tokenIds[i]);
+        }
+
+        // Delegate to external contract (handles: attached, blueprint, rarity, system/subType match)
+        newTokenId = boosterContract.upgradeBoosters(tokenIds);
+
+        emit BoosterCardsUpgraded(tokenIds, newTokenId, caller);
+    }
+
+    /**
+     * @notice Admin: Set booster cards contract address
+     * @param boosterCardsAddress Address of ColonyBoostersCards contract
+     */
+    function setBoosterCardsContract(address boosterCardsAddress) external onlyAuthorized {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+
+        address oldAddress = bs.boosterCardsContract;
+        bs.boosterCardsContract = boosterCardsAddress;
+
+        emit BoosterCardsContractUpdated(oldAddress, boosterCardsAddress);
+    }
+
+    // ============================================
+    // BOOSTER TRANSFER MODEL D
+    // ============================================
+
+    /**
+     * @notice Approve a pending booster transfer request
+     * @param tokenId Booster token ID
+     * @param to Approved recipient address
+     */
+    function approveBoosterTransfer(uint256 tokenId, address to) external onlyAuthorized {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        IColonyBoosterCards(boosterAddr).approveTransfer(tokenId, to);
+    }
+
+    /**
+     * @notice Complete an approved booster transfer
+     * @param from Current owner
+     * @param to New owner
+     * @param tokenId Booster token ID
+     */
+    function completeBoosterTransfer(address from, address to, uint256 tokenId) external onlyAuthorized {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        IColonyBoosterCards(boosterAddr).completeTransfer(from, to, tokenId);
+    }
+
+    /**
+     * @notice Reject a pending booster transfer request
+     * @param tokenId Booster token ID
+     * @param reason Rejection reason
+     */
+    function rejectBoosterTransfer(uint256 tokenId, string calldata reason) external onlyAuthorized {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        IColonyBoosterCards(boosterAddr).rejectTransfer(tokenId, reason);
     }
 
     // ============================================
@@ -565,28 +637,6 @@ contract ColonyBuildingsFacet is AccessControlBase {
         LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
         bs.config.systemEnabled = enabled;
         emit BuildingsSystemToggled(enabled);
-    }
-
-    /**
-     * @notice Set building cards contract address
-     * @param buildingCardsContract Address of ColonyBuildingCards contract
-     */
-    function setBuildingCardsContract(address buildingCardsContract) external onlyAuthorized {
-        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
-
-        address oldAddress = bs.buildingCardsContract;
-        bs.buildingCardsContract = buildingCardsContract;
-
-        emit BuildingCardsContractUpdated(oldAddress, buildingCardsContract);
-    }
-
-    /**
-     * @notice Enable/disable card mode
-     * @param enabled Whether card attachment is enabled
-     */
-    function setCardModeEnabled(bool enabled) external onlyAuthorized {
-        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
-        bs.cardModeEnabled = enabled;
     }
 
     /**

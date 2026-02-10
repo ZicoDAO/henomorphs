@@ -13,6 +13,7 @@ import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IColonyBoosterCards} from "../../staking/interfaces/IColonyBoosterCards.sol";
 
 /**
  * @title SpecimenEvolutionFacet
@@ -97,6 +98,23 @@ contract SpecimenEvolutionFacet is AccessControlBase {
     error CardInCooldown(uint32 remainingSeconds);
     error CardLocked();
     error InvalidCardCollection(uint16 collectionId);
+
+    // Booster card errors
+    error BoosterCardsNotSet();
+    error NotBoosterOwner(uint256 tokenId);
+
+    // Booster card events
+    event BoosterAttachedToSpecimen(
+        uint256 indexed boosterTokenId,
+        uint256 indexed collectionId,
+        uint256 indexed specimenTokenId,
+        address caller
+    );
+
+    event BoosterDetachedFromSpecimen(
+        uint256 indexed boosterTokenId,
+        address indexed caller
+    );
 
     // ============================================
     // MAIN EVOLUTION FUNCTION
@@ -867,6 +885,87 @@ contract SpecimenEvolutionFacet is AccessControlBase {
      * @param tokenId Token ID
      * @param caller Caller address
      */
+    // ============================================
+    // BOOSTER CARDS FUNCTIONS
+    // ============================================
+
+    /**
+     * @notice Attach a booster card to a specimen
+     * @param boosterTokenId Booster card token ID
+     * @param collectionId Specimen collection ID
+     * @param specimenTokenId Specimen token ID
+     */
+    function attachBoosterToSpecimen(
+        uint256 boosterTokenId,
+        uint256 collectionId,
+        uint256 specimenTokenId
+    ) external whenNotPaused nonReentrant {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        IColonyBoosterCards boosterContract = IColonyBoosterCards(boosterAddr);
+        address caller = LibMeta.msgSender();
+
+        if (boosterContract.ownerOf(boosterTokenId) != caller) revert NotBoosterOwner(boosterTokenId);
+
+        // Construct Evolution target and delegate to external contract
+        IColonyBoosterCards.AttachmentTarget memory target = IColonyBoosterCards.AttachmentTarget({
+            system: 1,              // Evolution
+            colonyId: bytes32(0),
+            buildingType: 0,
+            collectionId: collectionId,
+            tokenId: specimenTokenId,
+            user: address(0),
+            ventureType: 0
+        });
+
+        boosterContract.attachBooster(boosterTokenId, target);
+
+        emit BoosterAttachedToSpecimen(boosterTokenId, collectionId, specimenTokenId, caller);
+    }
+
+    /**
+     * @notice Detach a booster card from a specimen
+     * @param boosterTokenId Booster card token ID
+     */
+    function detachBoosterFromSpecimen(uint256 boosterTokenId) external whenNotPaused nonReentrant {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        IColonyBoosterCards boosterContract = IColonyBoosterCards(boosterAddr);
+        address caller = LibMeta.msgSender();
+
+        if (boosterContract.ownerOf(boosterTokenId) != caller) revert NotBoosterOwner(boosterTokenId);
+
+        boosterContract.detachBooster(boosterTokenId);
+
+        emit BoosterDetachedFromSpecimen(boosterTokenId, caller);
+    }
+
+    /**
+     * @notice Get booster bonuses for a specimen
+     * @param collectionId Specimen collection ID
+     * @param specimenTokenId Specimen token ID
+     * @return costReductionBps Evolution cost reduction in basis points
+     * @return tierBonus Extra tier bonus
+     */
+    function getSpecimenBoosterBonus(
+        uint256 collectionId,
+        uint256 specimenTokenId
+    ) external view returns (uint16 costReductionBps, uint8 tierBonus) {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) return (0, 0);
+
+        return IColonyBoosterCards(boosterAddr).getEvolutionBonus(collectionId, specimenTokenId);
+    }
+
+    // ============================================
+    // INTERNAL HELPERS
+    // ============================================
+
     function _verifySpecimenOwnership(
         uint256 collectionId,
         uint256 tokenId,

@@ -5,17 +5,9 @@ import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibPremiumStorage} from "../libraries/LibPremiumStorage.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibGamingStorage} from "../libraries/LibGamingStorage.sol";
+import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
 import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IResourcePodFacet} from "../../staking/interfaces/IStakingInterfaces.sol";
-
-/**
- * @notice Interface for mintable reward token (YLW)
- */
-interface IRewardToken is IERC20 {
-    function mint(address to, uint256 amount, string calldata reason) external;
-}
 
 /**
  * @notice Achievement NFT interface (HenomorphsAchievements compatible)
@@ -47,7 +39,6 @@ interface IRewardRedeemable {
  * @custom:version 2.0.0 - Refactored to use LibPremiumStorage (Diamond Pattern compliant)
  */
 contract AchievementRewardFacet is AccessControlBase {
-    using SafeERC20 for IERC20;
     
     // ==================== EVENTS ====================
 
@@ -521,7 +512,7 @@ contract AchievementRewardFacet is AccessControlBase {
      */
     function _mintNFT(address user, uint256 achievementId, uint8 tier) internal returns (uint256 tokenId) {
         LibPremiumStorage.PremiumStorage storage ps = LibPremiumStorage.premiumStorage();
-        if (ps.achievementNFT == address(0)) revert NFTMintFailed(achievementId);
+        if (ps.achievementNFT == address(0)) return 0;
 
         // Check if user already has this NFT - skip minting if so
         try IAchievementNFT(ps.achievementNFT).hasAchievement(user, achievementId, tier) returns (bool hasIt) {
@@ -534,9 +525,13 @@ contract AchievementRewardFacet is AccessControlBase {
             // If check fails, proceed with mint attempt
         }
 
-        tokenId = IAchievementNFT(ps.achievementNFT).mintAchievement(user, achievementId, tier);
-        ps.userAchievementRewards[user][achievementId].nftMinted = true;
-        unchecked { ps.totalNFTsMinted++; }
+        try IAchievementNFT(ps.achievementNFT).mintAchievement(user, achievementId, tier) returns (uint256 _tokenId) {
+            tokenId = _tokenId;
+            ps.userAchievementRewards[user][achievementId].nftMinted = true;
+            unchecked { ps.totalNFTsMinted++; }
+        } catch {
+            // NFT mint failed - can be retried later via mintPendingBadges
+        }
     }
 
     /**
@@ -598,10 +593,9 @@ contract AchievementRewardFacet is AccessControlBase {
         // 2. Award token rewards
         uint256 totalTokens = 0;
         if (config.tokenReward > 0) {
-            LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
             uint256 tierMultiplier = 100 + (reward.tierAchieved - 1) * 25; // 100%-200%
             totalTokens = (config.tokenReward * tierMultiplier) / 100;
-            _distributeYlwReward(rs.config.utilityToken, rs.config.paymentBeneficiary, user, totalTokens);
+            LibFeeCollection.transferFromTreasury(user, totalTokens, "achievement_reward");
             unchecked { ps.totalTokensDistributed += totalTokens; }
         }
 
@@ -671,11 +665,12 @@ contract AchievementRewardFacet is AccessControlBase {
             // 2. Token rewards
             uint256 totalTokens = 0;
             if (config.tokenReward > 0) {
-                LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
                 uint256 tierMultiplier = 100 + (reward.tierAchieved - 1) * 25;
                 totalTokens = (config.tokenReward * tierMultiplier) / 100;
-                _distributeYlwReward(rs.config.utilityToken, rs.config.paymentBeneficiary, user, totalTokens);
-                unchecked { ps.totalTokensDistributed += totalTokens; }
+                if (LibFeeCollection.checkTreasuryBalance(totalTokens)) {
+                    LibFeeCollection.transferFromTreasury(user, totalTokens, "achievement_reward");
+                    unchecked { ps.totalTokensDistributed += totalTokens; }
+                }
             }
 
             // 3. Resource rewards via centralized ResourcePodFacet
@@ -941,40 +936,6 @@ contract AchievementRewardFacet is AccessControlBase {
 
     // ==================== INTERNAL HELPERS ====================
     
-    /**
-     * @notice Distribute YLW reward with Treasury → Mint fallback
-     * @dev Priority: 1) Transfer from treasury, 2) Mint if treasury insufficient
-     * @param rewardToken YLW token address
-     * @param treasury Treasury address
-     * @param recipient User receiving the reward
-     * @param amount Amount to distribute
-     */
-    function _distributeYlwReward(
-        address rewardToken,
-        address treasury,
-        address recipient,
-        uint256 amount
-    ) internal {
-        // Check treasury balance and allowance
-        uint256 treasuryBalance = IERC20(rewardToken).balanceOf(treasury);
-        uint256 allowance = IERC20(rewardToken).allowance(treasury, address(this));
-        
-        if (treasuryBalance >= amount && allowance >= amount) {
-            // Pay from treasury (preferred - sustainable)
-            IERC20(rewardToken).safeTransferFrom(treasury, recipient, amount);
-        } else if (treasuryBalance > 0 && allowance > 0) {
-            // Partial from treasury, rest from mint
-            uint256 fromTreasury = treasuryBalance < allowance ? treasuryBalance : allowance;
-            IERC20(rewardToken).safeTransferFrom(treasury, recipient, fromTreasury);
-            
-            uint256 shortfall = amount - fromTreasury;
-            IRewardToken(rewardToken).mint(recipient, shortfall, "achievement_reward");
-        } else {
-            // Fallback: Mint new tokens
-            IRewardToken(rewardToken).mint(recipient, amount, "achievement_reward");
-        }
-    }
-
     /**
      * @notice Internal: Mint reward from collection if configured for achievement
      * @param user Recipient address

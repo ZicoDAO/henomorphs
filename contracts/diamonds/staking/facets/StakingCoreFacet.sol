@@ -812,53 +812,47 @@ contract StakingCoreFacet is AccessControlBase, IERC721Receiver {
         if (!AccessHelper.isAuthorized()) {
             revert UnauthorizedCaller();
         }
-        
+
         // Get storage references
         LibStakingStorage.StakingStorage storage ss = LibStakingStorage.stakingStorage();
-        
+
         // Check collection validity
         if (collectionId == 0 || collectionId > ss.collectionCounter) {
             revert InvalidCollectionId();
         }
-        
+
         uint256 combinedId = PodsUtils.combineIds(collectionId, tokenId);
         StakedSpecimen storage staked = ss.stakedSpecimens[combinedId];
-        
+
         // Check if token is actually staked
         if (!staked.staked) {
             revert TokenNotStaked();
         }
-        
+
         // Save token data for transfer
         address originalOwner = staked.owner;
         address collectionAddress = staked.collectionAddress;
-        
-        // Process pending rewards via StakingEarningsFacet (reward token system)
-        try IStakingEarningsFacet(address(this)).processUnstakeRewards(collectionId, tokenId) {
-            // Rewards processed successfully
-        } catch {
-            // Continue with emergency unstaking even if reward processing fails
-        }
 
-        // Clean up staked token data
-        _cleanupStakedToken(ss, combinedId, tokenId, originalOwner);
-        
-        // Transfer token to recipient
-        bool transferSuccessful;
-        
+        // Transfer token FIRST - before any state changes
+        // If transfer fails, no state was modified so nothing to revert
         address tokenSource = _getTokenVaultAddress();
         try IERC721(collectionAddress).safeTransferFrom(tokenSource, recipient, tokenId) {
-            transferSuccessful = true;
+            // Transfer succeeded - now safe to process rewards and cleanup
+            try IStakingEarningsFacet(address(this)).processUnstakeRewards(collectionId, tokenId) {
+                // Rewards processed successfully
+            } catch {
+                // Continue even if reward processing fails
+            }
+
+            _cleanupStakedToken(ss, combinedId, tokenId, originalOwner);
+
             emit TokenUnstaked(collectionId, tokenId, recipient);
             emit OperationResult("EmergencyUnstake", true);
+            return true;
         } catch {
-            // Revert state if transfer fails
-            _revertUnstakeState(ss, combinedId, collectionId, tokenId, originalOwner, collectionAddress);
             emit OperationResult("EmergencyUnstake", false);
-            transferSuccessful = false;
+            return false;
         }
-        
-        return transferSuccessful;
     }
 
     /**
@@ -1106,7 +1100,8 @@ contract StakingCoreFacet is AccessControlBase, IERC721Receiver {
 
     /**
      * @notice Revert state changes if the token transfer fails during unstaking
-     * @dev Used for both regular unstake and emergency unstake operations
+     * @dev Restores staking state including active staker tracking.
+     *      In unstakeSpecimen this is redundant (followed by revert), but kept complete for safety.
      */
     function _revertUnstakeState(
         LibStakingStorage.StakingStorage storage ss,
@@ -1123,15 +1118,18 @@ contract StakingCoreFacet is AccessControlBase, IERC721Receiver {
         staked.collectionId = collectionId;
         staked.tokenId = tokenId;
         staked.collectionAddress = collectionAddress;
-        
+
         // Add back to owner's tokens list
         ss.stakerTokens[owner].push(combinedId);
-        
+
         // Restore collection mapping
         ss.tokenCollectionIds[tokenId] = collectionId;
-        
+
         // Increment staked counter
         ss.totalStakedSpecimens++;
+
+        // Restore active staker tracking (undoes removeActiveStakerIfEmpty from _cleanupStakedToken)
+        LibStakingStorage.addActiveStaker(owner);
     }
 
     /**

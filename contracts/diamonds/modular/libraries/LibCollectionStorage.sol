@@ -127,6 +127,12 @@ library LibCollectionStorage {
         uint256 nonce;
     }
 
+    struct MintConduitConfig {
+        address conduitAddress;     // Address of the IMintConduit collection
+        bool active;                // Whether this mint conduit is active
+        bool hasTargetRestrictions; // If true, check mintConduitValidForTarget mapping
+    }
+
     struct TempReservation {
         bytes32 rollHash;
         uint256 expiresAt;
@@ -759,6 +765,18 @@ library LibCollectionStorage {
         // ==================== USER ROLLING TRACKING ====================
         // Track user's rolling count per collection for free roll eligibility (Main/Realm collections)
         mapping(uint256 => mapping(address => uint256)) userCollectionRollCount; // collectionId => user => rollCount
+
+        // ==================== MINT CONDUIT SYSTEM ====================
+        // External collections (e.g., HenomorphsConduit) that can be used to mint target collections using cores
+
+        // Registered mint conduit configurations: conduitAddress => MintConduitConfig
+        mapping(address => MintConduitConfig) mintConduitConfigs;
+
+        // Target restrictions: conduitAddress => targetCollectionId => isAllowed
+        mapping(address => mapping(uint256 => bool)) mintConduitValidForTarget;
+
+        // Track mint conduit usage per token: conduitAddress => tokenId => totalMinted
+        mapping(address => mapping(uint256 => uint256)) mintConduitTokenUsage;
     }
 
     // ==================== STORAGE ACCESSOR ====================

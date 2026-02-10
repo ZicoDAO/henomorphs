@@ -63,6 +63,11 @@ library MetadataHelper {
         bool onMission;
         string missionName;
         uint8 missionVariant;
+        string missionBaseUri;
+        string missionAnimationBaseUri;
+        uint8 missionTier;
+        uint8 henoVariant;
+        uint8 augmentVariant;
     }
 
     struct ThemeData {
@@ -269,8 +274,28 @@ library MetadataHelper {
         }
 
         string memory description = _getDescriptionFromStructs(systemData.specimen, modularData.traitPackName, systemData.compatibility.traitPackCompatibility);
-        string memory imageUri = _getMainImageUriFromStructs(coreData, systemData, modularData);
-        string memory animationUri = _getMainAnimationUriFromStructs(coreData, systemData, modularData);
+
+        string memory imageUri;
+        string memory animationUri;
+
+        if (missionData.onMission && bytes(missionData.missionBaseUri).length > 0) {
+            RealmTokenContext memory ctx = RealmTokenContext({
+                henoVariant: missionData.henoVariant,
+                augmentVariant: missionData.augmentVariant,
+                hasHenoContext: missionData.henoVariant > 0
+            });
+            imageUri = _buildMissionPassImageUrlWithContext(
+                missionData.missionBaseUri, missionData.missionTier, missionData.missionVariant, ctx
+            );
+            animationUri = _buildMissionPassAnimationUrlWithContext(
+                missionData.missionBaseUri, missionData.missionAnimationBaseUri,
+                missionData.missionTier, missionData.missionVariant, ctx
+            );
+        } else {
+            imageUri = _getMainImageUriFromStructs(coreData, systemData, modularData);
+            animationUri = _getMainAnimationUriFromStructs(coreData, systemData, modularData);
+        }
+
         string memory attributes = _getAllAttributesWithMission(coreData, systemData, modularData, missionData);
 
         return _assembleJSON(name, description, imageUri, animationUri, coreData.externalUrl, attributes);
@@ -314,8 +339,28 @@ library MetadataHelper {
         }
 
         string memory description = _getDescriptionWithTheme(systemData.specimen, modularData.traitPackName, systemData.compatibility.traitPackCompatibility, themeData);
-        string memory imageUri = _getMainImageUriWithTheme(coreData, systemData, modularData, themeData);
-        string memory animationUri = _getMainAnimationUriWithTheme(coreData, systemData, modularData, themeData);
+
+        string memory imageUri;
+        string memory animationUri;
+
+        if (missionData.onMission && bytes(missionData.missionBaseUri).length > 0) {
+            RealmTokenContext memory ctx = RealmTokenContext({
+                henoVariant: missionData.henoVariant,
+                augmentVariant: missionData.augmentVariant,
+                hasHenoContext: missionData.henoVariant > 0
+            });
+            imageUri = _buildMissionPassImageUrlWithContext(
+                missionData.missionBaseUri, missionData.missionTier, missionData.missionVariant, ctx
+            );
+            animationUri = _buildMissionPassAnimationUrlWithContext(
+                missionData.missionBaseUri, missionData.missionAnimationBaseUri,
+                missionData.missionTier, missionData.missionVariant, ctx
+            );
+        } else {
+            imageUri = _getMainImageUriWithTheme(coreData, systemData, modularData, themeData);
+            animationUri = _getMainAnimationUriWithTheme(coreData, systemData, modularData, themeData);
+        }
+
         string memory attributes = _getAllAttributesWithThemeAndMission(coreData, systemData, modularData, themeData, missionData);
 
         return _assembleJSON(name, description, imageUri, animationUri, coreData.externalUrl, attributes);

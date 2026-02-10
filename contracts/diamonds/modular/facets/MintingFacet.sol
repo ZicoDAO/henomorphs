@@ -14,6 +14,7 @@ import {ISpecimenCollection} from "../interfaces/IExternalSystems.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {PodsUtils} from "../utils/PodsUtils.sol";
 import {CollectionType} from "../libraries/ModularAssetModel.sol";
+import {IMintConduit} from "../interfaces/IMintConduit.sol";
 import {AccessHelper} from "../libraries/AccessHelper.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
@@ -125,6 +126,7 @@ contract MintingFacet is AccessControlBase {
     );
 
     event AutoAssignmentFailed(uint256 indexed augmentTokenId, address indexed specimenCollection, uint256 indexed specimenTokenId, string reason);
+    event ConduitMinted(address indexed user, address indexed conduitAddress, uint256 conduitTokenId, uint256 targetCollectionId, uint8 tier, uint8 variant, uint256 quantity, uint256[] tokenIds);
     
     // ==================== CUSTOM ERRORS ====================
     
@@ -154,7 +156,14 @@ contract MintingFacet is AccessControlBase {
     error InvalidSignature();
     error MaxWalletMintsExceeded(uint256 limit, uint256 attempted);
     error InvalidCollectionType();
-    
+    error MintConduitNotRegistered();
+    error MintConduitNotActive();
+    error MintConduitInvalidToken();
+    error MintConduitInsufficientCores(uint256 available, uint256 requested);
+    error MintConduitTargetNotAllowed();
+    error MintConduitConsumptionFailed();
+    error MintConduitNotOwner();
+
     // ==================== MAIN FUNCTIONS ====================
     
     /**
@@ -1830,6 +1839,169 @@ contract MintingFacet is AccessControlBase {
         if (config.currentMints >= config.maxMints) return (false, "SOLD_OUT");
         if (_availability(collectionId, tier, user) == 0) return (false, "NO_ALLOCATION");
         
+        return (true, "OK");
+    }
+
+    // ==================== MINT CONDUIT FUNCTIONS ====================
+
+    /**
+     * @notice Mint tokens using an external mint conduit (e.g., HenomorphsConduit cores)
+     * @dev Conduit-based minting is FREE (cores were paid for at conduit purchase).
+     *      Uses default variant + default tier of the target collection.
+     *      The conduit contract manages its own core deduction and auto-burn.
+     * @param conduitAddress Address of the IMintConduit collection
+     * @param conduitTokenId Token ID of the conduit being used
+     * @param targetCollectionId Target collection to mint into
+     * @param quantity Number of tokens to mint (consumes 1 core per token)
+     * @return tokenIds Array of minted token IDs
+     * @return variant The variant of minted tokens
+     */
+    function mintWithConduit(
+        address conduitAddress,
+        uint256 conduitTokenId,
+        uint256 targetCollectionId,
+        uint256 quantity
+    ) external payable whenNotPaused nonReentrant returns (
+        uint256[] memory tokenIds,
+        uint8 variant
+    ) {
+        address user = LibMeta.msgSender();
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+
+        // 1. Validate conduit is registered and active
+        LibCollectionStorage.MintConduitConfig storage conduitConfig = cs.mintConduitConfigs[conduitAddress];
+        if (conduitConfig.conduitAddress == address(0)) revert MintConduitNotRegistered();
+        if (!conduitConfig.active) revert MintConduitNotActive();
+
+        // 2. Validate target collection exists
+        _validateCollection(targetCollectionId);
+
+        // 3. Validate target restrictions
+        if (conduitConfig.hasTargetRestrictions) {
+            if (!cs.mintConduitValidForTarget[conduitAddress][targetCollectionId]) {
+                revert MintConduitTargetNotAllowed();
+            }
+        }
+
+        // 4. Validate collection type (Main or Realm only)
+        CollectionType collectionType = _getCollectionType(targetCollectionId);
+        if (collectionType != CollectionType.Main && collectionType != CollectionType.Realm) {
+            revert InvalidCollectionType();
+        }
+
+        // 5. Validate ownership of conduit token
+        try IERC721(conduitAddress).ownerOf(conduitTokenId) returns (address owner) {
+            if (owner != user) revert MintConduitNotOwner();
+        } catch {
+            revert MintConduitInvalidToken();
+        }
+
+        // 6. Validate conduit token is active
+        IMintConduit conduit = IMintConduit(conduitAddress);
+        if (!conduit.isConduitValid(conduitTokenId)) revert MintConduitInvalidToken();
+
+        // 7. Validate sufficient cores
+        uint256 available = conduit.availableCores(conduitTokenId);
+        if (available < quantity) revert MintConduitInsufficientCores(available, quantity);
+
+        // 8. Validate quantity
+        _validateQuantity(quantity);
+
+        // 9. Validate target minting is active and has capacity
+        (, uint8 defaultTier,) = LibCollectionStorage.getCollectionInfo(targetCollectionId);
+        _validateMintingActive(targetCollectionId, defaultTier);
+        _validateMintingTime(targetCollectionId, defaultTier);
+
+        LibCollectionStorage.MintingConfig storage mintConfig = _getMintingConfig(targetCollectionId, defaultTier);
+        if (mintConfig.currentMints + quantity > mintConfig.maxMints) {
+            revert MintCapExceeded(mintConfig.currentMints, mintConfig.maxMints);
+        }
+
+        // === EXECUTION ===
+
+        // 10. Determine default variant
+        variant = mintConfig.defaultVariant;
+        if (variant == 0) {
+            if (LibCollectionStorage.isInternalCollection(targetCollectionId)) {
+                variant = cs.collections[targetCollectionId].defaultVariant;
+            }
+            if (variant == 0) {
+                variant = 1;
+            }
+        }
+
+        // 11. Consume cores on the conduit contract (state change before minting)
+        bool consumed = conduit.consumeCores(conduitTokenId, quantity, user);
+        if (!consumed) revert MintConduitConsumptionFailed();
+
+        // 12. Execute minting on target collection (NO payment)
+        tokenIds = _executeMinting(user, targetCollectionId, defaultTier, variant, quantity, bytes32(0));
+
+        // 13. Update counters
+        _updateCounters(user, targetCollectionId, defaultTier, quantity);
+
+        // 14. Track conduit usage
+        cs.mintConduitTokenUsage[conduitAddress][conduitTokenId] += quantity;
+
+        // 15. Emit event
+        emit ConduitMinted(user, conduitAddress, conduitTokenId, targetCollectionId, defaultTier, variant, quantity, tokenIds);
+
+        // 16. Refund any accidentally sent ETH
+        if (msg.value > 0) {
+            Address.sendValue(payable(user), msg.value);
+        }
+
+        return (tokenIds, variant);
+    }
+
+    /**
+     * @notice Check if a conduit can be used to mint
+     * @param conduitAddress Conduit contract address
+     * @param conduitTokenId Conduit token ID
+     * @param targetCollectionId Target collection ID
+     * @param user User address
+     * @param quantity Desired quantity
+     * @return eligible Whether the mint would succeed
+     * @return reason Human-readable reason if eligible is false
+     */
+    function canMintWithConduit(
+        address conduitAddress,
+        uint256 conduitTokenId,
+        uint256 targetCollectionId,
+        address user,
+        uint256 quantity
+    ) external view returns (bool eligible, string memory reason) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        LibCollectionStorage.MintConduitConfig storage conduitConfig = cs.mintConduitConfigs[conduitAddress];
+
+        if (conduitConfig.conduitAddress == address(0)) return (false, "Conduit not registered");
+        if (!conduitConfig.active) return (false, "Conduit not active");
+
+        if (conduitConfig.hasTargetRestrictions && !cs.mintConduitValidForTarget[conduitAddress][targetCollectionId]) {
+            return (false, "Conduit not valid for target collection");
+        }
+
+        try IERC721(conduitAddress).ownerOf(conduitTokenId) returns (address owner) {
+            if (owner != user) return (false, "Not conduit owner");
+        } catch {
+            return (false, "Token does not exist");
+        }
+
+        IMintConduit conduit = IMintConduit(conduitAddress);
+        if (!conduit.isConduitValid(conduitTokenId)) return (false, "Conduit token not valid");
+
+        uint256 availableCores = conduit.availableCores(conduitTokenId);
+        if (availableCores < quantity) return (false, "Insufficient cores");
+
+        if (quantity == 0) return (false, "Invalid quantity");
+
+        (, uint8 defaultTier,) = LibCollectionStorage.getCollectionInfo(targetCollectionId);
+        LibCollectionStorage.MintingConfig storage mintConfig = _getMintingConfig(targetCollectionId, defaultTier);
+        if (!mintConfig.isActive) return (false, "Minting not active");
+        if (block.timestamp < mintConfig.startTime) return (false, "Minting not started");
+        if (block.timestamp > mintConfig.endTime) return (false, "Minting ended");
+        if (mintConfig.currentMints + quantity > mintConfig.maxMints) return (false, "Mint cap exceeded");
+
         return (true, "OK");
     }
 

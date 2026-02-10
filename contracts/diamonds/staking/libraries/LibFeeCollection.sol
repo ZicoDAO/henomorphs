@@ -168,6 +168,36 @@ library LibFeeCollection {
     }
 
     /**
+     * @notice Process configured operation fee with event discount applied
+     * @param fee OperationFee configuration from storage
+     * @param payer Address paying the fee
+     * @param discountBps Discount in basis points (e.g. 2500 = 25% off)
+     * @param operation Operation identifier for events
+     */
+    function processConfiguredFeeWithDiscount(
+        LibColonyWarsStorage.OperationFee storage fee,
+        address payer,
+        uint16 discountBps,
+        string memory operation
+    ) internal {
+        if (!fee.enabled || fee.baseAmount == 0) return;
+
+        uint256 finalAmount = (fee.baseAmount * fee.multiplier) / 100;
+
+        if (discountBps > 0 && discountBps < 10000) {
+            finalAmount = (finalAmount * (10000 - discountBps)) / 10000;
+        }
+
+        if (finalAmount == 0) return;
+
+        if (fee.burnOnCollect) {
+            collectAndBurnFee(IERC20(fee.currency), payer, fee.beneficiary, finalAmount, operation);
+        } else {
+            collectFee(IERC20(fee.currency), payer, fee.beneficiary, finalAmount, operation);
+        }
+    }
+
+    /**
      * @notice Process OperationFee from ChargeFees with multiplier support
      * @param currency Token address
      * @param beneficiary Destination address

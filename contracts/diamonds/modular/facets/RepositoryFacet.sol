@@ -759,13 +759,9 @@ contract RepositoryFacet is AccessControlBase {
         uint256 tokenId,
         uint8 variant
     ) external onlyAuthorized whenNotPaused validCollection(collectionId) {
-        
+
         LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
-        
-        // if (cs.collectionItemsVarianted[collectionId][tokenId] != 0) {
-        //     revert ItemAlreadyVarianted(tokenId);
-        // }
-        
+
         // Check if variant exists
         if (variant == 0) {
             if (cs.tierVariants[collectionId][tier][0].maxSupply == 0) {
@@ -776,9 +772,21 @@ contract RepositoryFacet is AccessControlBase {
                 revert VariantNotFound(variant);
             }
         }
-        
+
+        // Decrement old variant counter if token already had a variant
+        uint8 previousVariant = cs.itemsVariants[collectionId][tier][tokenId];
+        if (cs.collectionItemsVarianted[collectionId][tokenId] != 0 && previousVariant != variant) {
+            if (cs.hitVariantsCounters[collectionId][tier][previousVariant] > 0) {
+                cs.hitVariantsCounters[collectionId][tier][previousVariant]--;
+            }
+        }
+
+        // Only increment if this is a new assignment or variant changed
+        if (cs.collectionItemsVarianted[collectionId][tokenId] == 0 || previousVariant != variant) {
+            cs.hitVariantsCounters[collectionId][tier][variant]++;
+        }
+
         cs.collectionItemsVarianted[collectionId][tokenId] = block.number;
-        cs.hitVariantsCounters[collectionId][tier][variant]++;
         cs.itemsVariants[collectionId][tier][tokenId] = variant;
 
         (address collectionAddress,, bool exists) = LibCollectionStorage.getCollectionInfo(collectionId);
@@ -793,19 +801,28 @@ contract RepositoryFacet is AccessControlBase {
         emit VariantShuffled(collectionId, tokenId, variant, collectionId, tier, LibMeta.msgSender());
     }
 
-    function resetVariantAssignment(uint256 collectionId, uint8 tier, uint256 tokenId) external onlyAuthorized whenNotPaused {
+    function resetVariantAssignment(uint256 collectionId, uint8 tier, uint256 tokenId) external onlyAuthorized whenNotPaused validCollection(collectionId) {
         LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
-        
-        uint8 variant = cs.itemsVariants[collectionId][tier][tokenId];
-        if (variant > 0) {
-            unchecked {
-                cs.hitVariantsCounters[collectionId][tier][variant]--;
+
+        uint8 previousVariant = cs.itemsVariants[collectionId][tier][tokenId];
+
+        // Decrement old variant counter (safe check to avoid underflow)
+        if (previousVariant > 0) {
+            if (cs.hitVariantsCounters[collectionId][tier][previousVariant] > 0) {
+                cs.hitVariantsCounters[collectionId][tier][previousVariant]--;
             }
         }
-        
-        delete cs.itemsVariants[collectionId][tier][tokenId];
+
+        // Increment variant 0 counter if variant 0 is configured
+        if (cs.tierVariants[collectionId][tier][0].maxSupply > 0) {
+            cs.hitVariantsCounters[collectionId][tier][0]++;
+        }
+
+        // Reset token variant to 0 (base state)
+        cs.itemsVariants[collectionId][tier][tokenId] = 0;
         delete cs.collectionItemsVarianted[collectionId][tokenId];
-        
+
+        // Notify collection contract
         (address collectionAddress,, bool exists) = LibCollectionStorage.getCollectionInfo(collectionId);
         if (exists && collectionAddress != address(0)) {
             try ISpecimenCollection(collectionAddress).resetVariant(collectionId, tier, tokenId) {
@@ -814,6 +831,8 @@ contract RepositoryFacet is AccessControlBase {
                 // Collection doesn't support reset - that's OK
             }
         }
+
+        emit VariantShuffled(collectionId, tokenId, 0, collectionId, tier, LibMeta.msgSender());
     }
 
     /**
@@ -838,24 +857,32 @@ contract RepositoryFacet is AccessControlBase {
         (address collectionAddress,, bool exists) = LibCollectionStorage.getCollectionInfo(collectionId);
         bool notifyCollection = exists && collectionAddress != address(0);
         
+        // Check if variant 0 is configured (once for all tokens)
+        bool hasVariant0 = cs.tierVariants[collectionId][tier][0].maxSupply > 0;
+
         // Process each token
         for (uint256 i = 0; i < tokenIds.length; i++) {
             uint256 tokenId = tokenIds[i];
-            
+
             // Get current variant
             uint8 variant = cs.itemsVariants[collectionId][tier][tokenId];
-            
-            // Decrement counter only if variant was assigned
+
+            // Decrement counter only if variant was assigned (safe check)
             if (variant > 0) {
-                unchecked {
+                if (cs.hitVariantsCounters[collectionId][tier][variant] > 0) {
                     cs.hitVariantsCounters[collectionId][tier][variant]--;
                 }
             }
-            
-            // Reset storage mappings
-            delete cs.itemsVariants[collectionId][tier][tokenId];
+
+            // Increment variant 0 counter
+            if (hasVariant0) {
+                cs.hitVariantsCounters[collectionId][tier][0]++;
+            }
+
+            // Reset token variant to 0 (base state)
+            cs.itemsVariants[collectionId][tier][tokenId] = 0;
             delete cs.collectionItemsVarianted[collectionId][tokenId];
-            
+
             // Notify collection contract if possible
             if (notifyCollection) {
                 try ISpecimenCollection(collectionAddress).resetVariant(collectionId, tier, tokenId) {

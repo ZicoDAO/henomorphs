@@ -1043,6 +1043,48 @@ contract TerritoryResourceFacet is AccessControlBase {
         return 300;                    // Legendary: 3.0x
     }
 
+    // ==================== NODE TYPE CHANGE ====================
+
+    event ResourceNodeTypeChanged(uint256 indexed territoryId, uint8 oldType, uint8 newType, uint256 fee);
+    error SameResourceType(uint256 territoryId, uint8 resourceType);
+
+    /**
+     * @notice Change resource type of existing node (keeps level)
+     * @param territoryId Territory with the node
+     * @param newResourceType New resource type (0=Basic, 1=Energy, 2=Bio, 3=Rare)
+     */
+    function changeNodeResourceType(
+        uint256 territoryId,
+        uint8 newResourceType
+    ) external whenNotPaused {
+        bytes32 colonyId = _getCallerColonyId();
+        _requireTerritoryControl(territoryId, colonyId);
+
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibColonyWarsStorage.ResourceNode storage node = cws.territoryResourceNodes[territoryId];
+
+        if (!node.active) revert ResourceNodeNotFound(territoryId);
+        if (uint8(node.resourceType) == newResourceType) revert SameResourceType(territoryId, newResourceType);
+
+        // Validate new type fits territory
+        LibColonyWarsStorage.Territory storage territory = cws.territories[territoryId];
+        if (!_isValidResourceTypeForTerritory(territory.territoryType, newResourceType)) {
+            revert InvalidTerritoryForResourceType(territoryId, newResourceType);
+        }
+
+        // Fee: same as upgrade cost at current level
+        uint256 fee = 50 ether * node.nodeLevel;
+        _chargeGovernanceToken(fee);
+
+        // Unstake mismatched resource cards
+        _forceUnstakeAllCards(territoryId, cws);
+
+        uint8 oldType = uint8(node.resourceType);
+        node.resourceType = LibColonyWarsStorage.ResourceType(newResourceType);
+
+        emit ResourceNodeTypeChanged(territoryId, oldType, newResourceType, fee);
+    }
+
     // ==================== NODE REMOVAL ====================
 
     /**
@@ -1398,6 +1440,29 @@ contract TerritoryResourceFacet is AccessControlBase {
             config.minResourceAmount,
             config.enabled
         );
+    }
+
+    /**
+     * @notice Admin: Change node resource type without losing level or other data
+     * @param territoryId Territory with the node
+     * @param newResourceType New resource type (0=Basic, 1=Energy, 2=Bio, 3=Rare)
+     * @dev ADMIN ONLY. Does NOT validate territory type. Unstakes mismatched cards.
+     */
+    function adminSetNodeResourceType(
+        uint256 territoryId,
+        uint8 newResourceType
+    ) external onlyAuthorized {
+        if (newResourceType > 3) revert InvalidTerritoryForResourceType(territoryId, newResourceType);
+
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibColonyWarsStorage.ResourceNode storage node = cws.territoryResourceNodes[territoryId];
+
+        if (!node.active) revert ResourceNodeNotFound(territoryId);
+
+        // Force unstake resource cards (they may not match new type)
+        _forceUnstakeAllCards(territoryId, cws);
+
+        node.resourceType = LibColonyWarsStorage.ResourceType(newResourceType);
     }
 
     /**

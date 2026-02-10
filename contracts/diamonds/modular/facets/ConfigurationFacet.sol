@@ -105,6 +105,9 @@ contract ConfigurationFacet is AccessControlBase {
     event CouponTargetRestrictionsChanged(uint256 indexed couponCollectionId, bool hasRestrictions);
     event MintingRollingAllowedChanged(uint256 indexed collectionId, uint8 indexed tier, bool allowed);
     event MintingConfigFixed(uint256 indexed collectionId, uint8 indexed tier, string changes);
+    event MintConduitRegistered(address indexed conduitAddress, bool active);
+    event MintConduitStatusChanged(address indexed conduitAddress, bool active);
+    event MintConduitTargetsUpdated(address indexed conduitAddress, uint256[] targetCollectionIds, bool enabled);
 
     // ==================== ERRORS ====================
     
@@ -629,6 +632,70 @@ contract ConfigurationFacet is AccessControlBase {
         emit OwnershipTransferred(oldOwner, newOwner);
     }
 
+    // ==================== MINT CONDUIT CONFIGURATION ====================
+
+    /// @notice Register an external collection as a mint conduit
+    /// @dev If targetCollectionIds is non-empty, target restrictions are automatically enabled
+    /// @param conduitAddress Address of the IMintConduit collection
+    /// @param targetCollectionIds Allowed target collection IDs (empty = no restrictions)
+    function registerMintConduit(
+        address conduitAddress,
+        uint256[] calldata targetCollectionIds
+    ) external onlyAuthorized whenNotPaused {
+        if (conduitAddress == address(0)) revert InvalidAddress();
+
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+
+        bool hasRestrictions = targetCollectionIds.length > 0;
+
+        cs.mintConduitConfigs[conduitAddress] = LibCollectionStorage.MintConduitConfig({
+            conduitAddress: conduitAddress,
+            active: true,
+            hasTargetRestrictions: hasRestrictions
+        });
+
+        for (uint256 i = 0; i < targetCollectionIds.length; i++) {
+            cs.mintConduitValidForTarget[conduitAddress][targetCollectionIds[i]] = true;
+        }
+
+        emit MintConduitRegistered(conduitAddress, true);
+        if (hasRestrictions) {
+            emit MintConduitTargetsUpdated(conduitAddress, targetCollectionIds, true);
+        }
+    }
+
+    /// @notice Update a mint conduit configuration (active status and targets)
+    /// @dev Pass targetCollectionIds with enabled=true to add targets, enabled=false to remove
+    /// @param conduitAddress Conduit contract address
+    /// @param active Whether the conduit should be active
+    /// @param targetCollectionIds Target collection IDs to update
+    /// @param enabled Enable or disable these specific targets
+    function updateMintConduit(
+        address conduitAddress,
+        bool active,
+        uint256[] calldata targetCollectionIds,
+        bool enabled
+    ) external onlyAuthorized whenNotPaused {
+        if (conduitAddress == address(0)) revert InvalidAddress();
+
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+
+        cs.mintConduitConfigs[conduitAddress].active = active;
+
+        for (uint256 i = 0; i < targetCollectionIds.length; i++) {
+            cs.mintConduitValidForTarget[conduitAddress][targetCollectionIds[i]] = enabled;
+        }
+
+        if (enabled && targetCollectionIds.length > 0) {
+            cs.mintConduitConfigs[conduitAddress].hasTargetRestrictions = true;
+        }
+
+        emit MintConduitStatusChanged(conduitAddress, active);
+        if (targetCollectionIds.length > 0) {
+            emit MintConduitTargetsUpdated(conduitAddress, targetCollectionIds, enabled);
+        }
+    }
+
     // ==================== ADMIN UTILITIES ====================
 
     function emergencyResetCoupon(
@@ -898,6 +965,48 @@ contract ConfigurationFacet is AccessControlBase {
         } else {
             return (false, 0, [uint80(0), uint80(0)]);
         }
+    }
+
+    // ==================== MINT CONDUIT VIEW FUNCTIONS ====================
+
+    /// @notice Get mint conduit configuration
+    /// @param conduitAddress Conduit contract address
+    /// @return config The conduit configuration
+    /// @return exists Whether the conduit is registered
+    function getMintConduitConfig(
+        address conduitAddress
+    ) external view returns (LibCollectionStorage.MintConduitConfig memory config, bool exists) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        config = cs.mintConduitConfigs[conduitAddress];
+        exists = config.conduitAddress != address(0);
+    }
+
+    /// @notice Check if a mint conduit is valid for a target collection
+    /// @param conduitAddress Conduit contract address
+    /// @param targetCollectionId Target collection ID
+    /// @return isValid Whether the conduit can mint for this target
+    function isMintConduitValidForCollection(
+        address conduitAddress,
+        uint256 targetCollectionId
+    ) external view returns (bool isValid) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        LibCollectionStorage.MintConduitConfig storage config = cs.mintConduitConfigs[conduitAddress];
+
+        if (config.conduitAddress == address(0) || !config.active) return false;
+        if (!config.hasTargetRestrictions) return true;
+        return cs.mintConduitValidForTarget[conduitAddress][targetCollectionId];
+    }
+
+    /// @notice Get total mints performed via a specific conduit token
+    /// @param conduitAddress Conduit contract address
+    /// @param conduitTokenId Conduit token ID
+    /// @return totalMinted Total tokens minted using this conduit token
+    function getMintConduitTokenUsage(
+        address conduitAddress,
+        uint256 conduitTokenId
+    ) external view returns (uint256 totalMinted) {
+        LibCollectionStorage.CollectionStorage storage cs = LibCollectionStorage.collectionStorage();
+        return cs.mintConduitTokenUsage[conduitAddress][conduitTokenId];
     }
 
     // ==================== ADDITIONAL VIEW FUNCTIONS ====================

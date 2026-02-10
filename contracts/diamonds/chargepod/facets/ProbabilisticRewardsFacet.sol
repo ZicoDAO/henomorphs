@@ -161,7 +161,19 @@ contract ProbabilisticRewardsFacet is AccessControlBase {
         
         // Apply critical hit
         if (ps.probabilisticConfig.criticalHitsEnabled) {
-            (bool isCrit, uint256 critBonus) = _rollCriticalHit(user, tokenId, totalReward);
+            bool isCrit;
+            uint256 critBonus;
+
+            // GUARANTEED_CRIT premium (use-based, 10 uses)
+            LibPremiumStorage.PremiumAction storage critPrem = ps.userActions[user][LibPremiumStorage.ActionType.GUARANTEED_CRIT];
+            if (critPrem.active && critPrem.usesRemaining > 0) {
+                isCrit = true;
+                critBonus = (totalReward * (ps.probabilisticConfig.critMultiplier - 100)) / 100;
+                LibPremiumStorage.consumeUse(ps, user, LibPremiumStorage.ActionType.GUARANTEED_CRIT);
+            } else {
+                (isCrit, critBonus) = _rollCriticalHit(user, tokenId, totalReward);
+            }
+
             if (isCrit) {
                 totalReward += critBonus;
                 ps.probabilisticUserData[user].totalCriticalHits++;
@@ -261,18 +273,27 @@ contract ProbabilisticRewardsFacet is AccessControlBase {
         // Roll for drop
         uint256 roll = _random(user, tokenId) % 10000;
         uint256 cumulativeChance = 0;
-        
+
+        // ENHANCED_DROPS premium (duration-based, 2x drop chances)
+        uint256 dropMultiplier = 1;
+        {
+            LibPremiumStorage.PremiumAction storage dropPrem = ps.userActions[user][LibPremiumStorage.ActionType.ENHANCED_DROPS];
+            if (dropPrem.active && dropPrem.expiresAt > block.timestamp) {
+                dropMultiplier = 2;
+            }
+        }
+
         // Check legendary first (with pity boost)
-        cumulativeChance += ps.dropRarities[4].chance + legendaryBoost;
+        cumulativeChance += ps.dropRarities[4].chance * dropMultiplier + legendaryBoost;
         if (roll < cumulativeChance) {
             reward = _calculateDropReward(4);
             _awardResources(user, ps.dropRarities[4].resourceCount);
             return (true, 4, reward);
         }
-        
+
         // Check other rarities (descending)
         for (uint8 i = 3; i > 0; i--) {
-            cumulativeChance += ps.dropRarities[i].chance;
+            cumulativeChance += ps.dropRarities[i].chance * dropMultiplier;
             if (roll < cumulativeChance) {
                 reward = _calculateDropReward(i);
                 if (ps.dropRarities[i].resourceCount > 0) {
@@ -281,9 +302,9 @@ contract ProbabilisticRewardsFacet is AccessControlBase {
                 return (true, i, reward);
             }
         }
-        
+
         // Common drop
-        cumulativeChance += ps.dropRarities[0].chance;
+        cumulativeChance += ps.dropRarities[0].chance * dropMultiplier;
         if (roll < cumulativeChance) {
             return (true, 0, _calculateDropReward(0));
         }
