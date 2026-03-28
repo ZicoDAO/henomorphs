@@ -1061,12 +1061,10 @@ contract MissionFacet is AccessControlBase {
         // Check collection eligibility
         _checkCollectionEligibility(passCollection, uint16(collectionId));
 
-        // Check ownership and state
+        // Check ownership and state (supports both wallet-owned and staked tokens via AccessHelper)
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
-        SpecimenCollection storage collection = hs.specimenCollections[collectionId];
-        address actualOwner = IERC721(collection.collectionAddress).ownerOf(tokenId);
-        if (actualOwner != owner) {
-            revert ParticipantNotOwned(combinedId, owner, actualOwner);
+        if (!AccessHelper.checkTokenOwnership(collectionId, tokenId, owner, AccessHelper.getStakingAddress())) {
+            revert ParticipantNotOwned(combinedId, owner, address(0));
         }
 
         // Check not already locked

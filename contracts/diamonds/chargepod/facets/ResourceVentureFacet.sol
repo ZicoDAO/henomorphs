@@ -365,6 +365,9 @@ contract ResourceVentureFacet is AccessControlBase {
             }
         }
 
+        // Apply decay before distributing rewards (prevents stale lastDecayUpdate)
+        LibResourceStorage.applyResourceDecay(caller);
+
         // Distribute rewards
         for (uint8 i = 0; i < 4; i++) {
             if (rewards[i] > 0) {
@@ -454,6 +457,9 @@ contract ResourceVentureFacet is AccessControlBase {
         // Return portion based on progress (max 50% return even at 100% progress)
         uint256[4] memory returned;
         uint256[4] memory lost;
+
+        // Apply decay before returning resources (prevents stale lastDecayUpdate)
+        LibResourceStorage.applyResourceDecay(caller);
 
         for (uint8 i = 0; i < 4; i++) {
             if (venture.stakedResources[i] > 0) {

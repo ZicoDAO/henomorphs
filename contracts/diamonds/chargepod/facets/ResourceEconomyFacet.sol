@@ -24,7 +24,7 @@ interface IRewardToken is IERC20 {
 /**
  * @title ResourceEconomyFacet
  * @notice Manages resource nodes, harvesting, and colony resource balances
- * @dev MODUĹ 6 - Dual Token Economy Implementation
+ * @dev MODUŁ 6 - Dual Token Economy Implementation
  *
  * NOTE: This facet uses economyResourceNodes (keyed by auto-increment economyNodeId),
  * separate from territoryResourceNodes used by TerritoryResourceFacet (keyed by territoryId).
@@ -100,8 +100,9 @@ contract ResourceEconomyFacet is AccessControlBase {
     uint32 constant MAINTENANCE_PERIOD = 7 days; // Maintenance grace period before penalties
     
     // Constants - Node Costs (ZICO)
-    uint256 constant NODE_CREATION_COST_PER_LEVEL = 100 ether; // 100 ZICO per level
-    uint256 constant NODE_UPGRADE_COST_MULTIPLIER = 200 ether; // 200 ZICO * current level
+    // Both creation and upgrade use the same base rate so both paths cost the same
+    uint256 constant NODE_BASE_COST = 100 ether; // Base cost for level 1 creation
+    uint256 constant NODE_COST_PER_LEVEL = 100 ether; // 100 ZICO per level (upgrade & creation)
 
     // ============================================================================
     // RESOURCE NODE MANAGEMENT - ZICO OPERATIONS
@@ -137,8 +138,9 @@ contract ResourceEconomyFacet is AccessControlBase {
             revert TerritoryNotControlled();
         }
         
-        // Calculate primary currency cost: 100 per node level
-        uint256 creationCost = uint256(nodeLevel) * NODE_CREATION_COST_PER_LEVEL;
+        // Creation cost = base + cumulative upgrade costs (same total as upgrading from lvl 1)
+        uint256 level = uint256(nodeLevel);
+        uint256 creationCost = NODE_BASE_COST + NODE_COST_PER_LEVEL * level * (level - 1) / 2;
 
         // Collect primary currency fee (Premium token for strategic investments)
         LibFeeCollection.collectFee(
@@ -189,8 +191,8 @@ contract ResourceEconomyFacet is AccessControlBase {
             revert TerritoryNotControlled();
         }
         
-        // Calculate ZICO cost: 200 ZICO * current level
-        uint256 upgradeCost = uint256(node.nodeLevel) * NODE_UPGRADE_COST_MULTIPLIER;
+        // Upgrade cost: 100 ZICO * current level
+        uint256 upgradeCost = uint256(node.nodeLevel) * NODE_COST_PER_LEVEL;
 
         // Collect primary currency fee (Premium token for upgrades)
         LibFeeCollection.collectFee(
@@ -297,7 +299,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         }
 
         // Reward auxiliary currency (Utility token for daily activities)
-        // Uses Treasury â†’ Mint fallback pattern for sustainable tokenomics
+        // Uses Treasury → Mint fallback pattern for sustainable tokenomics
         address auxiliaryCurrency = ResourceHelper.getAuxiliaryCurrency();
         if (auxiliaryCurrency != address(0) && tokenReward > 0) {
             _distributeYlwReward(auxiliaryCurrency, LibMeta.msgSender(), tokenReward);
@@ -368,6 +370,24 @@ contract ResourceEconomyFacet is AccessControlBase {
     error RequisitionCooldown(uint32 remaining);
     error RequisitionDailyCap(uint256 remaining);
     error RequisitionInsufficientColonyResources(uint8 resourceType, uint256 requested, uint256 available);
+
+    // ============================================================================
+    // COLONY RESOURCE SUPPLY (personal → colony)
+    // ============================================================================
+
+    event ColonyResourcesSupplied(
+        bytes32 indexed colonyId,
+        address indexed user,
+        uint8 resourceType,
+        uint256 supplied,
+        uint256 colonyReceived,
+        uint256 bonusAmount
+    );
+
+    error SupplyDisabled();
+    error SupplyCooldown(uint32 remaining);
+    error SupplyDailyCap(uint256 remaining);
+    error SupplyInsufficientResources(uint8 resourceType, uint256 requested, uint256 available);
 
     /**
      * @notice Requisition resources from colony pool to personal balance
@@ -502,6 +522,138 @@ contract ResourceEconomyFacet is AccessControlBase {
         dailyRemaining = dailyCap > usedToday ? dailyCap - usedToday : 0;
     }
 
+    /**
+     * @notice Supply personal resources to colony pool
+     * @dev Reverse of requisitionResources(). Colony receives amount + bonus.
+     *      Trade Hub building increases the bonus.
+     * @param resourceType Resource type (0=Basic, 1=Energy, 2=Bio, 3=Rare)
+     * @param amount Amount to supply from personal balance
+     */
+    function supplyColonyResources(
+        uint8 resourceType,
+        uint256 amount
+    ) external whenNotPaused nonReentrant {
+        require(amount > 0, "Zero amount");
+        require(resourceType <= 3, "Invalid type");
+
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        if (!rs.contributionEnabled) revert SupplyDisabled();
+
+        address caller = LibMeta.msgSender();
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
+        require(colonyId != bytes32(0), "No colony");
+
+        // Cooldown check
+        uint32 lastTime = rs.lastContributionTime[caller];
+        if (lastTime > 0 && block.timestamp < lastTime + rs.contributionCooldown) {
+            revert SupplyCooldown(
+                uint32(lastTime + rs.contributionCooldown - block.timestamp)
+            );
+        }
+
+        // Daily cap check
+        uint32 today = uint32(block.timestamp / 86400);
+        if (rs.contributionDailyCap > 0) {
+            uint256 usedToday = rs.dailyContributed[caller][today];
+            if (usedToday + amount > rs.contributionDailyCap) {
+                revert SupplyDailyCap(rs.contributionDailyCap - usedToday);
+            }
+        }
+
+        // Apply decay before checking balance
+        LibResourceStorage.applyResourceDecay(caller);
+
+        // Check user has enough
+        uint256 available = rs.userResources[caller][resourceType];
+        if (available < amount) {
+            revert SupplyInsufficientResources(resourceType, amount, available);
+        }
+
+        // Calculate bonus (Trade Hub increases it)
+        uint16 bonusBps = rs.contributionBonusBps;
+        {
+            LibBuildingsStorage.ColonyBuildingEffects memory effects =
+                LibBuildingsStorage.getColonyBuildingEffects(colonyId);
+            if (effects.marketFeeReductionBps > 0 && bonusBps > 0) {
+                uint16 extraBonus = uint16((uint256(bonusBps) * effects.marketFeeReductionBps) / 10000);
+                bonusBps = bonusBps + extraBonus;
+            }
+        }
+
+        uint256 bonusAmount = (amount * bonusBps) / 10000;
+        uint256 colonyReceived = amount + bonusAmount;
+
+        // Deduct from user
+        rs.userResources[caller][resourceType] -= amount;
+
+        // Add to colony (amount + bonus)
+        LibColonyWarsStorage.ResourceBalance storage balance = cws.colonyResources[colonyId];
+        ResourceHelper.addResources(balance, LibColonyWarsStorage.ResourceType(resourceType), colonyReceived);
+
+        // Track bonus in global supply (bonus is new resource creation)
+        if (bonusAmount > 0) {
+            LibResourceStorage.incrementGlobalSupply(resourceType, bonusAmount);
+        }
+
+        // Collect YLW fee
+        LibColonyWarsStorage.OperationFee storage fee =
+            LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_PROCESSING);
+        if (fee.enabled) {
+            LibFeeCollection.processConfiguredFee(fee, caller, "resource_contribution");
+        }
+
+        // Track
+        rs.lastContributionTime[caller] = uint32(block.timestamp);
+        rs.dailyContributed[caller][today] += amount;
+
+        emit ColonyResourcesSupplied(colonyId, caller, resourceType, amount, colonyReceived, bonusAmount);
+    }
+
+    /**
+     * @notice Configure colony supply system
+     */
+    function setColonySupplyConfig(
+        bool enabled,
+        uint16 bonusBps,
+        uint32 cooldown,
+        uint256 dailyCap
+    ) external onlyAuthorized {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+        rs.contributionEnabled = enabled;
+        rs.contributionBonusBps = bonusBps;
+        rs.contributionCooldown = cooldown;
+        rs.contributionDailyCap = dailyCap;
+    }
+
+    /**
+     * @notice Get colony supply info for user
+     */
+    function getColonySupplyInfo(address user) external view returns (
+        bool enabled,
+        uint16 bonusBps,
+        uint32 cooldownRemaining,
+        uint256 dailyRemaining,
+        uint256 dailyCap
+    ) {
+        LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
+
+        enabled = rs.contributionEnabled;
+        bonusBps = rs.contributionBonusBps;
+        dailyCap = rs.contributionDailyCap;
+
+        uint32 lastTime = rs.lastContributionTime[user];
+        uint32 cooldownEnd = lastTime + rs.contributionCooldown;
+        cooldownRemaining = block.timestamp < cooldownEnd
+            ? uint32(cooldownEnd - block.timestamp)
+            : 0;
+
+        uint32 today = uint32(block.timestamp / 86400);
+        uint256 usedToday = rs.dailyContributed[user][today];
+        dailyRemaining = dailyCap > usedToday ? dailyCap - usedToday : 0;
+    }
+
     // ============================================================================
     // VIEW FUNCTIONS
     // ============================================================================
@@ -622,7 +774,8 @@ contract ResourceEconomyFacet is AccessControlBase {
         returns (uint256 zicoCost) 
     {
         if (nodeLevel == 0 || nodeLevel > MAX_NODE_LEVEL) return 0;
-        return uint256(nodeLevel) * NODE_CREATION_COST_PER_LEVEL;
+        uint256 level = uint256(nodeLevel);
+        return NODE_BASE_COST + NODE_COST_PER_LEVEL * level * (level - 1) / 2;
     }
 
     /**
@@ -639,7 +792,7 @@ contract ResourceEconomyFacet is AccessControlBase {
             LibColonyWarsStorage.colonyWarsStorage().economyResourceNodes[nodeId];
 
         if (!node.active || node.nodeLevel >= MAX_NODE_LEVEL) return 0;
-        return uint256(node.nodeLevel) * NODE_UPGRADE_COST_MULTIPLIER;
+        return uint256(node.nodeLevel) * NODE_COST_PER_LEVEL;
     }
 
     /**
@@ -827,7 +980,7 @@ contract ResourceEconomyFacet is AccessControlBase {
 
             // Upgrade cost (0 if already max level)
             if (node.nodeLevel < MAX_NODE_LEVEL) {
-                upgradeCostZico = uint256(node.nodeLevel) * NODE_UPGRADE_COST_MULTIPLIER;
+                upgradeCostZico = uint256(node.nodeLevel) * NODE_COST_PER_LEVEL;
             }
         }
     }
@@ -908,7 +1061,7 @@ contract ResourceEconomyFacet is AccessControlBase {
 
                 // Upgrade cost (0 if already max level)
                 if (node.nodeLevel < MAX_NODE_LEVEL) {
-                    upgradeCostsZico[i] = uint256(node.nodeLevel) * NODE_UPGRADE_COST_MULTIPLIER;
+                    upgradeCostsZico[i] = uint256(node.nodeLevel) * NODE_COST_PER_LEVEL;
                 }
             }
         }
@@ -1020,7 +1173,7 @@ contract ResourceEconomyFacet is AccessControlBase {
     // ============================================================================
 
     /**
-     * @notice Distribute YLW reward with Treasury â†’ Mint fallback
+     * @notice Distribute YLW reward with Treasury → Mint fallback
      * @dev Priority: 1) Transfer from treasury, 2) Mint if treasury insufficient
      * @param rewardToken YLW token address
      * @param recipient User receiving the reward
@@ -1811,11 +1964,11 @@ contract ResourceEconomyFacet is AccessControlBase {
     /**
      * @notice Initialize default crafting tiers (ADMIN ONLY)
      * @dev Sets default tier thresholds:
-     *      - Tier 0: 5,000 â†’ Common
-     *      - Tier 1: 10,000 â†’ Uncommon
-     *      - Tier 2: 25,000 â†’ Rare
-     *      - Tier 3: 50,000 â†’ Epic
-     *      - Tier 4: 100,000 â†’ Legendary
+     *      - Tier 0: 5,000 → Common
+     *      - Tier 1: 10,000 → Uncommon
+     *      - Tier 2: 25,000 → Rare
+     *      - Tier 3: 50,000 → Epic
+     *      - Tier 4: 100,000 → Legendary
      */
     function initializeCraftingTiers() external onlyAuthorized {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();

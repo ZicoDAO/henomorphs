@@ -241,18 +241,19 @@ contract StakingEarningsFacet is AccessControlBase {
         amount = _calculateReward(collectionId, tokenId, staked, ss);
         if (amount == 0) revert NothingToClaim();
         
-        // Check shared daily limit
+        // Cap to shared daily limit (same pattern as processUnstakeRewards)
         uint256 availableLimit = LibStakingStorage.getAvailableYlwLimit(ss, sender);
+        if (availableLimit == 0) revert DailyLimitExceeded(amount, 0);
         if (amount > availableLimit) {
-            revert DailyLimitExceeded(amount, availableLimit);
+            amount = availableLimit;
         }
-        
+
         staked.lastClaimTimestamp = uint32(block.timestamp);
         staked.totalRewardsClaimed += amount;
-        
+
         fromTreasury = _distributeReward(ss, sender, amount);
         _tryExpGain(collectionId, tokenId, amount);
-        
+
         // Consume from shared daily limit
         (bool limitOk, ) = LibStakingStorage.checkAndConsumeYlwLimit(ss, sender, amount);
         if (!limitOk) revert DailyLimitExceeded(amount, availableLimit);
@@ -348,9 +349,15 @@ contract StakingEarningsFacet is AccessControlBase {
 
             // Check if adding this reward would exceed available limit
             if (batch.rewardTotal + reward > totalAvailable) {
+                uint256 remaining = totalAvailable - batch.rewardTotal;
+                if (remaining == 0) {
+                    limitReached = true;
+                    emit BatchLimitReached(sender, batch.rewardTotal, maxToCheck - checkedCount);
+                    break;
+                }
+                // Cap this token's reward to fit remaining daily limit
+                reward = remaining;
                 limitReached = true;
-                emit BatchLimitReached(sender, batch.rewardTotal, maxToCheck - checkedCount);
-                break;
             }
 
             unchecked {
@@ -363,6 +370,12 @@ contract StakingEarningsFacet is AccessControlBase {
             _tryExpGain(collectionId, tokenId, reward);
 
             emit RewardClaimed(collectionId, tokenId, sender, reward, false);
+
+            // Stop processing after capped reward filled the limit
+            if (limitReached) {
+                emit BatchLimitReached(sender, batch.rewardTotal, maxToCheck - checkedCount);
+                break;
+            }
         }
 
         // FIX: If no rewards found, return zeros instead of reverting
@@ -458,25 +471,39 @@ contract StakingEarningsFacet is AccessControlBase {
                 if (reward > 0) {
                     // Check if adding this reward would exceed available limit
                     if (rewardTotal + reward > totalAvailable) {
-                        skipped = tokenIds.length - i;
-                        emit BatchLimitReached(sender, rewardTotal, skipped);
-                        break;
+                        uint256 remaining = totalAvailable - rewardTotal;
+                        if (remaining == 0) {
+                            skipped = tokenIds.length - i;
+                            emit BatchLimitReached(sender, rewardTotal, skipped);
+                            break;
+                        }
+                        // Cap reward to remaining daily limit
+                        reward = remaining;
                     }
-                    
+
                     unchecked {
                         rewardTotal += reward;
                         processed++;
                     }
-                    
+
                     staked.lastClaimTimestamp = uint32(block.timestamp);
                     staked.totalRewardsClaimed += reward;
-                    
+
                     _tryExpGain(colId, tokenIds[i], reward);
-                    
+
                     emit RewardClaimed(colId, tokenIds[i], sender, reward, false);
+
+                    // Stop if limit was reached with capped reward
+                    if (rewardTotal >= totalAvailable) {
+                        skipped = tokenIds.length - i - 1;
+                        if (skipped > 0) {
+                            emit BatchLimitReached(sender, rewardTotal, skipped);
+                        }
+                        break;
+                    }
                 }
             }
-            
+
             // If we hit the limit, break outer loop too
             if (skipped > 0) break;
         }
@@ -1467,10 +1494,11 @@ contract StakingEarningsFacet is AccessControlBase {
         amount = _calculateReward(collectionId, tokenId, staked, ss);
         if (amount == 0) revert NothingToClaim();
 
-        // Check shared daily limit
+        // Cap to shared daily limit (same pattern as processUnstakeRewards)
         uint256 availableLimit = LibStakingStorage.getAvailableYlwLimit(ss, recipient);
+        if (availableLimit == 0) revert DailyLimitExceeded(amount, 0);
         if (amount > availableLimit) {
-            revert DailyLimitExceeded(amount, availableLimit);
+            amount = availableLimit;
         }
 
         staked.lastClaimTimestamp = uint32(block.timestamp);

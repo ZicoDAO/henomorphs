@@ -989,6 +989,17 @@ library LibColonyWarsStorage {
          */
         mapping(bytes32 => bytes32[]) colonyProcessingOrders;
 
+        // ============================================
+        // TERRITORY CAPTURE TIMING FIX (APPEND-ONLY)
+        // ============================================
+
+        /**
+         * @notice Actual timestamp when a siege destroyed a territory (damageLevel reached 100)
+         * @dev territoryId => block.timestamp at resolution time
+         * Used for 1-hour exclusive capture window instead of siege.siegeEndTime (which is planned end, not actual)
+         */
+        mapping(uint256 => uint32) territoryDestroyedAt;
+
     }
 
     function colonyWarsStorage() internal pure returns (ColonyWarsStorage storage cws) {

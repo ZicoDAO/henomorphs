@@ -396,6 +396,9 @@ contract ColonyBuildingsFacet is AccessControlBase {
             revert NothingToClaim();
         }
 
+        // Apply decay before adding resources (prevents stale lastDecayUpdate)
+        LibResourceStorage.applyResourceDecay(caller);
+
         // Check supply caps and add resources
         if (basicAmount > 0 && LibResourceStorage.checkSupplyCap(0, basicAmount)) {
             rs.userResources[caller][0] += basicAmount;

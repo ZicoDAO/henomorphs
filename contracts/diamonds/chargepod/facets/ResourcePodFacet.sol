@@ -62,7 +62,12 @@ contract ResourcePodFacet is AccessControlBase {
     error InvalidResearchType(uint8 researchType);
     error TerritoryNotOwned(uint256 territoryId);
     error ExpeditionOnCooldown(uint32 cooldownRemaining);
-    
+    error InfrastructureLevelMaxed(uint8 infrastructureType, uint256 currentLevel);
+
+    // ==================== CONSTANTS ====================
+
+    uint256 constant MAX_INFRASTRUCTURE_LEVEL = 10;
+
     // ==================== INITIALIZATION ====================
     
     /**
@@ -465,6 +470,11 @@ contract ResourcePodFacet is AccessControlBase {
             revert InvalidInfrastructureType(infrastructureType);
         }
 
+        uint256 currentLevel = rs.colonyInfrastructure[colonyId][infrastructureType];
+        if (currentLevel >= MAX_INFRASTRUCTURE_LEVEL) {
+            revert InfrastructureLevelMaxed(infrastructureType, currentLevel);
+        }
+
         LibResourceStorage.applyResourceDecay(user);
 
         // Check and consume resources
@@ -662,6 +672,11 @@ contract ResourcePodFacet is AccessControlBase {
             revert InsufficientPermissions(user, "fund research");
         }
 
+        uint256 currentLevel = rs.colonyInfrastructure[colonyId][researchType];
+        if (currentLevel >= MAX_INFRASTRUCTURE_LEVEL) {
+            revert InfrastructureLevelMaxed(researchType, currentLevel);
+        }
+
         // Apply decay before checking resources
         LibResourceStorage.applyResourceDecay(user);
 
@@ -820,15 +835,22 @@ contract ResourcePodFacet is AccessControlBase {
 
         daysSinceLastDecay = timePassed / 86400;
 
-        // Calculate decay preview for each resource type (same formula as applyResourceDecay)
+        // Cap days to match applyResourceDecay logic
+        uint32 cappedDays = daysSinceLastDecay > 7 ? 7 : daysSinceLastDecay;
+
+        // Calculate decay preview for each resource type (matches applyResourceDecay caps)
         for (uint8 i = 0; i < 4; i++) {
             uint256 currentAmount = resources[i];
             if (currentAmount > 0) {
-                // sqrt-based decay formula
                 uint256 sqrtAmount = _sqrt(currentAmount);
-                uint256 decayAmount = (sqrtAmount * rs.config.baseResourceDecayRate * daysSinceLastDecay) / 100;
+                uint256 decayAmount = (sqrtAmount * rs.config.baseResourceDecayRate * cappedDays) / 100;
 
-                // Minimum decay of 1
+                // Cap at 15% of balance
+                uint256 maxDecay = currentAmount * 15 / 100;
+                if (decayAmount > maxDecay) {
+                    decayAmount = maxDecay;
+                }
+
                 if (decayAmount == 0 && currentAmount > 0) {
                     decayAmount = 1;
                 }

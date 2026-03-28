@@ -311,6 +311,18 @@ library LibResourceStorage {
 
         mapping(address => uint32) lastRequisitionTime;
         mapping(address => mapping(uint32 => uint256)) dailyRequisitioned; // user => day => amount
+
+        // ============================================
+        // COLONY RESOURCE CONTRIBUTION (APPEND-ONLY)
+        // ============================================
+
+        uint16 contributionBonusBps;            // bonus % added to colony (default 1000 = 10%)
+        uint32 contributionCooldown;            // seconds between contributions (default 1h)
+        uint256 contributionDailyCap;           // max resources per user per day (default 500)
+        bool contributionEnabled;
+
+        mapping(address => uint32) lastContributionTime;
+        mapping(address => mapping(uint32 => uint256)) dailyContributed; // user => day => amount
     }
     
     /**
@@ -357,20 +369,26 @@ library LibResourceStorage {
 
         uint32 daysPassed = timePassed / 86400;
 
+        // Cap accumulated days to prevent catastrophic one-time decay
+        // when lastDecayUpdate is stale (e.g. user only used non-decay code paths)
+        if (daysPassed > 7) daysPassed = 7;
+
         // Apply SQRT-based decay to each resource type
         // Formula: decayAmount = sqrt(currentAmount) * baseResourceDecayRate * daysPassed / 100
-        // This creates diminishing decay percentage for larger balances
+        // Capped at 15% of current balance per application to prevent brutal spikes
+        // while still penalizing inactivity meaningfully
         unchecked {
             for (uint8 i = 0; i < 4; i++) {
                 uint256 currentAmount = rs.userResources[user][i];
                 if (currentAmount > 0) {
-                    // Calculate sqrt of current amount (using OpenZeppelin Math.sqrt)
                     uint256 sqrtAmount = currentAmount.sqrt();
-
-                    // Calculate decay: sqrt(amount) * rate * days / 100
-                    // baseResourceDecayRate is in basis points (100 = 1%)
-                    // We divide by 100 to scale sqrt properly
                     uint256 decayAmount = (sqrtAmount * rs.config.baseResourceDecayRate * daysPassed) / 100;
+
+                    // Cap decay at 15% of current balance
+                    uint256 maxDecay = currentAmount * 15 / 100;
+                    if (decayAmount > maxDecay) {
+                        decayAmount = maxDecay;
+                    }
 
                     // Minimum decay of 1 if user has resources and decay rate is > 0
                     if (decayAmount == 0 && currentAmount > 0) {
@@ -383,7 +401,7 @@ library LibResourceStorage {
                         rs.userResources[user][i] = currentAmount - decayAmount;
                     }
                 }
-            }          
+            }
         }
 
         rs.lastDecayUpdate[user] = currentTime;
@@ -397,20 +415,24 @@ library LibResourceStorage {
      */
     function getInfrastructureBonus(bytes32 colonyId, uint8 bonusType) internal view returns (uint16 bonus) {
         ResourceStorage storage rs = resourceStorage();
-        
+        uint256 MAX_INFRA_LEVEL = 10;
+
         bonus = 100; // Base 100% (no bonus)
-        
+
         if (bonusType == 0) { // Processing bonus
-            bonus += uint16(rs.colonyInfrastructure[colonyId][PROCESSING_FACILITY] * 10); // 10% per facility
+            uint256 level = rs.colonyInfrastructure[colonyId][PROCESSING_FACILITY];
+            if (level > MAX_INFRA_LEVEL) level = MAX_INFRA_LEVEL;
+            bonus += uint16(level * 10); // 10% per facility, max +100%
         } else if (bonusType == 1) { // Research bonus
-            bonus += uint16(rs.colonyInfrastructure[colonyId][RESEARCH_LAB] * 15); // 15% per lab
+            uint256 level = rs.colonyInfrastructure[colonyId][RESEARCH_LAB];
+            if (level > MAX_INFRA_LEVEL) level = MAX_INFRA_LEVEL;
+            bonus += uint16(level * 15); // 15% per lab, max +150%
         } else if (bonusType == 2) { // Defense bonus
-            bonus += uint16(rs.colonyInfrastructure[colonyId][DEFENSE_STRUCTURE] * 5); // 5% per structure
+            uint256 level = rs.colonyInfrastructure[colonyId][DEFENSE_STRUCTURE];
+            if (level > MAX_INFRA_LEVEL) level = MAX_INFRA_LEVEL;
+            bonus += uint16(level * 5); // 5% per structure, max +50%
         }
-        
-        // Cap bonuses at reasonable levels
-        if (bonus > 300) bonus = 300; // Max 200% bonus
-        
+
         return bonus;
     }
     

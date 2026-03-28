@@ -13,7 +13,7 @@ import {AccessHelper} from "../../staking/libraries/AccessHelper.sol";
 import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {LibFeeCollection} from "../../staking/libraries/LibFeeCollection.sol";
 import {ChargeCalculator} from "../libraries/ChargeCalculator.sol";
-import {IStakingSystem, IExternalCollection} from "../../staking/interfaces/IStakingInterfaces.sol";
+import {IStakingSystem, IStakingWearFacet, IExternalCollection} from "../../staking/interfaces/IStakingInterfaces.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
 import {LibPremiumStorage} from "../libraries/LibPremiumStorage.sol";
 
@@ -98,13 +98,18 @@ contract RepairFacet is AccessControlBase {
         
         if (operation.wearReduction > 0) {
             (result.wearSuccess, result.actualWearReduced) = _executeWearRepair(
-                collectionId, 
-                tokenId, 
+                collectionId,
+                tokenId,
                 operation.wearReduction,
                 operation.emergencyMode
             );
         }
-        
+
+        // Revert if nothing was actually repaired
+        if (!result.chargeSuccess && !result.wearSuccess) {
+            revert RepairOperationFailed("No repair performed");
+        }
+
         // Calculate and collect fees
         if (!operation.emergencyMode) {
             result.totalCost = _calculateAndCollectFee(
@@ -178,7 +183,7 @@ contract RepairFacet is AccessControlBase {
     }
 
     /**
-     * @notice Batch repair multiple henomorphs
+     * @notice Batch repair multiple henomorphs (admin only, no fees)
      * @param collectionIds Array of collection IDs
      * @param tokenIds Array of token IDs
      * @param operations Array of repair operations
@@ -187,19 +192,40 @@ contract RepairFacet is AccessControlBase {
         uint256[] calldata collectionIds,
         uint256[] calldata tokenIds,
         RepairOperation[] calldata operations
-    ) external onlyAuthorized returns (uint256 successCount) {
+    ) external onlyAuthorized nonReentrant returns (uint256 successCount) {
         uint256 length = collectionIds.length;
 
         if (length != tokenIds.length || length != operations.length || length > MAX_BATCH_SIZE) {
             revert BatchSizeTooLarge();
         }
 
-        uint256 failedCount = 0;
+        uint256 failedCount;
 
         for (uint256 i = 0; i < length;) {
-            try this.executeRepair(collectionIds[i], tokenIds[i], operations[i]) {
+            RepairOperation calldata op = operations[i];
+
+            if ((op.chargePoints == 0 && op.wearReduction == 0) ||
+                op.chargePoints > MAX_REPAIR_AMOUNT ||
+                op.wearReduction > MAX_REPAIR_AMOUNT)
+            {
+                unchecked { ++failedCount; ++i; }
+                continue;
+            }
+
+            bool anySuccess;
+
+            if (op.chargePoints > 0) {
+                (bool cs,) = _executeChargeRepair(collectionIds[i], tokenIds[i], op.chargePoints, op.emergencyMode);
+                if (cs) anySuccess = true;
+            }
+            if (op.wearReduction > 0) {
+                (bool ws,) = _executeWearRepair(collectionIds[i], tokenIds[i], op.wearReduction, op.emergencyMode);
+                if (ws) anySuccess = true;
+            }
+
+            if (anySuccess) {
                 unchecked { ++successCount; }
-            } catch {
+            } else {
                 unchecked { ++failedCount; }
             }
             unchecked { ++i; }
@@ -210,7 +236,7 @@ contract RepairFacet is AccessControlBase {
     }
 
     /**
-     * @notice Batch combined repair with automatic discount
+     * @notice Batch combined repair with bulk fee collection
      * @param collectionIds Array of collection IDs
      * @param tokenIds Array of token IDs
      * @param chargePoints Array of charge points to repair
@@ -224,44 +250,35 @@ contract RepairFacet is AccessControlBase {
         uint256[] calldata chargePoints,
         uint256[] calldata wearReduction
     ) external nonReentrant returns (uint256 successCount, uint256 totalCost) {
-        uint256 length = collectionIds.length;
-
-        if (length != tokenIds.length || length != chargePoints.length ||
-            length != wearReduction.length || length > MAX_BATCH_SIZE) {
+        if (collectionIds.length != tokenIds.length || collectionIds.length != chargePoints.length ||
+            collectionIds.length != wearReduction.length || collectionIds.length > MAX_BATCH_SIZE ||
+            collectionIds.length == 0) {
             revert BatchSizeTooLarge();
         }
 
-        if (length == 0) {
-            revert LibHenomorphsStorage.InvalidCallData();
-        }
+        // Pack both accumulators into one uint256 to reduce stack depth
+        // High 128 bits = totalChargeRepaired, Low 128 bits = totalWearReduced
+        uint256 packed;
 
-        uint256 failedCount = 0;
-
-        for (uint256 i = 0; i < length;) {
-            RepairOperation memory op = RepairOperation({
-                chargePoints: uint128(chargePoints[i]),
-                wearReduction: uint128(wearReduction[i]),
-                emergencyMode: false,
-                skipValidation: false
-            });
-
-            try this.executeRepair(collectionIds[i], tokenIds[i], op) returns (RepairResult memory result) {
-                if (result.chargeSuccess || result.wearSuccess) {
-                    unchecked {
-                        ++successCount;
-                        totalCost += result.totalCost;
-                    }
-                } else {
-                    unchecked { ++failedCount; }
+        for (uint256 i = 0; i < collectionIds.length;) {
+            // Permission + validation moved into helper to reduce stack depth
+            (bool ok, uint256 cr, uint256 wr) = _executeCombinedRepairItem(
+                collectionIds[i], tokenIds[i], chargePoints[i], wearReduction[i]
+            );
+            if (ok) {
+                unchecked {
+                    ++successCount;
+                    packed += (cr << 128) | wr;
                 }
-            } catch {
-                unchecked { ++failedCount; }
             }
-
             unchecked { ++i; }
         }
 
-        emit BatchRepairCompleted(successCount, failedCount);
+        if (packed > 0) {
+            totalCost = _collectBatchRepairFees(packed >> 128, packed & type(uint128).max);
+        }
+
+        emit BatchRepairCompleted(successCount, collectionIds.length - successCount);
         return (successCount, totalCost);
     }
 
@@ -277,50 +294,60 @@ contract RepairFacet is AccessControlBase {
         uint256[] calldata collectionIds,
         uint256[] calldata tokenIds,
         uint256 wearAmount
-    ) 
-        external 
-        nonReentrant 
-        returns (uint256 successCount, uint256 totalCost) 
+    )
+        external
+        nonReentrant
+        returns (uint256 successCount, uint256 totalCost)
     {
-        // Input validation
         if (collectionIds.length == 0 || collectionIds.length > MAX_BATCH_SIZE) {
             revert BatchSizeTooLarge();
         }
-        
         if (collectionIds.length != tokenIds.length) {
             revert LibHenomorphsStorage.InvalidCallData();
         }
-        
         if (wearAmount == 0 || wearAmount > MAX_REPAIR_AMOUNT) {
             revert InvalidRepairAmount();
         }
-        
-        uint256 failedCount = 0;
-        
+
+        uint256 totalWearReduced;
+        uint256 failedCount;
+
         for (uint256 i = 0; i < collectionIds.length;) {
-            RepairOperation memory op = RepairOperation({
-                chargePoints: 0,
-                wearReduction: uint128(wearAmount),
-                emergencyMode: false,
-                skipValidation: false
-            });
-            
-            try this.executeRepair(collectionIds[i], tokenIds[i], op) returns (RepairResult memory result) {
-                if (result.wearSuccess) {
-                    unchecked { 
+            if (_isRepairPermitted(collectionIds[i], tokenIds[i])) {
+                (bool success, uint256 actualReduced) = _executeWearRepair(
+                    collectionIds[i], tokenIds[i], wearAmount, false
+                );
+                if (success && actualReduced > 0) {
+                    unchecked {
                         ++successCount;
-                        totalCost += result.totalCost;
+                        totalWearReduced += actualReduced;
                     }
                 } else {
                     unchecked { ++failedCount; }
                 }
-            } catch {
+            } else {
                 unchecked { ++failedCount; }
             }
-            
             unchecked { ++i; }
         }
-        
+
+        // Collect fee once for all successful repairs
+        if (totalWearReduced > 0) {
+            address user = LibMeta.msgSender();
+            if (!_hasFreeRepairsPremium(user)) {
+                LibColonyWarsStorage.OperationFee storage wearFee =
+                    LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_WEAR_REPAIR);
+                LibFeeCollection.processOperationFee(
+                    wearFee.currency, wearFee.beneficiary, wearFee.baseAmount,
+                    wearFee.multiplier, wearFee.burnOnCollect, wearFee.enabled,
+                    user, totalWearReduced, "batch_wear_repair"
+                );
+            }
+            LibColonyWarsStorage.OperationFee storage wrf =
+                LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_WEAR_REPAIR);
+            totalCost = (wrf.baseAmount * wrf.multiplier * totalWearReduced) / 100;
+        }
+
         emit BatchRepairCompleted(successCount, failedCount);
         return (successCount, totalCost);
     }
@@ -429,9 +456,9 @@ contract RepairFacet is AccessControlBase {
             chargeNeeded = missingCharge > 0;
         }
         
-        // UPDATED: Predict wear repair using unified wear level
+        // Predict wear repair via staking system (cross-diamond call)
         if (wearReduction > 0) {
-            (uint256 currentWear, ) = LibBiopodIntegration.getUnifiedWearLevel(collectionId, tokenId);
+            uint256 currentWear = _getCurrentWear(collectionId, tokenId);
             actualWearRepair = wearReduction > currentWear ? currentWear : wearReduction;
             wearNeeded = currentWear > 0;
         }
@@ -518,7 +545,7 @@ contract RepairFacet is AccessControlBase {
         
         currentCharge = charge.currentCharge;
         maxCharge = charge.maxCharge;
-        (currentWear,) = LibBiopodIntegration.getStakingWearLevel(collectionId, tokenId);
+        currentWear = _getCurrentWear(collectionId, tokenId);
         inRepairMode = (charge.flags & 1) != 0;
         boostEndTime = charge.boostEndTime > block.timestamp ? charge.boostEndTime : 0;
         
@@ -526,6 +553,75 @@ contract RepairFacet is AccessControlBase {
     }
 
     // =================== INTERNAL FUNCTIONS ===================
+
+    /**
+     * @notice Execute combined charge + wear repair for a single token (stack-safe helper)
+     */
+    function _executeCombinedRepairItem(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint256 chargeAmount,
+        uint256 wearAmount
+    ) private returns (bool anySuccess, uint256 chargeRepaired, uint256 wearReduced) {
+        // Validation moved here from main loop to reduce stack depth in caller
+        if (!_isRepairPermitted(collectionId, tokenId) ||
+            (chargeAmount == 0 && wearAmount == 0) ||
+            chargeAmount > MAX_REPAIR_AMOUNT ||
+            wearAmount > MAX_REPAIR_AMOUNT)
+        {
+            return (false, 0, 0);
+        }
+        if (chargeAmount > 0) {
+            (bool cs, uint256 cr) = _executeChargeRepair(collectionId, tokenId, chargeAmount, false);
+            if (cs) {
+                anySuccess = true;
+                chargeRepaired = cr;
+            }
+        }
+        if (wearAmount > 0) {
+            (bool ws, uint256 wr) = _executeWearRepair(collectionId, tokenId, wearAmount, false);
+            if (ws) {
+                anySuccess = true;
+                wearReduced = wr;
+            }
+        }
+    }
+
+    /**
+     * @notice Collect batch repair fees in one go (stack-safe helper)
+     */
+    function _collectBatchRepairFees(
+        uint256 totalChargeRepaired,
+        uint256 totalWearReduced
+    ) private returns (uint256 totalCost) {
+        address user = LibMeta.msgSender();
+
+        if (!_hasFreeRepairsPremium(user)) {
+            if (totalChargeRepaired > 0) {
+                LibColonyWarsStorage.OperationFee storage chargeFee =
+                    LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_CHARGE_REPAIR);
+                LibFeeCollection.processOperationFee(
+                    chargeFee.currency, chargeFee.beneficiary, chargeFee.baseAmount,
+                    chargeFee.multiplier, chargeFee.burnOnCollect, chargeFee.enabled,
+                    user, totalChargeRepaired, "batch_charge_repair"
+                );
+            }
+            if (totalWearReduced > 0) {
+                LibColonyWarsStorage.OperationFee storage wearFee =
+                    LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_WEAR_REPAIR);
+                LibFeeCollection.processOperationFee(
+                    wearFee.currency, wearFee.beneficiary, wearFee.baseAmount,
+                    wearFee.multiplier, wearFee.burnOnCollect, wearFee.enabled,
+                    user, totalWearReduced, "batch_wear_repair"
+                );
+            }
+        }
+
+        LibColonyWarsStorage.OperationFee storage crf = LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_CHARGE_REPAIR);
+        LibColonyWarsStorage.OperationFee storage wrf = LibColonyWarsStorage.getOperationFee(LibColonyWarsStorage.FEE_WEAR_REPAIR);
+        totalCost = (crf.baseAmount * crf.multiplier * totalChargeRepaired) / 100 +
+                    (wrf.baseAmount * wrf.multiplier * totalWearReduced) / 100;
+    }
 
     function _executeChargeRepair(
         uint256 collectionId,
@@ -589,33 +685,30 @@ contract RepairFacet is AccessControlBase {
         uint256 wearReduction,
         bool emergencyMode
     ) internal returns (bool success, uint256 actualReduced) {
-        // UPDATED: Check current wear level using unified function
-        (uint256 currentWear, ) = LibBiopodIntegration.getUnifiedWearLevel(collectionId, tokenId);
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
 
-        if (currentWear == 0) {
-            return (false, 0);
+        // Apply wear repair via dedicated cross-diamond call
+        // applyWearRepairFromChargepod handles: current wear calc, capping, repair time tracking
+        if (hs.stakingSystemAddress != address(0)) {
+            try IStakingWearFacet(hs.stakingSystemAddress).applyWearRepairFromChargepod(
+                collectionId, tokenId, wearReduction
+            ) returns (bool repairSuccess, uint256 repaired) {
+                success = repairSuccess;
+                actualReduced = repaired;
+            } catch {}
         }
 
-        actualReduced = wearReduction > currentWear ? currentWear : wearReduction;
-
-        // Apply wear repair for staked tokens
-        bool repairSuccess = LibBiopodIntegration.applyWearRepair(collectionId, tokenId, actualReduced);
+        // Sync biopod calibration on success
+        if (success && actualReduced > 0) {
+            _syncWearWithBiopod(collectionId, tokenId);
+        }
 
         // Emergency mode always succeeds
-        if (emergencyMode && !repairSuccess) {
-            repairSuccess = true;
+        if (emergencyMode && !success) {
+            success = true;
         }
 
-        // Notify Staking system of wear change (if applicable)
-        if (repairSuccess) {
-            LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
-            if (hs.stakingSystemAddress != address(0)) {
-                uint256 newWear = currentWear > actualReduced ? currentWear - actualReduced : 0;
-                try IStakingSystem(hs.stakingSystemAddress).notifyWearChange(collectionId, tokenId, newWear) {} catch {}
-            }
-        }
-
-        return (repairSuccess, repairSuccess ? actualReduced : 0);
+        return (success, success ? actualReduced : 0);
     }
 
     function _hasFreeRepairsPremium(address user) internal view returns (bool) {
@@ -923,16 +1016,23 @@ contract RepairFacet is AccessControlBase {
         rs.userResources[user][LibResourceStorage.BIO_COMPOUNDS] -= bioCost;
         rs.userResources[user][LibResourceStorage.BASIC_MATERIALS] -= basicCost;
 
-        // Apply wear repair via existing system
-        if (!LibBiopodIntegration.applyWearRepair(collectionId, tokenId, actualReduced)) {
+        // Apply wear repair via dedicated cross-diamond call
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+        bool repairSuccess;
+        if (hs.stakingSystemAddress != address(0)) {
+            try IStakingWearFacet(hs.stakingSystemAddress).applyWearRepairFromChargepod(
+                collectionId, tokenId, actualReduced
+            ) returns (bool success, uint256) {
+                repairSuccess = success;
+            } catch {}
+        }
+        if (!repairSuccess) {
             // Refund resources on failure
             rs.userResources[user][LibResourceStorage.BIO_COMPOUNDS] += bioCost;
             rs.userResources[user][LibResourceStorage.BASIC_MATERIALS] += basicCost;
-            revert RepairOperationFailed("Wear repair via Biopod failed");
+            revert RepairOperationFailed("Wear repair via staking system failed");
         }
-
-        // Notify Staking system of wear change
-        _notifyStakingOfWearChange(collectionId, tokenId, currentWear, actualReduced);
+        _syncWearWithBiopod(collectionId, tokenId);
 
         emit WearRepairedWithResources(collectionId, tokenId, user, actualReduced, bioCost, basicCost);
     }
@@ -1012,18 +1112,66 @@ contract RepairFacet is AccessControlBase {
     }
 
     /**
-     * @notice Get current wear from Biopod
+     * @notice Get current wear level via staking system (cross-diamond) with biopod fallback
      */
     function _getCurrentWear(uint256 collectionId, uint256 tokenId) private view returns (uint256) {
         LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
-        address biopod = hs.specimenCollections[collectionId].biopodAddress;
 
+        // Primary: staking system (authoritative source for staked tokens)
+        if (hs.stakingSystemAddress != address(0)) {
+            try IStakingWearFacet(hs.stakingSystemAddress).getTokenWearData(collectionId, tokenId)
+                returns (uint256 wearLevel, uint256, string memory)
+            {
+                return wearLevel;
+            } catch {}
+        }
+
+        // Fallback: biopod calibration
+        address biopod = hs.specimenCollections[collectionId].biopodAddress;
         if (biopod != address(0)) {
             try ISpecimenBiopod(biopod).probeCalibration(collectionId, tokenId) returns (Calibration memory cal) {
                 return cal.wear;
             } catch {}
         }
         return 0;
+    }
+
+    /**
+     * @notice Sync biopod calibration after wear change
+     */
+    function _syncWearWithBiopod(uint256 collectionId, uint256 tokenId) private {
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+        address biopod = hs.specimenCollections[collectionId].biopodAddress;
+        if (biopod != address(0)) {
+            // Get updated wear from staking system, then write to biopod
+            uint256 newWear = _getCurrentWear(collectionId, tokenId);
+            try ISpecimenBiopod(biopod).probeCalibration(collectionId, tokenId) returns (Calibration memory cal) {
+                try ISpecimenBiopod(biopod).updateCalibrationStatus(collectionId, tokenId, cal.level, newWear) {} catch {}
+            } catch {}
+        }
+    }
+
+    /**
+     * @notice Non-reverting permission check for batch operations
+     * @dev Same logic as _checkRepairPermissions but returns bool
+     */
+    function _isRepairPermitted(uint256 collectionId, uint256 tokenId) private view returns (bool) {
+        LibHenomorphsStorage.HenomorphsStorage storage hs = LibHenomorphsStorage.henomorphsStorage();
+
+        if (collectionId == 0 || collectionId > hs.collectionCounter) {
+            return false;
+        }
+
+        SpecimenCollection storage collection = hs.specimenCollections[collectionId];
+        if (!collection.enabled) {
+            return false;
+        }
+
+        if (AccessHelper.isAuthorized()) {
+            return true;
+        }
+
+        return AccessHelper.checkTokenOwnership(collectionId, tokenId, LibMeta.msgSender(), hs.stakingSystemAddress);
     }
 
     /**

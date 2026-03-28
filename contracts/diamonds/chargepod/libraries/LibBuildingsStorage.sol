@@ -497,15 +497,15 @@ library LibBuildingsStorage {
             return 10000; // 100% - maintenance is current
         }
 
-        // Calculate penalty
+        // Calculate penalty (use uint256 to prevent uint16 overflow when periodsOverdue * penaltyBps > 65535)
         uint32 periodsOverdue = (timeSinceMaintenance - config.maintenancePeriod) / config.maintenancePeriod;
-        uint16 penalty = uint16(periodsOverdue) * config.maintenancePenaltyBps;
+        uint256 penaltyRaw = uint256(periodsOverdue) * uint256(config.maintenancePenaltyBps);
 
-        if (penalty >= 9000) {
+        if (penaltyRaw >= 9000) {
             return 1000; // Minimum 10% effectiveness
         }
 
-        return 10000 - penalty;
+        return 10000 - uint16(penaltyRaw);
     }
 
     /**

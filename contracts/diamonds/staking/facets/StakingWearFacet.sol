@@ -91,6 +91,60 @@ contract StakingWearFacet is AccessControlBase {
     }
 
     /**
+     * @notice Apply wear repair from Chargepod diamond (cross-diamond)
+     * @dev Reverts on auth failure (unlike notifyWearChange which silently returns).
+     *      Updates lastWearRepairTime for proper auto-repair cooldown tracking.
+     * @param collectionId Collection ID
+     * @param tokenId Token ID
+     * @param repairAmount Amount of wear to repair
+     * @return success Whether repair was applied
+     * @return actualRepaired Actual wear points repaired
+     */
+    function applyWearRepairFromChargepod(
+        uint256 collectionId,
+        uint256 tokenId,
+        uint256 repairAmount
+    ) external returns (bool success, uint256 actualRepaired) {
+        LibStakingStorage.StakingStorage storage ss = LibStakingStorage.stakingStorage();
+
+        // Strict auth: only Chargepod diamond
+        if (msg.sender != ss.chargeSystemAddress) {
+            revert UnauthorizedCaller();
+        }
+
+        if (repairAmount == 0 || repairAmount > 100) {
+            revert InvalidWearAmount();
+        }
+
+        uint256 combinedId = PodsUtils.combineIds(collectionId, tokenId);
+        StakedSpecimen storage staked = ss.stakedSpecimens[combinedId];
+
+        if (!staked.staked) {
+            return (false, 0);
+        }
+
+        // Calculate current wear including time-based accumulation
+        uint256 currentWear = LibBiopodIntegration.calculateCurrentWear(collectionId, tokenId);
+        if (currentWear == 0) {
+            return (false, 0);
+        }
+
+        actualRepaired = repairAmount > currentWear ? currentWear : repairAmount;
+        uint256 newWear = currentWear - actualRepaired;
+
+        uint8 oldWear = staked.wearLevel;
+        staked.wearLevel = uint8(newWear);
+        staked.wearPenalty = uint8(LibStakingStorage.calculateWearPenalty(uint8(newWear)));
+        staked.lastWearUpdateTime = uint32(block.timestamp);
+        staked.lastWearRepairTime = uint32(block.timestamp);
+
+        emit WearUpdated(collectionId, tokenId, oldWear, uint8(newWear));
+        emit WearRepaired(collectionId, tokenId, actualRepaired, uint8(newWear));
+
+        return (true, actualRepaired);
+    }
+
+    /**
      * @notice Update wear data from Biopod with improved error handling
      * @param collectionId Collection ID
      * @param tokenId Token ID
@@ -376,22 +430,28 @@ contract StakingWearFacet is AccessControlBase {
         if (repairAmount == 0 || repairAmount > 100) {
             return false;
         }
-        
+
         if (collectionId == 0 || collectionId > ss.collectionCounter) {
             return false;
         }
-        
+
         uint256 combinedId = PodsUtils.combineIds(collectionId, tokenId);
         StakedSpecimen storage staked = ss.stakedSpecimens[combinedId];
-        
+
         if (!staked.staked) {
             return false;
         }
-        
+
         if (staked.owner != sender && !AccessHelper.isAuthorized()) {
             return false;
         }
-        
+
+        // Check if token actually has wear to repair (prevents overcharging in batch)
+        uint256 currentWear = LibBiopodIntegration.calculateCurrentWear(collectionId, tokenId);
+        if (currentWear == 0) {
+            return false;
+        }
+
         return true;
     }
 

@@ -632,6 +632,7 @@ contract TerritorySiegeFacet is AccessControlBase {
                 // If this siege destroyed the territory (brought damage to 100), record siege for capture priority
                 if (previousDamage < 100 && territory.damageLevel >= 100) {
                     cws.lastDestroyingSiegeId[siege.territoryId] = siegeId;
+                    cws.territoryDestroyedAt[siege.territoryId] = uint32(block.timestamp);
                     territoryCaptured = true;
                 }
             }
@@ -1042,12 +1043,17 @@ contract TerritorySiegeFacet is AccessControlBase {
             if (isFullyDamaged) {
                 bytes32 destroyingSiegeId = cws.lastDestroyingSiegeId[territoryId];
                 if (destroyingSiegeId != bytes32(0)) {
-                    LibColonyWarsStorage.TerritorySiege storage destroyingSiege = cws.territorySieges[destroyingSiegeId];
-                    // siegeEndTime is when the siege was resolved (damage applied)
-                    uint32 timeSinceDestruction = uint32(block.timestamp) - destroyingSiege.siegeEndTime;
-                    // Within 1 hour, only the destroyer colony can capture
-                    if (timeSinceDestruction < 3600 && colonyId != destroyingSiege.attackerColony) {
-                        revert CaptureNotYetAllowed();
+                    uint32 destroyedAt = cws.territoryDestroyedAt[territoryId];
+                    // Fallback for sieges resolved before this fix was deployed
+                    if (destroyedAt == 0) {
+                        destroyedAt = cws.territorySieges[destroyingSiegeId].siegeEndTime;
+                    }
+                    // Within 1 hour of actual destruction, only the destroyer colony can capture
+                    if (block.timestamp < uint256(destroyedAt) + 3600) {
+                        LibColonyWarsStorage.TerritorySiege storage destroyingSiege = cws.territorySieges[destroyingSiegeId];
+                        if (colonyId != destroyingSiege.attackerColony) {
+                            revert CaptureNotYetAllowed();
+                        }
                     }
                 }
             }
@@ -1093,9 +1099,12 @@ contract TerritorySiegeFacet is AccessControlBase {
         if (territory.damageLevel > 0) {
             territory.damageLevel = 0;
         }
-        // Clear the destroying siege reference
+        // Clear the destroying siege reference and destruction timestamp
         if (cws.lastDestroyingSiegeId[territoryId] != bytes32(0)) {
             delete cws.lastDestroyingSiegeId[territoryId];
+        }
+        if (cws.territoryDestroyedAt[territoryId] != 0) {
+            delete cws.territoryDestroyedAt[territoryId];
         }
 
         // Add to colony's territory list

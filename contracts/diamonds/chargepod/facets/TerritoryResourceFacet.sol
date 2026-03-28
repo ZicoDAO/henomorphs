@@ -217,7 +217,72 @@ contract TerritoryResourceFacet is AccessControlBase {
 
         emit ResourceNodeHarvested(territoryId, colonyId, uint8(node.resourceType), harvestedAmount);
     }
-    
+
+    /**
+     * @notice Batch harvest resources from multiple territory nodes
+     * @param territoryIds Array of territory IDs to harvest from
+     * @return harvestedAmounts Array of harvested amounts (0 for skipped nodes)
+     * @return totalHarvested Sum of all harvested resources
+     * @dev Skips nodes that are inactive, on cooldown, or not controlled by caller's colony.
+     *      Does NOT revert on individual node failures - returns 0 for those entries.
+     */
+    function batchHarvestResourceNodes(
+        uint256[] calldata territoryIds
+    ) external whenNotPaused returns (uint256[] memory harvestedAmounts, uint256 totalHarvested) {
+        bytes32 colonyId = _getCallerColonyId();
+        address sender = LibMeta.msgSender();
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        uint32 currentTime = uint32(block.timestamp);
+        uint32 cooldown = 86400; // 24 hours
+
+        uint256 length = territoryIds.length;
+        harvestedAmounts = new uint256[](length);
+
+        for (uint256 i = 0; i < length; i++) {
+            uint256 territoryId = territoryIds[i];
+
+            // Skip if territory not controlled by caller's colony
+            if (cws.territories[territoryId].controllingColony != colonyId) continue;
+
+            LibColonyWarsStorage.ResourceNode storage node = cws.territoryResourceNodes[territoryId];
+
+            // Skip inactive nodes
+            if (!node.active) continue;
+
+            // Skip nodes on cooldown
+            if (node.lastHarvestTime > 0 && node.lastHarvestTime <= currentTime) {
+                uint32 timeSinceHarvest = currentTime - node.lastHarvestTime;
+                if (timeSinceHarvest < cooldown) continue;
+            }
+
+            // Calculate production with bonuses
+            uint256 amount = _calculateHarvestAmount(colonyId, node);
+
+            // Apply maintenance penalty
+            if (node.lastMaintenancePaid > 0 && node.lastMaintenancePaid <= currentTime) {
+                uint32 timeSinceMaintenance = currentTime - node.lastMaintenancePaid;
+                if (timeSinceMaintenance > MAINTENANCE_PERIOD) {
+                    uint32 overdueTime = timeSinceMaintenance - MAINTENANCE_PERIOD;
+                    uint256 weeksOverdue = overdueTime / MAINTENANCE_PERIOD;
+                    uint256 penaltyPercent = 50 * (weeksOverdue + 1);
+                    if (penaltyPercent > 90) penaltyPercent = 90;
+                    amount = amount * (100 - penaltyPercent) / 100;
+                }
+            }
+
+            // Update harvest timestamp
+            node.lastHarvestTime = currentTime;
+
+            // Award resources
+            _awardResources(sender, uint8(node.resourceType), amount);
+
+            harvestedAmounts[i] = amount;
+            totalHarvested += amount;
+
+            emit ResourceNodeHarvested(territoryId, colonyId, uint8(node.resourceType), amount);
+        }
+    }
+
     // ==================== VIEW FUNCTIONS ====================
 
     /**

@@ -761,16 +761,23 @@ contract CollaborativeCraftingFacet is AccessControlBase {
         LibResourceStorage.CollaborativeProject storage project,
         LibResourceStorage.ResourceStorage storage rs
     ) internal {
-        // Update colony infrastructure based on project type
+        // Update colony infrastructure based on project type (capped at 10)
+        uint256 MAX_INFRA_LEVEL = 10;
         if (project.projectType == 1) {
             // Infrastructure project -> Processing Facility
-            rs.colonyInfrastructure[project.colonyId][0] += 1;
+            if (rs.colonyInfrastructure[project.colonyId][0] < MAX_INFRA_LEVEL) {
+                rs.colonyInfrastructure[project.colonyId][0] += 1;
+            }
         } else if (project.projectType == 2) {
             // Research project -> Research Lab
-            rs.colonyInfrastructure[project.colonyId][1] += 1;
+            if (rs.colonyInfrastructure[project.colonyId][1] < MAX_INFRA_LEVEL) {
+                rs.colonyInfrastructure[project.colonyId][1] += 1;
+            }
         } else if (project.projectType == 3) {
             // Defense project -> Defense Structure
-            rs.colonyInfrastructure[project.colonyId][2] += 1;
+            if (rs.colonyInfrastructure[project.colonyId][2] < MAX_INFRA_LEVEL) {
+                rs.colonyInfrastructure[project.colonyId][2] += 1;
+            }
         }
         
         // Mint NFT rewards to contributors

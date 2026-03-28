@@ -141,9 +141,8 @@ contract ResourceDecayFacet is AccessControlBase {
     }
     
     /**
-     * @notice Estimate decay using SQRT formula
-     * @dev Uses same formula as LibResourceStorage.applyResourceDecay:
-     *      decayAmount = sqrt(currentAmount) * rate * days / 100
+     * @notice Estimate decay using SQRT formula (matches applyResourceDecay caps)
+     * @dev daysPassed capped at 7, decayAmount capped at 5% of balance
      */
     function estimateDecay(address user) external view returns (uint256[4] memory estimatedDecay) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
@@ -156,22 +155,25 @@ contract ResourceDecayFacet is AccessControlBase {
         if (lastUpdate == 0) return estimatedDecay;
 
         uint32 currentTime = uint32(block.timestamp);
-        // Handle corrupted future timestamp
         if (currentTime <= lastUpdate) return estimatedDecay;
 
         uint32 timePassed = currentTime - lastUpdate;
         if (timePassed < 86400) return estimatedDecay;
 
         uint32 daysPassed = timePassed / 86400;
+        if (daysPassed > 7) daysPassed = 7;
 
         for (uint8 i = 0; i < 4; i++) {
             uint256 currentAmount = rs.userResources[user][i];
             if (currentAmount > 0) {
-                // SQRT-based decay formula (same as LibResourceStorage)
                 uint256 sqrtAmount = Math.sqrt(currentAmount);
                 uint256 decayAmount = (sqrtAmount * rs.config.baseResourceDecayRate * daysPassed) / 100;
 
-                // Minimum decay of 1
+                uint256 maxDecay = currentAmount * 15 / 100;
+                if (decayAmount > maxDecay) {
+                    decayAmount = maxDecay;
+                }
+
                 if (decayAmount == 0 && currentAmount > 0) {
                     decayAmount = 1;
                 }

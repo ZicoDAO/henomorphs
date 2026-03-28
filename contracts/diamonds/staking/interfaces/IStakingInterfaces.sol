@@ -27,9 +27,10 @@ interface IStakingWearFacet {
      */
     function repairTokenWear(uint256 collectionId, uint256 tokenId, uint256 repairAmount) external;
 
-    function getTokenWearData(uint256 collectionId, uint256 tokenId) external view returns (uint256 wearLevel, uint256 wearPenalty);
+    function getTokenWearData(uint256 collectionId, uint256 tokenId) external view returns (uint256 wearLevel, uint256 wearPenalty, string memory dataSource);
     function getWearRepairCost(uint256 wearAmount) external view returns (uint256 cost, address beneficiary);
     function checkAndPerformAutoRepair(uint256 collectionId, uint256 tokenId) external returns (bool repaired);
+    function applyWearRepairFromChargepod(uint256 collectionId, uint256 tokenId, uint256 repairAmount) external returns (bool success, uint256 actualRepaired);
 }
 
 /**
