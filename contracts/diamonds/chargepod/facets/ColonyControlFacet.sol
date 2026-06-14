@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
-import {LibHenomorphsStorage} from "../../chargepod/libraries/LibHenomorphsStorage.sol";
+import {LibHenomorphsStorage} from "../libraries/LibHenomorphsStorage.sol";
 import {LibStakingStorage} from "../../staking/libraries/LibStakingStorage.sol";
+import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {PodsUtils} from "../../../libraries/PodsUtils.sol";
 import {ColonyHelper} from "../../staking/libraries/ColonyHelper.sol";
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
@@ -125,7 +126,21 @@ contract ColonyControlFacet is AccessControlBase {
 
         // Setup colony and get ID
         bytes32 colonyId = _setupColony(colonyName, hs);
-        
+
+        // Auto-set as primary colony if user has none yet. Without this,
+        // a user who joins an alliance before manually setting a primary
+        // gets stuck: changePrimaryColony reverts in-alliance, so they
+        // can never assign one. Maintain/harvest/capture territory all
+        // gate on `getUserPrimaryColony(msg.sender) == territory.controllingColony`,
+        // so a missing primary effectively soft-bricks their account.
+        // The check is `cws.userPrimaryColony` directly (NOT getUserPrimaryColony,
+        // which falls back to userToColony and would mask "never set explicitly").
+        address creator = LibMeta.msgSender();
+        LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
+        if (cws.userPrimaryColony[creator] == bytes32(0)) {
+            LibColonyWarsStorage.setUserPrimaryColony(creator, colonyId);
+        }
+
         // Process members with resilient approach
         _processColonyMembers(colonyId, collectionIds, tokenIds);
         
@@ -374,8 +389,8 @@ contract ColonyControlFacet is AccessControlBase {
             revert ColonyHelper.ColonyDoesNotExist(colonyId);
         }
         
-        if (!ColonyHelper.isAuthorizedForColony(colonyId, hs.stakingSystemAddress) && !AccessHelper.isAuthorized()) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not authorized for this colony");
+        if (!ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress) && !AccessHelper.isAuthorized()) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Only colony creator or admin");
         }
         
         // Validate criteria with proper error handling
@@ -424,8 +439,8 @@ contract ColonyControlFacet is AccessControlBase {
             revert ColonyHelper.ColonyDoesNotExist(colonyId);
         }
         
-        if (!ColonyHelper.isAuthorizedForColony(colonyId, hs.stakingSystemAddress) && !AccessHelper.isAuthorized()) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not authorized for this colony");
+        if (!ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress) && !AccessHelper.isAuthorized()) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Only colony creator or admin");
         }
         
         if (requestIds.length != approve.length) {
@@ -645,9 +660,9 @@ contract ColonyControlFacet is AccessControlBase {
             revert ColonyHelper.ColonyDoesNotExist(colonyId);
         }
         
-        // More comprehensive authorization check that aligns with other functions
-        if (!ColonyHelper.isAuthorizedForColony(colonyId, stakingSys) && !AccessHelper.isAuthorized()) {
-            revert AccessHelper.Unauthorized(sender, "Not authorized for this colony");
+        // Only colony creator or admin can expel â€” prevents members from removing each other's tokens
+        if (!ColonyHelper.isColonyCreator(colonyId, stakingSys) && !AccessHelper.isAuthorized()) {
+            revert AccessHelper.Unauthorized(sender, "Only colony creator or admin can expel");
         }
         
         // Check if token is in the colony
@@ -700,8 +715,8 @@ contract ColonyControlFacet is AccessControlBase {
             revert ColonyHelper.ColonyDoesNotExist(colonyId);
         }
         
-        if (!ColonyHelper.isAuthorizedForColony(colonyId, hs.stakingSystemAddress) && !AccessHelper.isAuthorized()) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not authorized for this colony");
+        if (!ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress) && !AccessHelper.isAuthorized()) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Only colony creator or admin");
         }
         
         // Notify staking system first

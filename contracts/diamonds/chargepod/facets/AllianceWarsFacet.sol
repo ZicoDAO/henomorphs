@@ -1535,21 +1535,31 @@ contract AllianceWarsFacet is AccessControlBase {
         }
         
         bytes32 currentPrimary = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
-        
+
         // Cannot set same colony as primary
         if (currentPrimary == newPrimaryColony) {
             revert SameColony();
         }
-        
-        // Cannot change while in alliance (prevents manipulation)
-        if (LibColonyWarsStorage.isUserInAlliance(LibMeta.msgSender())) {
-            revert AllianceAlreadyExists(); // Reuse error for "leave alliance first"
+
+        // Cannot change while in alliance (prevents manipulation) â€” UNLESS this is
+        // the user's first-ever primary set. Without this escape, users who joined
+        // an alliance before setting a primary are permanently stuck: they cannot
+        // self-fix and the only path used to be `adminChangePrimaryColony`. The
+        // anti-manipulation intent (don't let alliance members rotate primary to
+        // game maintenance/harvest gating) is preserved â€” once any non-zero
+        // primary is set, the in-alliance lock applies as before.
+        // Direct storage read (NOT getUserPrimaryColony) so we don't accept the
+        // userToColony fallback as "already set".
+        if (cws.userPrimaryColony[LibMeta.msgSender()] != bytes32(0)) {
+            if (LibColonyWarsStorage.isUserInAlliance(LibMeta.msgSender())) {
+                revert AllianceAlreadyExists(); // Reuse error for "leave alliance first"
+            }
         }
-        
+
         // Update primary colony
         LibColonyWarsStorage.setUserPrimaryColony(LibMeta.msgSender(), newPrimaryColony);
         cws.userToColony[LibMeta.msgSender()] = newPrimaryColony;
-        
+
         emit PrimaryColonyChanged(LibMeta.msgSender(), currentPrimary, newPrimaryColony);
     }
 

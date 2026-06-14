@@ -100,8 +100,14 @@ contract ColonyWarsRegistrationFacet is AccessControlBase {
         uint32 currentSeason = cws.currentSeason;
         LibColonyWarsStorage.Season storage season = cws.seasons[currentSeason];
 
-        // Prevent duplicate registrations
-        if (cws.colonyWarProfiles[colonyId].registered) {
+        // Prevent duplicate registrations for the CURRENT season only.
+        // Pre-2026-05-21 this checked profile.registered alone, which blocked
+        // legacy colonies (registered=true with registeredSeasonId=0 because the
+        // field was appended after their original registration) from joining S4
+        // â€” even though captureTerritory grandfather-clauses them in. Aligns the
+        // two paths: stale colonies CAN re-register; only current-season dupes revert.
+        if (cws.colonyWarProfiles[colonyId].registered &&
+            cws.colonyWarProfiles[colonyId].registeredSeasonId == currentSeason) {
             revert InvalidBattleState();
         }
 
@@ -173,22 +179,17 @@ contract ColonyWarsRegistrationFacet is AccessControlBase {
         _removeColonyFromSeason(colonyId, currentSeason, cws);
         _resetColonyWarProfile(colonyId, cws);
 
-        // Remove from user's primary colony if it was primary
+        // Reassign primary if this was the user's primary colony.
+        // Primary anchors resource/territory mechanics independent of warfare â€”
+        // do not require the replacement to be `registered`, and keep the old
+        // primary as a last resort if no alternative exists.
         bytes32 userPrimary = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
         if (userPrimary == colonyId) {
-            // Set new primary from remaining colonies
-            bytes32[] memory userColonies = LibColonyWarsStorage.getUserSeasonColonies(currentSeason, LibMeta.msgSender());
-            bytes32 newPrimary = bytes32(0);
-
-            for (uint256 i = 0; i < userColonies.length; i++) {
-                if (userColonies[i] != colonyId && cws.colonyWarProfiles[userColonies[i]].registered) {
-                    newPrimary = userColonies[i];
-                    break;
-                }
+            bytes32 newPrimary = LibColonyWarsStorage.findFallbackPrimaryColony(LibMeta.msgSender(), colonyId);
+            if (newPrimary != bytes32(0)) {
+                LibColonyWarsStorage.setUserPrimaryColony(LibMeta.msgSender(), newPrimary);
+                cws.userToColony[LibMeta.msgSender()] = newPrimary;
             }
-
-            LibColonyWarsStorage.setUserPrimaryColony(LibMeta.msgSender(), newPrimary);
-            cws.userToColony[LibMeta.msgSender()] = newPrimary;
         }
 
         // Remove from user's season colonies array

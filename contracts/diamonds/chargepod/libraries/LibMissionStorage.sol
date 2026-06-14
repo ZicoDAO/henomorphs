@@ -12,7 +12,7 @@ import {ControlFee} from "../../../libraries/HenomorphsModel.sol";
  * @custom:security-contact contact@archxs.com
  */
 library LibMissionStorage {
-    bytes32 constant MISSION_STORAGE_POSITION = keccak256("henomorphs.missions.storage");
+    bytes32 constant MISSION_STORAGE_POSITION = keccak256("henomorphs.missions.storage.v1");
 
     // ============================================================
     // CONSTANTS
@@ -445,6 +445,14 @@ library LibMissionStorage {
         uint8 xpGained;
         uint8 objectiveProgress;    // Which objective advanced
         uint8 triggeredEventId;     // 0 if no event triggered
+        // 2026-05 upgrade: track how many fog tiles this single action revealed.
+        // Move sets 0 or 1 (the entered tile, only if it was previously fog).
+        // Scan sets 0..2 (adjacent tiles that were not yet discovered).
+        // Drives Discover-objective progress in _updateObjectiveProgress â€”
+        // before this field, Discover was a no-op type with no handler and
+        // any Discover-required objective was uncompletable. Memory-only
+        // struct, appended at the end â†’ no on-chain storage layout impact.
+        uint8 newlyDiscoveredCount;
     }
 
     /**
@@ -616,10 +624,10 @@ library LibMissionStorage {
         bool lendingSystemPaused;
 
         // ============ COLLECTION LOOKUPS (added for efficient queries) ============
-        // Reverse mapping: collection address → collection ID (0 = not registered)
+        // Reverse mapping: collection address â†’ collection ID (0 = not registered)
         mapping(address => uint16) passCollectionByAddress;
 
-        // Reverse mapping: specimen collection ID → array of pass collection IDs that support it
+        // Reverse mapping: specimen collection ID â†’ array of pass collection IDs that support it
         mapping(uint16 => uint16[]) passesForSpecimen;
     }
 

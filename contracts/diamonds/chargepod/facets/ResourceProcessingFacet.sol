@@ -205,7 +205,7 @@ contract ResourceProcessingFacet is AccessControlBase {
 
         // Apply Refinery building bonus
         LibBuildingsStorage.ColonyBuildingEffects memory effects =
-            LibBuildingsStorage.getColonyBuildingEffects(colonyId);
+            LibBuildingsStorage.getColonyBuildingEffectsWithCards(colonyId);
         if (effects.processingBonusBps > 0) {
             outputAmount += (outputAmount * effects.processingBonusBps) / 10000;
         }

@@ -323,6 +323,44 @@ library LibResourceStorage {
 
         mapping(address => uint32) lastContributionTime;
         mapping(address => mapping(uint32 => uint256)) dailyContributed; // user => day => amount
+
+        // ============================================
+        // RESOURCE-TO-YLW EXCHANGE SYSTEM (APPEND-ONLY v5)
+        // ============================================
+
+        /// @notice Master switch for resource exchange
+        bool exchangeEnabled;
+
+        /// @notice Exchange fee in basis points (default 500 = 5%, burned)
+        uint16 exchangeFeeBps;
+
+        /// @notice Max YLW output per user per day (in wei, default 50 ether)
+        uint256 exchangeDailyLimitYlw;
+
+        /// @notice Base YLW rate per resource unit (in wei), indexed by resource type 0-3
+        /// Deliberately low "pawn shop" rates so gameplay is always more profitable
+        uint256[4] resourceExchangeBaseRates;
+
+        /// @notice Minimum exchange amount per resource type (in wei), indexed 0-3
+        uint256[4] resourceExchangeMinAmounts;
+
+        /// @notice Timestamp of last exchange per user
+        mapping(address => uint32) lastExchangeTime;
+
+        /// @notice Daily exchange YLW volume per user: user => day => YLW volume (in wei)
+        mapping(address => mapping(uint32 => uint256)) dailyExchangeVolume;
+
+        /// @notice Daily exchange count per user: user => day => count
+        mapping(address => mapping(uint32 => uint8)) dailyExchangeCount;
+
+        /// @notice Cumulative lifetime exchange volume per user (in YLW wei)
+        mapping(address => uint256) totalExchangeVolume;
+
+        /// @notice Global stats: total resources burned through exchange (per type)
+        uint256[4] totalResourcesBurnedByExchange;
+
+        /// @notice Global stats: total YLW minted through exchange
+        uint256 totalYlwMintedByExchange;
     }
     
     /**
@@ -341,7 +379,7 @@ library LibResourceStorage {
      *      - Linear decay punishes large balances too harshly
      *      - Sqrt decay: decayAmount = sqrt(currentAmount) * rate * days / scaleFactor
      *      - This makes decay proportionally smaller for larger balances
-     *      - Example at 1% rate: 100 resources → 1 decay, 10000 resources → 10 decay (not 100)
+     *      - Example at 1% rate: 100 resources â†’ 1 decay, 10000 resources â†’ 10 decay (not 100)
      * @param user User address
      */
     function applyResourceDecay(address user) internal {

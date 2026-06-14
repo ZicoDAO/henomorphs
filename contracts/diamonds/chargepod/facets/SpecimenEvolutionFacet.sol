@@ -954,12 +954,22 @@ contract SpecimenEvolutionFacet is AccessControlBase {
     function getSpecimenBoosterBonus(
         uint256 collectionId,
         uint256 specimenTokenId
-    ) external view returns (uint16 costReductionBps, uint8 tierBonus) {
+    ) public view returns (uint16 costReductionBps, uint8 tierBonus) {
         LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
         address boosterAddr = bs.boosterCardsContract;
         if (boosterAddr == address(0)) return (0, 0);
 
         return IColonyBoosterCards(boosterAddr).getEvolutionBonus(collectionId, specimenTokenId);
+    }
+
+    /**
+     * @notice Alias for getSpecimenBoosterBonus (app compatibility)
+     */
+    function getEvolutionBoosterBonus(
+        uint256 collectionId,
+        uint256 specimenTokenId
+    ) external view returns (uint16 costReductionBps, uint8 tierBonus) {
+        return getSpecimenBoosterBonus(collectionId, specimenTokenId);
     }
 
     // ============================================

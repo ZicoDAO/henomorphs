@@ -96,6 +96,12 @@ contract ColonyBuildingsFacet is AccessControlBase {
     event MultiSystemCardConfigUpdated(uint8 maxCardsPerSpecimen, uint8 maxCardsPerVentureSlot);
     event BoosterCardsUpgraded(uint256[] burnedTokenIds, uint256 indexed newTokenId, address indexed caller);
     event BoosterCardsContractUpdated(address indexed oldAddress, address indexed newAddress);
+    event BuildingBoosterClaimed(
+        bytes32 indexed colonyId,
+        uint8 indexed buildingType,
+        uint256 boosterTokenId,
+        address indexed claimer
+    );
 
     // ============================================
     // ERRORS
@@ -117,6 +123,9 @@ contract ColonyBuildingsFacet is AccessControlBase {
     error NotCardOwner(uint256 tokenId);
     error InvalidUpgradeInput();
     error BoosterCardsNotSet();
+    error BoosterAlreadyClaimed(bytes32 colonyId, uint8 buildingType);
+    error BuildingLevelTooLow(uint8 currentLevel, uint8 requiredLevel);
+    error BoosterClaimDisabled();
 
     // ============================================
     // MAIN FUNCTIONS
@@ -385,7 +394,7 @@ contract ColonyBuildingsFacet is AccessControlBase {
         }
 
         LibBuildingsStorage.ColonyBuildingEffects memory effects =
-            LibBuildingsStorage.getColonyBuildingEffects(colonyId);
+            LibBuildingsStorage.getColonyBuildingEffectsWithCards(colonyId);
 
         // Calculate passive generation (per day values / 86400 * timePassed)
         uint256 basicAmount = (effects.passiveBasicPerDay * timePassed) / 86400;
@@ -520,6 +529,116 @@ contract ColonyBuildingsFacet is AccessControlBase {
         emit BoosterBlueprintActivated(tokenId, caller);
     }
 
+    // ============================================
+    // BOOSTER CLAIM (players claim booster for max-level buildings)
+    // ============================================
+
+    /**
+     * @notice Claim a booster blueprint for a building that reached the required level
+     * @param buildingType Building type (0-7)
+     * @dev One claim per building type per colony. Mints a random-rarity blueprint.
+     */
+    function claimBuildingBooster(uint8 buildingType) external whenNotPaused nonReentrant {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) revert BoosterCardsNotSet();
+
+        uint8 minLevel = bs.boosterClaimMinLevel;
+        if (minLevel == 0) revert BoosterClaimDisabled();
+
+        address caller = LibMeta.msgSender();
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(caller);
+        require(colonyId != bytes32(0), "No colony");
+
+        // Check building level
+        LibBuildingsStorage.Building storage building = bs.colonyBuildings[colonyId][buildingType];
+        if (building.level < minLevel) revert BuildingLevelTooLow(building.level, minLevel);
+        if (!building.active) revert BuildingNotFound(colonyId, buildingType);
+
+        // Check not already claimed
+        if (bs.boosterClaimed[colonyId][buildingType]) revert BoosterAlreadyClaimed(colonyId, buildingType);
+
+        // Mark as claimed BEFORE external call (CEI pattern)
+        bs.boosterClaimed[colonyId][buildingType] = true;
+
+        // Mint random booster blueprint for this building type
+        // targetSystem=0 (Buildings), subType=buildingType, isBlueprint=true
+        uint256 boosterTokenId = IColonyBoosterCards(boosterAddr).mintRandomBooster(
+            caller,
+            0,              // Buildings system
+            buildingType,
+            true            // as blueprint
+        );
+
+        emit BuildingBoosterClaimed(colonyId, buildingType, boosterTokenId, caller);
+    }
+
+    /**
+     * @notice Check if a player can claim a booster for a specific building
+     * @param user Player address
+     * @param buildingType Building type (0-7)
+     * @return canClaim Whether claiming is possible
+     * @return reason Human-readable reason if cannot claim
+     */
+    function canClaimBuildingBooster(address user, uint8 buildingType) external view returns (
+        bool canClaim,
+        string memory reason
+    ) {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+
+        if (bs.boosterCardsContract == address(0)) return (false, "Booster cards not set");
+        if (bs.boosterClaimMinLevel == 0) return (false, "Booster claim disabled");
+
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(user);
+        if (colonyId == bytes32(0)) return (false, "No colony");
+
+        LibBuildingsStorage.Building storage building = bs.colonyBuildings[colonyId][buildingType];
+        if (!building.active) return (false, "Building not active");
+        if (building.level < bs.boosterClaimMinLevel) return (false, "Building level too low");
+        if (bs.boosterClaimed[colonyId][buildingType]) return (false, "Already claimed");
+
+        return (true, "");
+    }
+
+    /**
+     * @notice Get claim status for all 8 building types
+     * @param user Player address
+     * @return claimable Bitmask of claimable building types (bit 0 = type 0, etc.)
+     * @return claimed Bitmask of already claimed building types
+     * @return minLevel Minimum level required
+     */
+    function getBuildingBoosterClaimStatus(address user) external view returns (
+        uint8 claimable,
+        uint8 claimed,
+        uint8 minLevel
+    ) {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        minLevel = bs.boosterClaimMinLevel;
+
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(user);
+        if (colonyId == bytes32(0) || minLevel == 0) return (0, 0, minLevel);
+
+        for (uint8 i = 0; i < 8; i++) {
+            LibBuildingsStorage.Building storage building = bs.colonyBuildings[colonyId][i];
+
+            if (bs.boosterClaimed[colonyId][i]) {
+                claimed |= uint8(1 << i);
+            } else if (building.active && building.level >= minLevel) {
+                claimable |= uint8(1 << i);
+            }
+        }
+    }
+
+    /**
+     * @notice Admin: Set minimum building level required to claim a booster
+     * @param minLevel Minimum level (0 = disabled, typically 5)
+     */
+    function setBoosterClaimMinLevel(uint8 minLevel) external onlyAuthorized {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        bs.boosterClaimMinLevel = minLevel;
+    }
+
     /**
      * @notice Get booster bonuses for a building
      * @param colonyId Colony identifier
@@ -536,6 +655,77 @@ contract ColonyBuildingsFacet is AccessControlBase {
         if (boosterAddr == address(0)) return (0, 0);
 
         return IColonyBoosterCards(boosterAddr).getBuildingBonus(colonyId, buildingType);
+    }
+
+    /**
+     * @notice Get detach cooldown info for a booster card
+     * @param tokenId Booster token ID
+     * @return cooldownEnd Timestamp when cooldown expires
+     * @return remainingSeconds Seconds remaining until detach is possible
+     * @return canDetach Whether the booster can be detached now
+     */
+    function getDetachCooldown(uint256 tokenId) external view returns (
+        uint32 cooldownEnd,
+        uint32 remainingSeconds,
+        bool canDetach
+    ) {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) return (0, 0, false);
+
+        IColonyBoosterCards boosterContract = IColonyBoosterCards(boosterAddr);
+
+        if (!boosterContract.isAttached(tokenId)) return (0, 0, false);
+
+        (uint32 cooldownUntil, bool locked) = boosterContract.getCooldownInfo(tokenId);
+        cooldownEnd = cooldownUntil;
+        uint32 now_ = uint32(block.timestamp);
+        remainingSeconds = cooldownUntil > now_ ? cooldownUntil - now_ : 0;
+        canDetach = !locked && now_ >= cooldownUntil;
+    }
+
+    /**
+     * @notice Preview the result of upgrading 3 booster cards
+     * @param tokenId1 First booster token ID
+     * @param tokenId2 Second booster token ID
+     * @param tokenId3 Third booster token ID
+     * @return canUpgrade Whether the upgrade is valid
+     * @return resultRarity The rarity of the resulting booster
+     * @return resultTargetSystem The target system of the resulting booster
+     */
+    function getUpgradePreview(
+        uint256 tokenId1,
+        uint256 tokenId2,
+        uint256 tokenId3
+    ) external view returns (bool canUpgrade, uint8 resultRarity, uint8 resultTargetSystem) {
+        LibBuildingsStorage.BuildingsStorage storage bs = LibBuildingsStorage.buildingsStorage();
+        address boosterAddr = bs.boosterCardsContract;
+        if (boosterAddr == address(0)) return (false, 0, 0);
+
+        IColonyBoosterCards boosterContract = IColonyBoosterCards(boosterAddr);
+
+        // Get traits for all 3 tokens
+        (uint8 sys1, uint8 sub1, uint8 rar1, bool bp1) = boosterContract.getTraitsFlat(tokenId1);
+        (uint8 sys2, uint8 sub2, uint8 rar2, bool bp2) = boosterContract.getTraitsFlat(tokenId2);
+        (uint8 sys3, uint8 sub3, uint8 rar3, bool bp3) = boosterContract.getTraitsFlat(tokenId3);
+
+        // Validate: same system, same subType, same rarity
+        if (sys1 != sys2 || sys1 != sys3) return (false, 0, 0);
+        if (sub1 != sub2 || sub1 != sub3) return (false, 0, 0);
+        if (rar1 != rar2 || rar1 != rar3) return (false, 0, 0);
+
+        // Cannot upgrade Legendary (rarity 4)
+        if (rar1 >= 4) return (false, 0, 0);
+
+        // Cannot upgrade blueprints
+        if (bp1 || bp2 || bp3) return (false, 0, 0);
+
+        // Cannot upgrade attached boosters
+        if (boosterContract.isAttached(tokenId1) ||
+            boosterContract.isAttached(tokenId2) ||
+            boosterContract.isAttached(tokenId3)) return (false, 0, 0);
+
+        return (true, rar1 + 1, sys1);
     }
 
     /**
@@ -1011,7 +1201,7 @@ contract ColonyBuildingsFacet is AccessControlBase {
     function getColonyBuildingEffects(bytes32 colonyId) external view returns (
         LibBuildingsStorage.ColonyBuildingEffects memory effects
     ) {
-        return LibBuildingsStorage.getColonyBuildingEffects(colonyId);
+        return LibBuildingsStorage.getColonyBuildingEffectsWithCards(colonyId);
     }
 
     /**
@@ -1059,7 +1249,7 @@ contract ColonyBuildingsFacet is AccessControlBase {
         }
 
         LibBuildingsStorage.ColonyBuildingEffects memory effects =
-            LibBuildingsStorage.getColonyBuildingEffects(colonyId);
+            LibBuildingsStorage.getColonyBuildingEffectsWithCards(colonyId);
 
         basicMaterials = (effects.passiveBasicPerDay * timePassed) / 86400;
         energyCrystals = (effects.passiveEnergyPerDay * timePassed) / 86400;

@@ -51,6 +51,14 @@ contract MissionConfigFacet is AccessControlBase {
     event LendingConfigSet(address indexed paymentToken, uint16 platformFeeBps);
     event LendingSystemPaused(bool paused);
 
+    // Admin reset events â€” used by the cleanup tooling that rescues state
+    // orphaned by the pre-fix `uint128(combinedId)` truncation in
+    // _lockParticipants/_unlockParticipants.
+    event AdminTokenUnlocked(uint256 indexed combinedId);
+    event AdminSessionPurged(bytes32 indexed sessionId, address indexed initiator);
+    event AdminPassUsesRestored(uint16 indexed collectionId, uint256 indexed tokenId, uint16 uses);
+    event AdminUserActiveMissionCleared(address indexed user, bytes32 previousSessionId);
+
     // ============================================================
     // ERRORS
     // ============================================================
@@ -1071,5 +1079,246 @@ contract MissionConfigFacet is AccessControlBase {
      */
     function isPassLendingSystemPaused() external view returns (bool paused) {
         return LibMissionStorage.missionStorage().lendingSystemPaused;
+    }
+
+    // ============================================================
+    // ADMIN STATE RESET (rescue tooling)
+    // ============================================================
+
+    /**
+     * @notice Clear lock + active-session entries for a token under its full
+     *         packed key. Idempotent.
+     * @param fullCombinedId (specimenCollectionId << 128) | tokenId
+     */
+    function adminUnlockTokenInMission(uint256 fullCombinedId) external onlyAuthorized {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        ms.lockedHenomorphs[fullCombinedId] = false;
+        delete ms.henomorphActiveMission[fullCombinedId];
+        emit AdminTokenUnlocked(fullCombinedId);
+    }
+
+    /**
+     * @notice Delete every storage entry that belongs to a session. Also clears
+     *         the initiator's userActiveMission pointer if it still points here.
+     *         Idempotent.
+     */
+    function adminPurgeSession(bytes32 sessionId) external onlyAuthorized {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        address initiator = ms.sessionInitiators[sessionId];
+
+        if (initiator != address(0) && ms.userActiveMission[initiator] == sessionId) {
+            delete ms.userActiveMission[initiator];
+        }
+        delete ms.packedStates[sessionId];
+        delete ms.sessionMaps[sessionId];
+        delete ms.sessionObjectives[sessionId];
+        delete ms.sessionParticipants[sessionId];
+        delete ms.sessionEntropy[sessionId];
+        delete ms.sessionInitiators[sessionId];
+
+        emit AdminSessionPurged(sessionId, initiator);
+    }
+
+    /**
+     * @notice Refund pass uses lost to a Failed/Expired session. Also flips
+     *         PassStatus back to Active if previously marked Exhausted.
+     */
+    function adminRestorePassUses(uint16 collectionId, uint256 tokenId, uint16 uses)
+        external
+        onlyAuthorized
+    {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        ms.passUsesRemaining[collectionId][tokenId] += uses;
+        if (ms.passStatus[collectionId][tokenId] == LibMissionStorage.PassStatus.Exhausted) {
+            ms.passStatus[collectionId][tokenId] = LibMissionStorage.PassStatus.Active;
+        }
+        emit AdminPassUsesRestored(collectionId, tokenId, uses);
+    }
+
+    /**
+     * @notice Clear userActiveMission for a user. Safety net. Idempotent.
+     */
+    function adminClearUserActiveMission(address user) external onlyAuthorized {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        bytes32 prev = ms.userActiveMission[user];
+        delete ms.userActiveMission[user];
+        emit AdminUserActiveMissionCleared(user, prev);
+    }
+
+    // ============================================================
+    // VIEW FUNCTIONS (moved from MissionFacet to free bytecode budget)
+    // ============================================================
+    //
+    // These views are pure storage readers â€” they don't touch any internal
+    // helpers in MissionFacet. Routed via Diamond, so UI calling the diamond
+    // proxy address gets the same behavior regardless of which facet hosts
+    // the selector. canExtractMission / estimateMissionRewards stay in
+    // MissionFacet because they call internal helpers there.
+
+    function getMissionProgress(bytes32 sessionId)
+        external
+        view
+        returns (LibMissionStorage.MissionSession memory session)
+    {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
+
+        session.sessionId = sessionId;
+        session.initiator = ms.sessionInitiators[sessionId];
+        session.passCollectionId = state.passCollectionId;
+        session.passTokenId = state.passTokenId;
+        session.missionVariant = state.missionVariant;
+        session.phase = LibMissionStorage.MissionPhase(state.phase);
+        session.currentNodeId = state.currentNodeId;
+        session.startBlock = state.startBlock;
+        session.revealBlock = state.revealBlock;
+        session.deadlineBlock = state.deadlineBlock;
+        session.lastActionBlock = state.lastActionBlock;
+        session.totalActions = state.totalActions;
+        session.combatsWon = state.combatsWon;
+        session.combatsLost = state.combatsLost;
+        session.chargeUsed = state.chargeUsed;
+        session.eventsTriggered = state.eventsTriggered;
+        session.eventsResolved = state.eventsResolved;
+        session.eventsFailed = state.eventsFailed;
+        session.pendingEventId = state.pendingEventId;
+        session.pendingEventDeadline = state.pendingEventDeadline;
+        session.accumulatedReward = uint256(state.rewardPool) * 1e6;
+    }
+
+    function getMissionMap(bytes32 sessionId)
+        external
+        view
+        returns (LibMissionStorage.MapNode[] memory nodes)
+    {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        LibMissionStorage.PackedMapNodes storage packedNodes = ms.sessionMaps[sessionId];
+        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
+
+        uint8 mapSize = ms.variantConfigs[state.passCollectionId][state.missionVariant].mapSize;
+        nodes = new LibMissionStorage.MapNode[](mapSize);
+
+        for (uint8 i = 0; i < mapSize; i++) {
+            nodes[i] = LibMissionStorage.getNode(packedNodes, i);
+        }
+    }
+
+    function getMissionObjectives(bytes32 sessionId)
+        external
+        view
+        returns (LibMissionStorage.MissionObjective[] memory objectives)
+    {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        LibMissionStorage.PackedObjectives storage packedObjectives = ms.sessionObjectives[sessionId];
+        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
+
+        LibMissionStorage.MissionVariantConfig storage config = ms.variantConfigs[state.passCollectionId][state.missionVariant];
+        uint8 totalObjectives = config.requiredObjectivesCount + config.bonusObjectivesCount;
+        objectives = new LibMissionStorage.MissionObjective[](totalObjectives);
+
+        for (uint8 i = 0; i < totalObjectives; i++) {
+            objectives[i] = LibMissionStorage.getObjective(packedObjectives, i);
+        }
+    }
+
+    function getActiveMissionEvent(bytes32 sessionId)
+        external
+        view
+        returns (LibMissionStorage.MissionEvent memory missionEvent)
+    {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
+
+        if (state.pendingEventId == 0) {
+            return missionEvent;
+        }
+
+        missionEvent.eventId = state.pendingEventId;
+        missionEvent.eventType = LibMissionStorage.EventType(state.pendingEventId % 6);
+        missionEvent.triggerBlock = state.lastActionBlock;
+        missionEvent.deadlineBlock = state.pendingEventDeadline;
+        missionEvent.difficulty = uint8((uint256(ms.sessionEntropy[sessionId]) >> 8) % 10) + 1;
+        missionEvent.penaltyOnIgnore = 10;
+    }
+
+    function getUserActiveMission(address user) external view returns (bytes32 sessionId) {
+        return LibMissionStorage.missionStorage().userActiveMission[user];
+    }
+
+    function getUserMissionProfile(address user)
+        external
+        view
+        returns (LibMissionStorage.UserMissionProfile memory profile)
+    {
+        return LibMissionStorage.missionStorage().userProfiles[user];
+    }
+
+    function getMissionCooldown(address user, uint16 passCollectionId)
+        external
+        view
+        returns (uint32 lastMissionEnd, uint32 cooldownEnd, uint32 remainingSeconds)
+    {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        lastMissionEnd = ms.userMissionCooldowns[user];
+        uint32 globalCooldown = ms.passCollections[passCollectionId].globalCooldown;
+        if (lastMissionEnd == 0) {
+            return (0, 0, 0);
+        }
+        cooldownEnd = lastMissionEnd + globalCooldown;
+        uint32 nowTs = uint32(block.timestamp);
+        remainingSeconds = (cooldownEnd > nowTs) ? cooldownEnd - nowTs : 0;
+    }
+
+    function getMissionParticipants(bytes32 sessionId)
+        external
+        view
+        returns (LibMissionStorage.PackedParticipant[] memory participants)
+    {
+        return LibMissionStorage.missionStorage().sessionParticipants[sessionId];
+    }
+
+    function getPassRechargeInfo(uint16 collectionId, uint256 tokenId)
+        external
+        view
+        returns (
+            LibMissionStorage.PassStatus status,
+            uint16 usesRemaining,
+            bool canRecharge,
+            uint256 cooldownRemaining,
+            uint96 pricePerUse,
+            uint16 discountBps
+        )
+    {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+
+        status = ms.passStatus[collectionId][tokenId];
+        usesRemaining = ms.passUsesRemaining[collectionId][tokenId];
+
+        LibMissionStorage.RechargeConfig storage config = ms.passRechargeConfigs[collectionId];
+        pricePerUse = config.pricePerUse;
+        discountBps = config.discountBps;
+
+        canRecharge = config.enabled &&
+            !ms.rechargeSystemPaused &&
+            status != LibMissionStorage.PassStatus.Uninitialized;
+
+        if (config.cooldownSeconds > 0) {
+            LibMissionStorage.PassRechargeRecord storage record = ms.passRechargeRecords[collectionId][tokenId];
+            if (record.lastRechargeTime > 0) {
+                uint256 nextRechargeTime = record.lastRechargeTime + config.cooldownSeconds;
+                if (block.timestamp < nextRechargeTime) {
+                    cooldownRemaining = nextRechargeTime - block.timestamp;
+                    canRecharge = false;
+                }
+            }
+        }
+    }
+
+    function getPassRechargeRecord(uint16 collectionId, uint256 tokenId)
+        external
+        view
+        returns (LibMissionStorage.PassRechargeRecord memory record)
+    {
+        return LibMissionStorage.missionStorage().passRechargeRecords[collectionId][tokenId];
     }
 }

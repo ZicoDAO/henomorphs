@@ -3,6 +3,9 @@ pragma solidity ^0.8.27;
 
 import {LibMeta} from "../../shared/libraries/LibMeta.sol";
 import {LibResourceStorage} from "../libraries/LibResourceStorage.sol";
+import {LibMarketplaceStorage} from "../libraries/LibMarketplaceStorage.sol";
+import {LibBuildingsStorage} from "../libraries/LibBuildingsStorage.sol";
+import {LibColonyWarsStorage} from "../libraries/LibColonyWarsStorage.sol";
 import {AccessControlBase} from "../../common/facets/AccessControlBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -10,33 +13,31 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 /**
  * @title ResourceMarketplaceFacet
  * @notice P2P marketplace for resource trading between colonies
- * @dev Implements order book trading with utility token settlement
+ * @dev Implements order book trading with utility token (YLW) settlement.
+ *      Storage is in LibMarketplaceStorage (Diamond pattern).
+ *
+ *      Audit fixes applied:
+ *      - BUG-1: resourceType validation (must be 0-3)
+ *      - BUG-2: Trade Hub marketFeeReductionBps applied to fees
+ *      - BUG-3: Monotonic nonce prevents order ID collisions
+ *      - BUG-4: activeOrderIds compacted via swap-and-pop on fill/cancel/cleanup
+ *      - ISSUE-6: Decay applied before returning resources on cancel/cleanup
+ *      - ISSUE-8: Max 20 active orders per user
+ *
+ * @author rutilicus.eth (ArchXS)
  */
 contract ResourceMarketplaceFacet is AccessControlBase {
     using SafeERC20 for IERC20;
-    
-    // ==================== STRUCTS ====================
-    
-    struct TradeOrder {
-        address seller;
-        bytes32 sellerColony;
-        uint8 resourceType;
-        uint256 amount;
-        uint256 pricePerUnit;      // In utility token (e.g., YLW)
-        uint32 expiresAt;
-        bool active;
-    }
-    
+
     // ==================== EVENTS ====================
-    
+
     event OrderCreated(bytes32 indexed orderId, address indexed seller, uint8 resourceType, uint256 amount, uint256 pricePerUnit);
     event OrderCancelled(bytes32 indexed orderId, address indexed seller);
     event OrderFilled(bytes32 indexed orderId, address indexed buyer, address indexed seller, uint256 amount, uint256 totalPrice);
     event OrderPartiallyFilled(bytes32 indexed orderId, address indexed buyer, uint256 amountFilled, uint256 amountRemaining);
-    event MarketFeesCollected(uint256 totalFees);
-    
+
     // ==================== ERRORS ====================
-    
+
     error OrderNotFound(bytes32 orderId);
     error OrderExpired(bytes32 orderId);
     error OrderInactive(bytes32 orderId);
@@ -46,53 +47,44 @@ contract ResourceMarketplaceFacet is AccessControlBase {
     error InvalidPrice(uint256 price);
     error UnauthorizedCancellation(address caller, address seller);
     error SelfTrade(address user);
-    
+    error InvalidResourceType(uint8 resourceType);
+    error MaxActiveOrdersReached(address user, uint8 maxOrders);
+
     // ==================== CONSTANTS ====================
-    
-    uint16 constant MARKET_FEE_BPS = 200; // 2% fee
+
+    uint16 constant BASE_MARKET_FEE_BPS = 200;    // 2% base fee (reduced by Trade Hub)
     uint32 constant MAX_ORDER_DURATION = 7 days;
-    
-    // ==================== STORAGE ====================
-    
-    bytes32 constant MARKETPLACE_STORAGE_POSITION = keccak256("henomorphs.marketplace.storage");
-    
-    struct MarketplaceStorage {
-        mapping(bytes32 => TradeOrder) orders;
-        bytes32[] activeOrderIds;
-        mapping(address => bytes32[]) userOrders;
-        uint256 totalFeesCollected;
-    }
-    
-    function marketplaceStorage() internal pure returns (MarketplaceStorage storage ms) {
-        bytes32 position = MARKETPLACE_STORAGE_POSITION;
-        assembly {
-            ms.slot := position
-        }
-    }
-    
+    uint8 constant MAX_ACTIVE_ORDERS_PER_USER = 20;
+
     // ==================== ORDER MANAGEMENT ====================
-    
+
     /**
-     * @notice Create sell order for resources
-     * @param resourceType Type of resource to sell
+     * @notice List resources for sale on the marketplace
+     * @param resourceType Type of resource to sell (0=Basic, 1=Energy, 2=Bio, 3=Rare)
      * @param amount Amount to sell
-     * @param pricePerUnit Price per unit in utility token
-     * @param duration Order duration in seconds (max 7 days)
-     * @return orderId Unique order identifier
+     * @param pricePerUnit Price per unit in YLW (wei)
+     * @param duration Listing duration in seconds (max 7 days)
+     * @return listingId Unique listing identifier
      */
-    function createSellOrder(
+    function listResources(
         uint8 resourceType,
         uint256 amount,
         uint256 pricePerUnit,
         uint32 duration
-    ) external whenNotPaused nonReentrant returns (bytes32 orderId) {
+    ) external whenNotPaused nonReentrant returns (bytes32 listingId) {
+        if (resourceType > 3) revert InvalidResourceType(resourceType);
         if (amount == 0) revert InvalidAmount(amount);
         if (pricePerUnit == 0) revert InvalidPrice(pricePerUnit);
         if (duration > MAX_ORDER_DURATION) duration = MAX_ORDER_DURATION;
-        
+
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        MarketplaceStorage storage ms = marketplaceStorage();
+        LibMarketplaceStorage.MarketplaceStorage storage ms = LibMarketplaceStorage.marketplaceStorage();
         address seller = LibMeta.msgSender();
+
+        // Enforce max active orders per user
+        if (LibMarketplaceStorage.countActiveOrders(ms, seller) >= MAX_ACTIVE_ORDERS_PER_USER) {
+            revert MaxActiveOrdersReached(seller, MAX_ACTIVE_ORDERS_PER_USER);
+        }
 
         // Apply decay before checking/locking resources
         LibResourceStorage.applyResourceDecay(seller);
@@ -103,22 +95,24 @@ contract ResourceMarketplaceFacet is AccessControlBase {
             revert InsufficientResources(resourceType, amount, available);
         }
 
-        // Lock resources
+        // Lock resources (deduct from user balance)
         rs.userResources[seller][resourceType] = available - amount;
-        
+
         // Get seller's colony
         bytes32 sellerColony = _getUserColony(seller);
-        
-        // Create order
-        orderId = keccak256(abi.encodePacked(
+
+        // Create listing with monotonic nonce to prevent ID collisions
+        uint256 nonce = ++ms.orderNonce;
+        listingId = keccak256(abi.encodePacked(
             seller,
             resourceType,
             amount,
             pricePerUnit,
-            block.timestamp
+            block.timestamp,
+            nonce
         ));
-        
-        TradeOrder storage order = ms.orders[orderId];
+
+        LibMarketplaceStorage.TradeOrder storage order = ms.orders[listingId];
         order.seller = seller;
         order.sellerColony = sellerColony;
         order.resourceType = resourceType;
@@ -126,35 +120,35 @@ contract ResourceMarketplaceFacet is AccessControlBase {
         order.pricePerUnit = pricePerUnit;
         order.expiresAt = uint32(block.timestamp) + duration;
         order.active = true;
-        
-        ms.activeOrderIds.push(orderId);
-        ms.userOrders[seller].push(orderId);
-        
-        emit OrderCreated(orderId, seller, resourceType, amount, pricePerUnit);
+
+        ms.activeOrderIds.push(listingId);
+        ms.userOrders[seller].push(listingId);
+
+        emit OrderCreated(listingId, seller, resourceType, amount, pricePerUnit);
     }
-    
+
     /**
-     * @notice Fill sell order (buy resources)
-     * @param orderId Order to fill
-     * @param amount Amount to buy (0 = fill entire order)
+     * @notice Buy resources from a marketplace listing
+     * @param listingId Listing to buy from
+     * @param amount Amount to buy (0 = buy all remaining)
      */
-    function fillOrder(
-        bytes32 orderId,
+    function buyResources(
+        bytes32 listingId,
         uint256 amount
     ) external whenNotPaused nonReentrant {
-        MarketplaceStorage storage ms = marketplaceStorage();
+        LibMarketplaceStorage.MarketplaceStorage storage ms = LibMarketplaceStorage.marketplaceStorage();
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        
-        TradeOrder storage order = ms.orders[orderId];
-        
+
+        LibMarketplaceStorage.TradeOrder storage order = ms.orders[listingId];
+
         // Validations
-        if (order.seller == address(0)) revert OrderNotFound(orderId);
-        if (!order.active) revert OrderInactive(orderId);
-        if (block.timestamp > order.expiresAt) revert OrderExpired(orderId);
-        
+        if (order.seller == address(0)) revert OrderNotFound(listingId);
+        if (!order.active) revert OrderInactive(listingId);
+        if (block.timestamp > order.expiresAt) revert OrderExpired(listingId);
+
         address buyer = LibMeta.msgSender();
         if (buyer == order.seller) revert SelfTrade(buyer);
-        
+
         // Determine fill amount
         uint256 fillAmount = amount == 0 ? order.amount : amount;
         if (fillAmount > order.amount) fillAmount = order.amount;
@@ -163,94 +157,112 @@ contract ResourceMarketplaceFacet is AccessControlBase {
         // Apply decay to buyer before awarding resources
         LibResourceStorage.applyResourceDecay(buyer);
 
-        // Calculate payment
+        // Calculate payment with Trade Hub fee reduction for buyer
         uint256 totalPrice = fillAmount * order.pricePerUnit;
-        uint256 fee = (totalPrice * MARKET_FEE_BPS) / 10000;
+        uint256 feeBps = _getEffectiveFeeBps(buyer);
+        uint256 fee = (totalPrice * feeBps) / 10000;
         uint256 sellerProceeds = totalPrice - fee;
-        
+
         // Verify buyer has payment
         IERC20 utilityToken = IERC20(rs.config.utilityToken);
         if (utilityToken.balanceOf(buyer) < totalPrice) {
             revert InsufficientPayment(totalPrice, utilityToken.balanceOf(buyer));
         }
-        
+
         // Transfer payment
         utilityToken.safeTransferFrom(buyer, order.seller, sellerProceeds);
-        utilityToken.safeTransferFrom(buyer, rs.config.paymentBeneficiary, fee);
-        
-        // Transfer resources
+        if (fee > 0) {
+            utilityToken.safeTransferFrom(buyer, rs.config.paymentBeneficiary, fee);
+        }
+
+        // Transfer resources to buyer
         rs.userResources[buyer][order.resourceType] += fillAmount;
-        
+
         // Update order
         order.amount -= fillAmount;
         ms.totalFeesCollected += fee;
-        
+
         if (order.amount == 0) {
             order.active = false;
-            emit OrderFilled(orderId, buyer, order.seller, fillAmount, totalPrice);
+            LibMarketplaceStorage.removeFromActiveOrders(ms, listingId);
+            emit OrderFilled(listingId, buyer, order.seller, fillAmount, totalPrice);
         } else {
-            emit OrderPartiallyFilled(orderId, buyer, fillAmount, order.amount);
+            emit OrderPartiallyFilled(listingId, buyer, fillAmount, order.amount);
         }
     }
-    
+
     /**
-     * @notice Cancel active order and return resources
-     * @param orderId Order to cancel
+     * @notice Cancel a listing and return locked resources to seller
+     * @param listingId Listing to cancel
      */
-    function cancelOrder(bytes32 orderId) external whenNotPaused nonReentrant {
-        MarketplaceStorage storage ms = marketplaceStorage();
+    function cancelListing(bytes32 listingId) external whenNotPaused nonReentrant {
+        LibMarketplaceStorage.MarketplaceStorage storage ms = LibMarketplaceStorage.marketplaceStorage();
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        
-        TradeOrder storage order = ms.orders[orderId];
-        
-        if (order.seller == address(0)) revert OrderNotFound(orderId);
-        if (!order.active) revert OrderInactive(orderId);
-        
+
+        LibMarketplaceStorage.TradeOrder storage order = ms.orders[listingId];
+
+        if (order.seller == address(0)) revert OrderNotFound(listingId);
+        if (!order.active) revert OrderInactive(listingId);
+
         address caller = LibMeta.msgSender();
         if (caller != order.seller) revert UnauthorizedCancellation(caller, order.seller);
-        
-        // Return locked resources
-        rs.userResources[order.seller][order.resourceType] += order.amount;
-        
-        // Deactivate order
+
+        uint256 returnAmount = order.amount;
+
+        // Deactivate and compact array
         order.active = false;
         order.amount = 0;
-        
-        emit OrderCancelled(orderId, order.seller);
+        LibMarketplaceStorage.removeFromActiveOrders(ms, listingId);
+
+        // Apply decay before returning resources (prevents decay bypass exploit)
+        LibResourceStorage.applyResourceDecay(order.seller);
+
+        // Return locked resources
+        rs.userResources[order.seller][order.resourceType] += returnAmount;
+
+        emit OrderCancelled(listingId, order.seller);
     }
-    
+
     /**
-     * @notice Batch cancel expired orders (anyone can call)
-     * @param orderIds Array of order IDs to cancel
+     * @notice Batch cleanup expired listings and return resources (anyone can call)
+     * @param listingIds Array of listing IDs to clean up
      */
-    function cleanupExpiredOrders(bytes32[] calldata orderIds) external {
-        MarketplaceStorage storage ms = marketplaceStorage();
+    function cleanupExpiredListings(bytes32[] calldata listingIds) external {
+        LibMarketplaceStorage.MarketplaceStorage storage ms = LibMarketplaceStorage.marketplaceStorage();
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        
+
         uint32 currentTime = uint32(block.timestamp);
-        
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            TradeOrder storage order = ms.orders[orderIds[i]];
-            
+
+        for (uint256 i = 0; i < listingIds.length; i++) {
+            LibMarketplaceStorage.TradeOrder storage order = ms.orders[listingIds[i]];
+
             if (order.active && currentTime > order.expiresAt) {
-                // Return resources to seller
-                rs.userResources[order.seller][order.resourceType] += order.amount;
-                
-                // Deactivate order
+                uint256 returnAmount = order.amount;
+                address seller = order.seller;
+                uint8 rType = order.resourceType;
+
+                // Deactivate and compact array
                 order.active = false;
                 order.amount = 0;
-                
-                emit OrderCancelled(orderIds[i], order.seller);
+                LibMarketplaceStorage.removeFromActiveOrders(ms, listingIds[i]);
+
+                // Apply decay before returning resources (prevents decay bypass)
+                LibResourceStorage.applyResourceDecay(seller);
+
+                // Return resources to seller
+                rs.userResources[seller][rType] += returnAmount;
+
+                emit OrderCancelled(listingIds[i], seller);
             }
         }
     }
-    
+
     // ==================== VIEW FUNCTIONS ====================
-    
+
     /**
-     * @notice Get order details
+     * @notice Get listing details
      */
-    function getOrder(bytes32 orderId) external view returns (
+    function getListing(bytes32 listingId) external view returns (
         address seller,
         bytes32 sellerColony,
         uint8 resourceType,
@@ -259,11 +271,11 @@ contract ResourceMarketplaceFacet is AccessControlBase {
         uint32 expiresAt,
         bool active
     ) {
-        MarketplaceStorage storage ms = marketplaceStorage();
-        TradeOrder storage order = ms.orders[orderId];
-        
-        if (order.seller == address(0)) revert OrderNotFound(orderId);
-        
+        LibMarketplaceStorage.MarketplaceStorage storage ms = LibMarketplaceStorage.marketplaceStorage();
+        LibMarketplaceStorage.TradeOrder storage order = ms.orders[listingId];
+
+        if (order.seller == address(0)) revert OrderNotFound(listingId);
+
         return (
             order.seller,
             order.sellerColony,
@@ -274,97 +286,97 @@ contract ResourceMarketplaceFacet is AccessControlBase {
             order.active
         );
     }
-    
+
     /**
-     * @notice Get all active orders for resource type
+     * @notice Get all active listings for a resource type
      */
-    function getActiveOrdersByResource(uint8 resourceType) external view returns (
+    function getListingsByType(uint8 resourceType) external view returns (
         bytes32[] memory orderIds,
-        TradeOrder[] memory orders
+        LibMarketplaceStorage.TradeOrder[] memory orders
     ) {
-        MarketplaceStorage storage ms = marketplaceStorage();
-        
+        LibMarketplaceStorage.MarketplaceStorage storage ms = LibMarketplaceStorage.marketplaceStorage();
+
         // Count matching orders
         uint256 count = 0;
         for (uint256 i = 0; i < ms.activeOrderIds.length; i++) {
-            TradeOrder storage order = ms.orders[ms.activeOrderIds[i]];
+            LibMarketplaceStorage.TradeOrder storage order = ms.orders[ms.activeOrderIds[i]];
             if (order.active && order.resourceType == resourceType && block.timestamp <= order.expiresAt) {
                 count++;
             }
         }
-        
+
         // Populate arrays
         orderIds = new bytes32[](count);
-        orders = new TradeOrder[](count);
-        
+        orders = new LibMarketplaceStorage.TradeOrder[](count);
+
         uint256 index = 0;
         for (uint256 i = 0; i < ms.activeOrderIds.length; i++) {
-            bytes32 orderId = ms.activeOrderIds[i];
-            TradeOrder storage order = ms.orders[orderId];
+            bytes32 oid = ms.activeOrderIds[i];
+            LibMarketplaceStorage.TradeOrder storage order = ms.orders[oid];
             if (order.active && order.resourceType == resourceType && block.timestamp <= order.expiresAt) {
-                orderIds[index] = orderId;
+                orderIds[index] = oid;
                 orders[index] = order;
                 index++;
             }
         }
     }
-    
+
     /**
-     * @notice Get user's active orders
+     * @notice Get all active listings for a user
      */
-    function getUserOrders(address user) external view returns (
+    function getUserListings(address user) external view returns (
         bytes32[] memory orderIds,
-        TradeOrder[] memory orders
+        LibMarketplaceStorage.TradeOrder[] memory orders
     ) {
-        MarketplaceStorage storage ms = marketplaceStorage();
+        LibMarketplaceStorage.MarketplaceStorage storage ms = LibMarketplaceStorage.marketplaceStorage();
         bytes32[] storage userOrderIds = ms.userOrders[user];
-        
+
         // Count active orders
         uint256 count = 0;
         for (uint256 i = 0; i < userOrderIds.length; i++) {
             if (ms.orders[userOrderIds[i]].active) count++;
         }
-        
+
         // Populate arrays
         orderIds = new bytes32[](count);
-        orders = new TradeOrder[](count);
-        
+        orders = new LibMarketplaceStorage.TradeOrder[](count);
+
         uint256 index = 0;
         for (uint256 i = 0; i < userOrderIds.length; i++) {
-            bytes32 orderId = userOrderIds[i];
-            TradeOrder storage order = ms.orders[orderId];
+            bytes32 oid = userOrderIds[i];
+            LibMarketplaceStorage.TradeOrder storage order = ms.orders[oid];
             if (order.active) {
-                orderIds[index] = orderId;
+                orderIds[index] = oid;
                 orders[index] = order;
                 index++;
             }
         }
     }
-    
+
     /**
-     * @notice Get best sell price for resource type
+     * @notice Get lowest listed price for a resource type
      */
-    function getBestPrice(uint8 resourceType) external view returns (uint256 bestPrice, bytes32 bestOrderId) {
-        MarketplaceStorage storage ms = marketplaceStorage();
-        
-        bestPrice = type(uint256).max;
-        
+    function getLowestPrice(uint8 resourceType) external view returns (uint256 lowestPrice, bytes32 listingId) {
+        LibMarketplaceStorage.MarketplaceStorage storage ms = LibMarketplaceStorage.marketplaceStorage();
+
+        lowestPrice = type(uint256).max;
+
         for (uint256 i = 0; i < ms.activeOrderIds.length; i++) {
-            bytes32 orderId = ms.activeOrderIds[i];
-            TradeOrder storage order = ms.orders[orderId];
-            
-            if (order.active && 
-                order.resourceType == resourceType && 
+            bytes32 oid = ms.activeOrderIds[i];
+            LibMarketplaceStorage.TradeOrder storage order = ms.orders[oid];
+
+            if (order.active &&
+                order.resourceType == resourceType &&
                 block.timestamp <= order.expiresAt &&
-                order.pricePerUnit < bestPrice) {
-                bestPrice = order.pricePerUnit;
-                bestOrderId = orderId;
+                order.pricePerUnit < lowestPrice) {
+                lowestPrice = order.pricePerUnit;
+                listingId = oid;
             }
         }
-        
-        if (bestPrice == type(uint256).max) bestPrice = 0;
+
+        if (lowestPrice == type(uint256).max) lowestPrice = 0;
     }
-    
+
     /**
      * @notice Get marketplace statistics
      */
@@ -373,38 +385,73 @@ contract ResourceMarketplaceFacet is AccessControlBase {
         uint256 totalFeesCollected,
         uint256[4] memory ordersByResourceType
     ) {
-        MarketplaceStorage storage ms = marketplaceStorage();
-        
+        LibMarketplaceStorage.MarketplaceStorage storage ms = LibMarketplaceStorage.marketplaceStorage();
+
         totalFeesCollected = ms.totalFeesCollected;
-        
+
         for (uint256 i = 0; i < ms.activeOrderIds.length; i++) {
-            TradeOrder storage order = ms.orders[ms.activeOrderIds[i]];
+            LibMarketplaceStorage.TradeOrder storage order = ms.orders[ms.activeOrderIds[i]];
             if (order.active && block.timestamp <= order.expiresAt) {
                 totalActiveOrders++;
                 ordersByResourceType[order.resourceType]++;
             }
         }
     }
-    
+
+    /**
+     * @notice Get effective marketplace fee for a buyer (after Trade Hub reduction)
+     * @param buyer Buyer address
+     * @return feeBps Effective fee in basis points
+     */
+    function getEffectiveMarketFee(address buyer) external view returns (uint256 feeBps) {
+        return _getEffectiveFeeBps(buyer);
+    }
+
     // ==================== INTERNAL HELPERS ====================
-    
+
+    /**
+     * @notice Calculate effective marketplace fee with Trade Hub reduction
+     * @dev Trade Hub marketFeeReductionBps (L1=500..L5=4000) reduces the base 2% fee
+     *      Example: Trade Hub L5 = 4000 bps reduction â†’ 200 * 4000 / 10000 = 80 â†’ fee = 120 bps (1.2%)
+     * @param buyer Buyer address (fee payer)
+     * @return feeBps Effective fee in basis points
+     */
+    function _getEffectiveFeeBps(address buyer) internal view returns (uint256 feeBps) {
+        feeBps = BASE_MARKET_FEE_BPS;
+
+        bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(buyer);
+        if (colonyId == bytes32(0)) return feeBps;
+
+        LibBuildingsStorage.ColonyBuildingEffects memory effects =
+            LibBuildingsStorage.getColonyBuildingEffectsWithCards(colonyId);
+
+        if (effects.marketFeeReductionBps > 0) {
+            uint256 reduction = (feeBps * effects.marketFeeReductionBps) / 10000;
+            feeBps = feeBps > reduction ? feeBps - reduction : 0;
+        }
+    }
+
+    /**
+     * @notice Get user's colony via staking system or colony facet
+     * @dev Defensive - catches reverts from external contracts
+     */
     function _getUserColony(address user) internal view returns (bytes32) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
-        
+
         // Try staking system
         if (rs.config.stakingSystemAddress != address(0)) {
             try IStakingSystem(rs.config.stakingSystemAddress).getUserColony(user) returns (bytes32 colonyId) {
                 if (colonyId != bytes32(0)) return colonyId;
             } catch {}
         }
-        
+
         // Try colony facet
         if (rs.config.colonyFacetAddress != address(0)) {
             try IColonyFacet(rs.config.colonyFacetAddress).getUserPrimaryColony(user) returns (bytes32 colonyId) {
                 if (colonyId != bytes32(0)) return colonyId;
             } catch {}
         }
-        
+
         return bytes32(0);
     }
 }

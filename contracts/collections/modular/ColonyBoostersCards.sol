@@ -76,6 +76,16 @@ contract ColonyBoostersCards is
         bool locked;
     }
 
+    /// @notice Reward tier configuration for IRewardRedeemable bridge
+    struct RewardTierConfig {
+        BoosterSVGLib.TargetSystem targetSystem;
+        uint8 subType;
+        BoosterSVGLib.Rarity rarity;
+        bool isBlueprint;
+        bool useRandomRarity;
+        bool active;
+    }
+
     // Core NFT data
     mapping(uint256 => BoosterSVGLib.BoosterTraits) private _boosterTraits;
     uint256 private _tokenIdCounter;
@@ -99,6 +109,9 @@ contract ColonyBoostersCards is
     uint256 public maxMintsPerWallet;
     uint32 public attachCooldownSeconds;
     uint32 public detachCooldownSeconds;
+
+    // IRewardRedeemable bridge (appended for UUPS storage safety)
+    mapping(uint256 => mapping(uint256 => RewardTierConfig)) private _rewardTiers;
 
     // ==================== EVENTS ====================
 
@@ -128,6 +141,8 @@ contract ColonyBoostersCards is
     event BlueprintActivated(uint256 indexed tokenId, address indexed owner);
     event MetadataRendererUpdated(address indexed oldRenderer, address indexed newRenderer);
     event TypeMaxSupplyUpdated(BoosterSVGLib.TargetSystem system, uint8 subType, uint256 maxSupply);
+    event RewardTierConfigured(uint256 indexed collectionId, uint256 indexed tierId, BoosterSVGLib.TargetSystem targetSystem, uint8 subType);
+    event RewardMinted(uint256 indexed tokenId, address indexed recipient, uint256 collectionId, uint256 tierId);
 
     // ==================== ERRORS ====================
 
@@ -147,6 +162,7 @@ contract ColonyBoostersCards is
     error TargetAlreadyHasBooster();
     error AttachmentInCooldown();
     error BoosterLocked();
+    error RewardTierNotConfigured();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() { _disableInitializers(); }
@@ -602,6 +618,20 @@ contract ColonyBoostersCards is
         return _targetToBooster[targetKey];
     }
 
+    /// @notice Get cooldown info (Diamond pass-through helper)
+    function getCooldownInfo(uint256 tokenId) external view returns (uint32 cooldownUntil, bool locked) {
+        BoosterAttachment storage a = _attachments[tokenId];
+        return (a.cooldownUntil, a.locked);
+    }
+
+    /// @notice Get flat traits (Diamond pass-through helper)
+    function getTraitsFlat(uint256 tokenId) external view returns (
+        uint8 targetSystem, uint8 subType, uint8 rarity, bool isBlueprintFlag
+    ) {
+        BoosterSVGLib.BoosterTraits memory t = _boosterTraits[tokenId];
+        return (uint8(t.targetSystem), t.subType, uint8(t.rarity), t.isBlueprint);
+    }
+
     /**
      * @notice Get bonuses for a building target
      */
@@ -746,6 +776,199 @@ contract ColonyBoostersCards is
 
     function pause() external onlyRole(ADMIN_ROLE) { _pause(); }
     function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
+
+    // ============ IRewardRedeemable BRIDGE ============
+
+    /**
+     * @notice Configure what booster a (collectionId, tierId) pair produces
+     * @param collectionId Reward collection identifier (maps to targetSystem context)
+     * @param tierId Reward tier identifier (maps to subType + rarity)
+     * @param targetSystem Target system (Buildings, Evolution, Venture, Universal)
+     * @param subType SubType within system (0-7 for Buildings, 0-3 for others)
+     * @param rarity Rarity tier (ignored if useRandomRarity is true)
+     * @param isBlueprint Whether minted boosters start as blueprints
+     * @param useRandomRarity If true, rarity is randomized instead of fixed
+     */
+    function configureRewardTier(
+        uint256 collectionId,
+        uint256 tierId,
+        BoosterSVGLib.TargetSystem targetSystem,
+        uint8 subType,
+        BoosterSVGLib.Rarity rarity,
+        bool isBlueprint,
+        bool useRandomRarity
+    ) external onlyRole(ADMIN_ROLE) {
+        _validateSubType(targetSystem, subType);
+        _rewardTiers[collectionId][tierId] = RewardTierConfig({
+            targetSystem: targetSystem,
+            subType: subType,
+            rarity: rarity,
+            isBlueprint: isBlueprint,
+            useRandomRarity: useRandomRarity,
+            active: true
+        });
+        emit RewardTierConfigured(collectionId, tierId, targetSystem, subType);
+    }
+
+    /**
+     * @notice Batch configure reward tiers
+     */
+    function configureRewardTierBatch(
+        uint256[] calldata collectionIds,
+        uint256[] calldata tierIds,
+        BoosterSVGLib.TargetSystem[] calldata targetSystems,
+        uint8[] calldata subTypes,
+        BoosterSVGLib.Rarity[] calldata rarities,
+        bool[] calldata blueprints,
+        bool[] calldata randomRarities
+    ) external onlyRole(ADMIN_ROLE) {
+        require(
+            collectionIds.length == tierIds.length &&
+            collectionIds.length == targetSystems.length &&
+            collectionIds.length == subTypes.length &&
+            collectionIds.length == rarities.length &&
+            collectionIds.length == blueprints.length &&
+            collectionIds.length == randomRarities.length,
+            "Length mismatch"
+        );
+
+        for (uint256 i = 0; i < collectionIds.length; i++) {
+            _validateSubType(targetSystems[i], subTypes[i]);
+            _rewardTiers[collectionIds[i]][tierIds[i]] = RewardTierConfig({
+                targetSystem: targetSystems[i],
+                subType: subTypes[i],
+                rarity: rarities[i],
+                isBlueprint: blueprints[i],
+                useRandomRarity: randomRarities[i],
+                active: true
+            });
+            emit RewardTierConfigured(collectionIds[i], tierIds[i], targetSystems[i], subTypes[i]);
+        }
+    }
+
+    /**
+     * @notice Deactivate a reward tier
+     */
+    function deactivateRewardTier(uint256 collectionId, uint256 tierId) external onlyRole(ADMIN_ROLE) {
+        _rewardTiers[collectionId][tierId].active = false;
+    }
+
+    /**
+     * @notice Mint booster as reward (IRewardRedeemable interface)
+     * @dev Called by Diamond facets (AchievementReward, RewardRedemption, CollaborativeCrafting)
+     * @param collectionId Reward collection context
+     * @param tierId Reward tier (must be configured via configureRewardTier)
+     * @param to Recipient address
+     * @param amount Number of boosters to mint (returns last tokenId)
+     */
+    function mintReward(
+        uint256 collectionId,
+        uint256 tierId,
+        address to,
+        uint256 amount
+    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused returns (uint256) {
+        RewardTierConfig storage config = _rewardTiers[collectionId][tierId];
+        if (!config.active) revert RewardTierNotConfigured();
+
+        uint256 lastTokenId;
+
+        for (uint256 i = 0; i < amount; i++) {
+            lastTokenId = _mintFromRewardConfig(config, to, collectionId, tierId);
+        }
+
+        return lastTokenId;
+    }
+
+    /**
+     * @notice Check if minting is possible for a reward tier
+     */
+    function canMintReward(
+        uint256 collectionId,
+        uint256 tierId,
+        uint256 amount
+    ) external view returns (bool) {
+        RewardTierConfig storage config = _rewardTiers[collectionId][tierId];
+        if (!config.active) return false;
+        if (_tokenIdCounter + amount > maxSupply) return false;
+
+        bytes32 typeKey = _typeKey(config.targetSystem, config.subType);
+        uint256 maxForType = typeMaxSupply[typeKey];
+        if (maxForType > 0 && typeMinted[typeKey] + amount > maxForType) return false;
+
+        return true;
+    }
+
+    /**
+     * @notice Batch mint rewards with different tiers
+     */
+    function batchMintReward(
+        uint256 collectionId,
+        uint256[] calldata tierIds,
+        address to,
+        uint256 amount
+    ) external onlyRole(MINTER_ROLE) nonReentrant whenNotPaused returns (uint256[] memory) {
+        uint256[] memory tokenIds = new uint256[](tierIds.length);
+
+        for (uint256 i = 0; i < tierIds.length; i++) {
+            RewardTierConfig storage config = _rewardTiers[collectionId][tierIds[i]];
+            if (!config.active) revert RewardTierNotConfigured();
+
+            tokenIds[i] = _mintFromRewardConfig(config, to, collectionId, tierIds[i]);
+        }
+
+        return tokenIds;
+    }
+
+    /// @notice Boosters are not redeemable for YLW
+    function redeemReward(uint256, address) external pure returns (uint256) {
+        return 0;
+    }
+
+    /// @notice Boosters have no YLW redemption value
+    function getRewardValue(uint256) external pure returns (uint256) {
+        return 0;
+    }
+
+    /**
+     * @notice View reward tier configuration
+     */
+    function getRewardTierConfig(uint256 collectionId, uint256 tierId) external view returns (RewardTierConfig memory) {
+        return _rewardTiers[collectionId][tierId];
+    }
+
+    function _mintFromRewardConfig(
+        RewardTierConfig storage config,
+        address to,
+        uint256 collectionId,
+        uint256 tierId
+    ) private returns (uint256) {
+        _validateMint(to, 1, config.targetSystem, config.subType);
+
+        uint256 tokenId = ++_tokenIdCounter;
+        bytes32 typeKey = _typeKey(config.targetSystem, config.subType);
+        typeMinted[typeKey]++;
+        _walletMintCount[to]++;
+
+        BoosterSVGLib.Rarity rarity = config.useRandomRarity
+            ? _calculateRarity(tokenId, config.targetSystem, config.subType, msg.sender)
+            : config.rarity;
+
+        _boosterTraits[tokenId] = BoosterSVGLib.BoosterTraits({
+            targetSystem: config.targetSystem,
+            subType: config.subType,
+            rarity: rarity,
+            primaryBonusBps: _calculatePrimaryBonus(config.targetSystem, config.subType, rarity),
+            secondaryBonusBps: _calculateSecondaryBonus(config.targetSystem, config.subType, rarity),
+            level: _calculateLevel(rarity),
+            isBlueprint: config.isBlueprint
+        });
+
+        _safeMint(to, tokenId);
+        emit BoosterMinted(tokenId, to, config.targetSystem, config.subType, rarity);
+        emit RewardMinted(tokenId, to, collectionId, tierId);
+
+        return tokenId;
+    }
 
     // ============ INTERNAL FUNCTIONS ============
 

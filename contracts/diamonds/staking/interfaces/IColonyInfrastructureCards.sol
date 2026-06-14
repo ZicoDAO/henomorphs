@@ -54,7 +54,8 @@ interface IColonyInfrastructureCards {
     function unequipFromColony(uint256 tokenId) external;
     function useInfrastructure(uint256 tokenId) external returns (bool);
     function repairInfrastructure(uint256 tokenId, uint8 durabilityToRestore) external returns (uint256 cost);
-    
+    function upgradeRarity(uint256 tokenId) external returns (uint8 newRarity);
+
     // Transfer functions (Model D: Conditional Transfer)
     function requestTransfer(uint256 tokenId, address to) external;
     function approveTransfer(uint256 tokenId, address to) external;
@@ -65,4 +66,5 @@ interface IColonyInfrastructureCards {
     event InfrastructureUnequipped(uint256 indexed tokenId, uint256 indexed colonyId);
     event InfrastructureUsed(uint256 indexed tokenId, uint256 indexed colonyId);
     event InfrastructureRepaired(uint256 indexed tokenId, uint8 durabilityRestored, uint256 costPaid);
+    event InfrastructureUpgraded(uint256 indexed tokenId, uint8 oldRarity, uint8 newRarity);
 }

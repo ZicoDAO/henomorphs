@@ -26,6 +26,41 @@ contract MissionFacet is AccessControlBase {
     using SafeERC20 for IERC20;
 
     // ============================================================
+    // REBALANCE CONSTANTS (2026-05 difficulty / agency upgrade)
+    // ============================================================
+    // Context: events used to be consequence-free. respondToEvent computed
+    // outcome.damageTaken / outcome.rewardBonus but never applied them, so the
+    // optimal play was "pick any response, just don't let it time out" and
+    // Scan was strictly dominated (no hidden danger to reveal). These
+    // constants give event resolution real teeth (failure = damage) and real
+    // payoff (success = resources), give Scan information value via move-into-
+    // fog ambush risk (B5), and reward squads that actually fight (B6).
+
+    // B4 â€” per-event-type damage applied to the squad lead on a FAILED
+    // response. Same channel as combat defeat (participant.damageTaken;
+    // incapacitation at > initialCharge / 2).
+    uint16 internal constant EVENT_DMG_PATROL = 15;
+    uint16 internal constant EVENT_DMG_TRAP = 20;
+    uint16 internal constant EVENT_DMG_AMBUSH = 25;
+    uint16 internal constant EVENT_DMG_ENVIRONMENTAL = 18;
+    uint16 internal constant EVENT_DMG_DEFAULT = 12;
+
+    // B4 â€” dataFragments granted on a successful, reward-bearing event.
+    uint8 internal constant EVENT_REWARD_FRAGMENTS = 8;
+
+    // B5 â€” chance (%) that moving onto an UNDISCOVERED tile hiding an enemy
+    // springs an ambush (damage, enemy NOT cleared). Scanning the tile first
+    // sets discovered = true and avoids this entirely â€” Scan's reason to exist.
+    uint8 internal constant MOVE_AMBUSH_CHANCE = 50;
+    uint16 internal constant MOVE_AMBUSH_DAMAGE = 18;
+
+    // B6 â€” engagement bonus: combat victories pay a small reward (basis points
+    // of baseReward per win, capped). Combat costs charge and a loss dents the
+    // performance rating, so this is a genuine risk/reward, not free money.
+    uint16 internal constant COMBAT_WIN_BONUS_BP = 200;      // +2% per win
+    uint16 internal constant COMBAT_WIN_BONUS_CAP_BP = 1000; // cap at +10%
+
+    // ============================================================
     // EVENTS
     // ============================================================
 
@@ -47,6 +82,10 @@ contract MissionFacet is AccessControlBase {
     );
     event MissionEventTriggered(bytes32 indexed sessionId, uint8 eventId, LibMissionStorage.EventType eventType);
     event MissionEventResolved(bytes32 indexed sessionId, uint8 eventId, bool success);
+    // Emitted by expireMissionEvent â€” surfaced to UI so the player sees
+    // "event timed out, mission continues" instead of being silently
+    // unstuck. Penalty already accounted for via state.eventsFailed.
+    event MissionEventTimedOut(bytes32 indexed sessionId, uint8 eventId);
     event MissionObjectiveCompleted(bytes32 indexed sessionId, uint8 objectiveId);
     event MissionCompleted(
         bytes32 indexed sessionId,
@@ -89,6 +128,10 @@ contract MissionFacet is AccessControlBase {
     error EventResponseRequired(bytes32 sessionId, uint8 eventId);
     error NoEventPending(bytes32 sessionId);
     error EventDeadlinePassed(bytes32 sessionId);
+    // 2026-05 upgrade â€” distinguishes "event expired, please clean up" from
+    // "event still has time" so expireMissionEvent can be permissionless
+    // without racing legitimate respondToEvent calls.
+    error EventStillActive(bytes32 sessionId, uint256 currentBlock, uint256 deadline);
     error InvalidParticipantCount(uint256 provided, uint8 min, uint8 max);
     error ParticipantNotOwned(uint256 combinedId, address expected, address actual);
     error ParticipantAlreadyLocked(uint256 combinedId);
@@ -368,6 +411,22 @@ contract MissionFacet is AccessControlBase {
             results[i] = _resolveAction(sessionId, actions[i]);
             state.totalActions++;
 
+            // The action itself fully executed (charge consumed, combat/loot/
+            // scan resolved) regardless of whether it ALSO rolled a random
+            // event. Emit its result BEFORE the event-trigger branch so a
+            // Combat action that coincides with an event still surfaces its
+            // win/lose. Previously the early `break` below skipped this emit,
+            // so the client â€” which derives combat outcome SOLELY from
+            // MissionActionPerformed â€” opened the event modal with no combat
+            // result toast: the player saw charge spent with no resolution.
+            emit MissionActionPerformed(
+                sessionId,
+                actions[i].participantIndex,
+                actions[i].actionType,
+                results[i].success,
+                results[i].chargeUsed
+            );
+
             // Check if event triggered
             if (results[i].triggeredEventId > 0) {
                 state.phase = uint8(LibMissionStorage.MissionPhase.EventPending);
@@ -378,14 +437,6 @@ contract MissionFacet is AccessControlBase {
                 emit MissionEventTriggered(sessionId, results[i].triggeredEventId, LibMissionStorage.EventType(results[i].triggeredEventId % 6));
                 break; // Stop processing further actions
             }
-
-            emit MissionActionPerformed(
-                sessionId,
-                actions[i].participantIndex,
-                actions[i].actionType,
-                results[i].success,
-                results[i].chargeUsed
-            );
         }
 
         state.lastActionBlock = uint32(block.number);
@@ -421,13 +472,28 @@ contract MissionFacet is AccessControlBase {
             revert EventDeadlinePassed(sessionId);
         }
 
+        // Capture before clearing â€” the resolved event id is needed for the
+        // emit below, which previously logged 0 (the already-cleared value).
+        uint8 resolvedEventId = state.pendingEventId;
+
         // Resolve event
-        outcome = _resolveEvent(sessionId, state.pendingEventId, response);
+        outcome = _resolveEvent(sessionId, resolvedEventId, response);
 
         if (outcome.success) {
             state.eventsResolved++;
         } else {
             state.eventsFailed++;
+            // Apply the event's bite to the squad lead â€” mirrors combat defeat
+            // (participant.damageTaken + incapacitation at > initialCharge / 2).
+            // Until now outcome.damageTaken was computed and discarded, which is
+            // exactly why events were consequence-free.
+            if (outcome.damageTaken > 0) {
+                LibMissionStorage.PackedParticipant storage lead = ms.sessionParticipants[sessionId][0];
+                lead.damageTaken += outcome.damageTaken;
+                if (lead.damageTaken > lead.initialCharge / 2) {
+                    lead.status = 1; // Incapacitated
+                }
+            }
         }
 
         // Clear event state
@@ -442,7 +508,59 @@ contract MissionFacet is AccessControlBase {
             state.phase = uint8(LibMissionStorage.MissionPhase.ReadyToComplete);
         }
 
-        emit MissionEventResolved(sessionId, state.pendingEventId, outcome.success);
+        emit MissionEventResolved(sessionId, resolvedEventId, outcome.success);
+    }
+
+    /**
+     * @notice Auto-resolve a pending event whose response deadline has passed.
+     * @dev Permissionless cleanup â€” the session initiator (or any keeper)
+     *      can call this to break the EventPending lock without abandoning
+     *      the squad. Penalty is the same as a failed Ignore response:
+     *      eventsFailed++ (counts toward "eventIgnored" failure reason in
+     *      _calculatePerformanceRating). After this call the session is
+     *      back in Active phase and performMissionActions / extractMission
+     *      become callable again.
+     *
+     *      This addresses a deployed-state bug where the contract had no
+     *      auto-fail path for EventPending â€” a player who missed the event
+     *      response window was forced to abandon (forfeiting the squad
+     *      lock + accumulated rewards).
+     */
+    function expireMissionEvent(bytes32 sessionId)
+        external
+        whenMissionSystemActive
+        nonReentrant
+    {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
+
+        if (state.phase != uint8(LibMissionStorage.MissionPhase.EventPending)) {
+            revert NoEventPending(sessionId);
+        }
+        if (block.number <= state.pendingEventDeadline) {
+            revert EventStillActive(sessionId, block.number, state.pendingEventDeadline);
+        }
+
+        uint8 expiredEventId = state.pendingEventId;
+
+        // Tally as a failed event (mirrors the response-failure path in
+        // _resolveEvent + respondToEvent so performance rating treats this
+        // identically to a botched Fight/Hide/Flee response).
+        state.eventsFailed++;
+
+        // Clear event state and return to active phase.
+        state.pendingEventId = 0;
+        state.pendingEventDeadline = 0;
+        state.phase = uint8(LibMissionStorage.MissionPhase.Active);
+
+        // After clearing, the player may have already met all required
+        // objectives â€” flip phase straight to ReadyToComplete so they can
+        // extract without an extra action tx.
+        if (_checkAllRequiredObjectivesComplete(sessionId)) {
+            state.phase = uint8(LibMissionStorage.MissionPhase.ReadyToComplete);
+        }
+
+        emit MissionEventTimedOut(sessionId, expiredEventId);
     }
 
     /**
@@ -460,6 +578,15 @@ contract MissionFacet is AccessControlBase {
     {
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
         address initiator = ms.sessionInitiators[sessionId];
+
+        // Mark Survive/Time as formally complete + emit completion events.
+        // Must run BEFORE _calculateFinalRewards so performance rating and
+        // perfect-completion bonus see the freshly closed objectives.
+        // _checkAllRequiredObjectivesComplete already gated this extract via
+        // live evaluation, so the conditions checked here are guaranteed
+        // satisfiable for the required slots; bonus Survive/Time still get
+        // a chance to flip if their condition holds.
+        _completeTerminalObjectives(sessionId);
 
         // Calculate final rewards with all bonuses
         result = _calculateFinalRewards(sessionId);
@@ -576,118 +703,14 @@ contract MissionFacet is AccessControlBase {
     // ============================================================
     // VIEW FUNCTIONS
     // ============================================================
-
-    /**
-     * @notice Get current mission progress
-     * @param sessionId Session to query
-     * @return session Full session details
-     */
-    function getMissionProgress(bytes32 sessionId)
-        external
-        view
-        returns (LibMissionStorage.MissionSession memory session)
-    {
-        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
-        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
-
-        session.sessionId = sessionId;
-        session.initiator = ms.sessionInitiators[sessionId];
-        session.passCollectionId = state.passCollectionId;
-        session.passTokenId = state.passTokenId;
-        session.missionVariant = state.missionVariant;
-        session.phase = LibMissionStorage.MissionPhase(state.phase);
-        session.currentNodeId = state.currentNodeId;
-        session.startBlock = state.startBlock;
-        session.revealBlock = state.revealBlock;
-        session.deadlineBlock = state.deadlineBlock;
-        session.lastActionBlock = state.lastActionBlock;
-        session.totalActions = state.totalActions;
-        session.combatsWon = state.combatsWon;
-        session.combatsLost = state.combatsLost;
-        session.chargeUsed = state.chargeUsed;
-        session.eventsTriggered = state.eventsTriggered;
-        session.eventsResolved = state.eventsResolved;
-        session.eventsFailed = state.eventsFailed;
-        session.pendingEventId = state.pendingEventId;
-        session.pendingEventDeadline = state.pendingEventDeadline;
-        session.accumulatedReward = uint256(state.rewardPool) * 1e6;
-    }
-
-    /**
-     * @notice Get mission map nodes
-     * @param sessionId Session to query
-     * @return nodes Array of map nodes
-     */
-    function getMissionMap(bytes32 sessionId)
-        external
-        view
-        returns (LibMissionStorage.MapNode[] memory nodes)
-    {
-        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
-        LibMissionStorage.PackedMapNodes storage packedNodes = ms.sessionMaps[sessionId];
-        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
-
-        uint8 mapSize = ms.variantConfigs[state.passCollectionId][state.missionVariant].mapSize;
-        nodes = new LibMissionStorage.MapNode[](mapSize);
-
-        for (uint8 i = 0; i < mapSize; i++) {
-            nodes[i] = LibMissionStorage.getNode(packedNodes, i);
-        }
-    }
-
-    /**
-     * @notice Get mission objectives
-     * @param sessionId Session to query
-     * @return objectives Array of objectives
-     */
-    function getMissionObjectives(bytes32 sessionId)
-        external
-        view
-        returns (LibMissionStorage.MissionObjective[] memory objectives)
-    {
-        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
-        LibMissionStorage.PackedObjectives storage packedObjectives = ms.sessionObjectives[sessionId];
-        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
-
-        LibMissionStorage.MissionVariantConfig storage config = ms.variantConfigs[state.passCollectionId][state.missionVariant];
-        uint8 totalObjectives = config.requiredObjectivesCount + config.bonusObjectivesCount;
-        objectives = new LibMissionStorage.MissionObjective[](totalObjectives);
-
-        for (uint8 i = 0; i < totalObjectives; i++) {
-            objectives[i] = LibMissionStorage.getObjective(packedObjectives, i);
-        }
-    }
-
-    /**
-     * @notice Get active event details
-     * @param sessionId Session to query
-     * @return missionEvent Current event details (if any)
-     */
-    function getActiveMissionEvent(bytes32 sessionId)
-        external
-        view
-        returns (LibMissionStorage.MissionEvent memory missionEvent)
-    {
-        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
-        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
-
-        if (state.pendingEventId == 0) {
-            return missionEvent; // Empty event
-        }
-
-        missionEvent.eventId = state.pendingEventId;
-        missionEvent.eventType = LibMissionStorage.EventType(state.pendingEventId % 6);
-        missionEvent.triggerBlock = state.lastActionBlock;
-        missionEvent.deadlineBlock = state.pendingEventDeadline;
-        missionEvent.difficulty = uint8((uint256(ms.sessionEntropy[sessionId]) >> 8) % 10) + 1;
-        missionEvent.penaltyOnIgnore = 10;
-    }
+    //
+    // Most pure-storage views moved to MissionConfigFacet to free bytecode
+    // budget on this facet (size-constrained at ~33KB). The two views left
+    // here depend on internal helpers (_checkAllRequiredObjectivesComplete,
+    // _calculateFinalRewards) that aren't worth duplicating.
 
     /**
      * @notice Check if mission can be extracted
-     * @param sessionId Session to query
-     * @return canExtract Whether mission can be completed
-     * @return reason Reason if cannot extract
      */
     function canExtractMission(bytes32 sessionId)
         external
@@ -711,47 +734,10 @@ contract MissionFacet is AccessControlBase {
 
     /**
      * @notice Estimate rewards for completing current mission state
-     * @param sessionId Session to query
-     * @return estimatedReward Estimated YLW reward
      */
     function estimateMissionRewards(bytes32 sessionId) external view returns (uint256 estimatedReward) {
         LibMissionStorage.MissionResult memory result = _calculateFinalRewards(sessionId);
         return result.totalReward;
-    }
-
-    /**
-     * @notice Get user's active mission session
-     * @param user User address
-     * @return sessionId Active session ID (bytes32(0) if none)
-     */
-    function getUserActiveMission(address user) external view returns (bytes32 sessionId) {
-        return LibMissionStorage.missionStorage().userActiveMission[user];
-    }
-
-    /**
-     * @notice Get user's mission profile and statistics
-     * @param user User address
-     * @return profile User's mission profile
-     */
-    function getUserMissionProfile(address user)
-        external
-        view
-        returns (LibMissionStorage.UserMissionProfile memory profile)
-    {
-        return LibMissionStorage.missionStorage().userProfiles[user];
-    }
-
-    /**
-     * @notice Get mission participants
-     * @param sessionId Session to query
-     * @return participants Array of participant data
-     */
-    function getMissionParticipants(bytes32 sessionId)
-        external
-        view
-        returns (LibMissionStorage.PackedParticipant[] memory participants)
-    {
-        return LibMissionStorage.missionStorage().sessionParticipants[sessionId];
     }
 
     // ============================================================
@@ -1162,17 +1148,24 @@ contract MissionFacet is AccessControlBase {
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
         LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
         LibMissionStorage.PackedParticipant[] storage participants = ms.sessionParticipants[sessionId];
-
-        // Get pass collection info for notifications
         LibMissionStorage.MissionPassCollection storage passConfig = ms.passCollections[state.passCollectionId];
 
+        // PackedParticipant.combinedId is uint128, but _lockParticipants stored
+        // the lock under the FULL uint256 key `(specimenCollectionId<<128)|tokenId`.
+        // The truncated value alone is not enough to reconstruct the original key,
+        // so iterate over every eligible specimen collection and clear the entry
+        // that actually points at this session. Other candidates are no-ops.
         for (uint256 i = 0; i < participants.length; i++) {
-            uint256 combinedId = uint256(participants[i].combinedId);
-            ms.lockedHenomorphs[combinedId] = false;
-            delete ms.henomorphActiveMission[combinedId];
+            uint256 truncated = uint256(participants[i].combinedId);
 
-            // Notify Diamond about mission removal (metadata update)
-            _notifyMissionRemoved(combinedId, sessionId, passConfig.collectionAddress);
+            for (uint256 j = 0; j < passConfig.eligibleCollections.length; j++) {
+                uint256 fullKey = (uint256(passConfig.eligibleCollections[j]) << 128) | truncated;
+                if (ms.henomorphActiveMission[fullKey] == sessionId) {
+                    ms.lockedHenomorphs[fullKey] = false;
+                    delete ms.henomorphActiveMission[fullKey];
+                    _notifyMissionRemoved(fullKey, sessionId, passConfig.collectionAddress);
+                }
+            }
         }
     }
 
@@ -1362,6 +1355,163 @@ contract MissionFacet is AccessControlBase {
             combatNodesPlaced = newCombatCount;
             LibMissionStorage.setNode(nodes, i, node);
         }
+
+        // Quota enforcement â€” pre-fix, _determineNodeType rolled each non-
+        // forced slot independently against `lootNodeChance` etc., so a 6-8
+        // node map could legitimately end with 0 Loot tiles while the
+        // template's required Collect target was 3-5. _ensureMinimumPayloads
+        // counts the surface area of each payload type and converts Empty
+        // tiles to fill the gap so every required objective has at least
+        // enough nodes to satisfy its maxTarget.
+        _ensureMinimumPayloads(sessionId, entropy, config, nodes, mapSize);
+    }
+
+    /**
+     * @notice Top up Loot/Combat/Terminal node counts so every required
+     * objective has enough payload tiles to be completable.
+     * @dev Iterates the variant's objective templates to find max(target)
+     * per type, counts existing matching tiles in the generated map,
+     * and converts Empty tiles (skipping node 0 and the Exit) to make up
+     * any shortfall. Conversion order is deterministic from `entropy` so
+     * identical (seed, variant) pairs still produce identical maps.
+     */
+    function _ensureMinimumPayloads(
+        bytes32 sessionId,
+        bytes32 entropy,
+        LibMissionStorage.MissionVariantConfig storage config,
+        LibMissionStorage.PackedMapNodes storage nodes,
+        uint8 mapSize
+    ) internal {
+        // Templates configured? Then required-objective math drives quotas.
+        // Legacy variants (templateCount=0) get conservative defaults so
+        // they don't regress vs. the pre-fix RNG.
+        uint8 needLoot;
+        uint8 needEnemy;
+        uint8 needTerminal;
+        if (config.objectiveTemplateCount > 0) {
+            for (uint8 ti = 0; ti < config.objectiveTemplateCount; ti++) {
+                LibMissionStorage.ObjectiveTemplate storage tmpl = config.objectiveTemplates[ti];
+                if (!tmpl.enabled || !tmpl.isRequired) continue;
+                if (tmpl.objectiveType == LibMissionStorage.ObjectiveType.Collect) {
+                    if (tmpl.maxTarget > needLoot) needLoot = tmpl.maxTarget;
+                } else if (tmpl.objectiveType == LibMissionStorage.ObjectiveType.Defeat) {
+                    if (tmpl.maxTarget > needEnemy) needEnemy = tmpl.maxTarget;
+                } else if (tmpl.objectiveType == LibMissionStorage.ObjectiveType.Hack) {
+                    if (tmpl.maxTarget > needTerminal) needTerminal = tmpl.maxTarget;
+                }
+            }
+        } else {
+            // Legacy floor: 2 of each so no variant is stuck with 0 payload.
+            needLoot = 2;
+            needEnemy = 2;
+            needTerminal = 1;
+        }
+
+        // Count current placements (node 0 is Empty start, last is Exit;
+        // both excluded from conversion below).
+        uint8 haveLoot;
+        uint8 haveEnemy;
+        uint8 haveTerminal;
+        for (uint8 i = 0; i < mapSize; i++) {
+            LibMissionStorage.MapNode memory n = LibMissionStorage.getNode(nodes, i);
+            if (n.hasLoot) haveLoot++;
+            if (n.hasEnemy) haveEnemy++;
+            if (n.nodeType == LibMissionStorage.NodeType.Terminal) haveTerminal++;
+        }
+
+        // Multi-pass conversion to fill quotas. Priority by source type so
+        // higher-value gameplay tiles are preserved when possible:
+        //   pass 0: Empty tiles (no gameplay value; preferred first)
+        //   pass 1: Event tiles (random outcomes, OK to consume)
+        //   pass 2: Secret tiles (random outcomes, last resort)
+        //   pass 3: EXCESS Combat tiles (haveEnemy > needEnemy)
+        //   pass 4: EXCESS Terminal tiles (haveTerminal > needTerminal)
+        // Objective / Exit / start / first `minCombatNodes` Combats are NEVER
+        // converted â€” they're either mission-critical or guaranteed minimums.
+        //
+        // 2026-05-11 PATCH (v1): single-pass Empty-only was too restrictive.
+        // 2026-05-11 PATCH (v2): even 3-pass (Empty/Event/Secret) wasn't
+        // sufficient on high-lootChance variants where RNG plus minCombatNodes
+        // consumed all non-Combat slots. Adding excess-payload demotion
+        // (passes 3-4) guarantees quotas are met whenever the math allows:
+        //   needLoot + needEnemy + needTerminal <= mapSize - 2.
+        // For V4 mapSize=14 / minCombat=5 / needEnemy=4 / needLoot=6 /
+        // needTerminal=2 = 12 â‰¤ 12, the patch now satisfies even worst-case
+        // RNG. The 1 excess Combat (minCombat 5 - needEnemy 4) gets demoted
+        // to Loot in pass 3, providing the final tile needed.
+        uint8 minCombatProtect = config.minCombatNodes;
+        for (uint8 pass = 0; pass < 5; pass++) {
+            if (haveLoot >= needLoot && haveEnemy >= needEnemy && haveTerminal >= needTerminal) break;
+
+            for (uint8 i = 1; i + 1 < mapSize; i++) {
+                if (haveLoot >= needLoot && haveEnemy >= needEnemy && haveTerminal >= needTerminal) break;
+
+                LibMissionStorage.MapNode memory n = LibMissionStorage.getNode(nodes, i);
+
+                // Source-type gate per pass.
+                bool sourceOk;
+                if (pass == 0) {
+                    sourceOk = (n.nodeType == LibMissionStorage.NodeType.Empty);
+                } else if (pass == 1) {
+                    sourceOk = (n.nodeType == LibMissionStorage.NodeType.Event);
+                } else if (pass == 2) {
+                    sourceOk = (n.nodeType == LibMissionStorage.NodeType.Secret);
+                } else if (pass == 3) {
+                    // Excess Combat: only demote if haveEnemy > needEnemy AND
+                    // this slot is beyond the forced minCombatNodes range
+                    // (forced Combats sit at indices 1..minCombatNodes per
+                    // `_generateNode`; demoting them would violate the variant
+                    // contract). Don't pre-decrement: only convert when there
+                    // is genuine excess.
+                    sourceOk = (
+                        n.nodeType == LibMissionStorage.NodeType.Combat
+                        && n.hasEnemy
+                        && i > minCombatProtect
+                        && haveEnemy > needEnemy
+                    );
+                } else {
+                    // pass 4: excess Terminal
+                    sourceOk = (
+                        n.nodeType == LibMissionStorage.NodeType.Terminal
+                        && haveTerminal > needTerminal
+                    );
+                }
+                if (!sourceOk) continue;
+
+                // Pick the most under-quota target type. Tie-break with entropy.
+                uint256 pick = uint256(keccak256(abi.encodePacked(entropy, "ensureMin", i, pass))) % 3;
+                bool converted = false;
+                if (haveLoot < needLoot && (pick == 0 || (haveEnemy >= needEnemy && haveTerminal >= needTerminal))) {
+                    // Demoting a Combat? Clear hasEnemy and decrement count
+                    // before flipping the tile, otherwise the post-write count
+                    // would still consider it an enemy.
+                    if (n.hasEnemy) { n.hasEnemy = false; haveEnemy--; }
+                    n.nodeType = LibMissionStorage.NodeType.Loot;
+                    n.hasLoot = true;
+                    haveLoot++;
+                    converted = true;
+                } else if (haveEnemy < needEnemy && (pick == 1 || haveTerminal >= needTerminal)) {
+                    n.nodeType = LibMissionStorage.NodeType.Combat;
+                    n.hasEnemy = true;
+                    haveEnemy++;
+                    converted = true;
+                } else if (haveTerminal < needTerminal) {
+                    // Avoid double-counting if this was already a Terminal (pass 4 noop).
+                    if (n.nodeType != LibMissionStorage.NodeType.Terminal) {
+                        if (n.hasEnemy) { n.hasEnemy = false; haveEnemy--; }
+                        n.nodeType = LibMissionStorage.NodeType.Terminal;
+                        haveTerminal++;
+                        converted = true;
+                    }
+                }
+
+                if (converted) LibMissionStorage.setNode(nodes, i, n);
+            }
+        }
+
+        // Silence unused-var warnings if strict; sessionId reserved for a
+        // future event ("MapQuotaEnforced") that monitoring can subscribe to.
+        sessionId;
     }
 
     function _generateNode(
@@ -1540,6 +1690,48 @@ contract MissionFacet is AccessControlBase {
         }
     }
 
+    /**
+     * @notice Mark Survive/Time objectives complete based on session-final
+     * state and emit MissionObjectiveCompleted for each one.
+     * @dev Called from extractMission BEFORE rewards calculation so
+     * _calculateFinalRewards / performance rating reflect the freshly-
+     * marked objectives. _checkAllRequiredObjectivesComplete (the gate
+     * that flipped Activeâ†’ReadyToComplete) accepts these via live check,
+     * so by the time we reach extract the conditions are guaranteed â€”
+     * but the on-chain `isCompleted` flag still needs to be set for
+     * downstream readers (UI, rewards, perfect-completion check).
+     */
+    function _completeTerminalObjectives(bytes32 sessionId) internal {
+        LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+        LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
+        LibMissionStorage.PackedObjectives storage objectives = ms.sessionObjectives[sessionId];
+
+        LibMissionStorage.MissionVariantConfig storage config = ms.variantConfigs[state.passCollectionId][state.missionVariant];
+        uint8 totalObjectives = config.requiredObjectivesCount + config.bonusObjectivesCount;
+
+        for (uint8 i = 0; i < totalObjectives; i++) {
+            LibMissionStorage.MissionObjective memory obj = LibMissionStorage.getObjective(objectives, i);
+            if (obj.isCompleted) continue;
+
+            bool shouldComplete = false;
+            if (obj.objectiveType == LibMissionStorage.ObjectiveType.Survive) {
+                shouldComplete = (state.combatsLost == 0);
+            } else if (obj.objectiveType == LibMissionStorage.ObjectiveType.Time) {
+                uint256 elapsed = uint256(state.lastActionBlock) > uint256(state.revealBlock)
+                    ? uint256(state.lastActionBlock) - uint256(state.revealBlock)
+                    : 0;
+                shouldComplete = (elapsed <= uint256(obj.targetAmount));
+            }
+
+            if (shouldComplete) {
+                obj.currentProgress = obj.targetAmount;
+                obj.isCompleted = true;
+                LibMissionStorage.setObjective(objectives, i, obj);
+                emit MissionObjectiveCompleted(sessionId, i);
+            }
+        }
+    }
+
     function _checkAllRequiredObjectivesComplete(bytes32 sessionId) internal view returns (bool) {
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
         LibMissionStorage.PackedMissionState storage state = ms.packedStates[sessionId];
@@ -1549,9 +1741,29 @@ contract MissionFacet is AccessControlBase {
 
         for (uint8 i = 0; i < requiredCount; i++) {
             LibMissionStorage.MissionObjective memory obj = LibMissionStorage.getObjective(objectives, i);
-            if (!obj.isCompleted) {
+            if (obj.isCompleted) continue;
+            // Live check for terminal objectives â€” Survive/Time can satisfy
+            // the gate even before they are formally marked completed
+            // (the formal mark + event happens in _completeTerminalObjectives
+            // at extractMission time). Without this, phase would never flip
+            // to ReadyToComplete on missions that include Survive/Time as
+            // required, so extractMission could never be called.
+            if (obj.objectiveType == LibMissionStorage.ObjectiveType.Survive) {
+                if (state.combatsLost == 0) continue;
                 return false;
             }
+            if (obj.objectiveType == LibMissionStorage.ObjectiveType.Time) {
+                // Player must complete within obj.targetAmount blocks of the
+                // reveal block (when actual gameplay starts). targetAmount is
+                // a direct block budget â€” admin sets meaningful values per
+                // variant via objective templates.
+                uint256 elapsed = uint256(state.lastActionBlock) > uint256(state.revealBlock)
+                    ? uint256(state.lastActionBlock) - uint256(state.revealBlock)
+                    : 0;
+                if (elapsed <= uint256(obj.targetAmount)) continue;
+                return false;
+            }
+            return false;
         }
         return true;
     }
@@ -1587,7 +1799,15 @@ contract MissionFacet is AccessControlBase {
 
         // Check for random event trigger
         if (_shouldTriggerEvent(sessionId, state)) {
-            result.triggeredEventId = uint8((uint256(ms.sessionEntropy[sessionId]) >> 24) % 10) + 1;
+            // Derive the event ID from a per-action hash, NOT a fixed slice of
+            // sessionEntropy. The old `(entropy >> 24) % 10` depended only on
+            // the session seed, so every event a mission ever rolled was the
+            // SAME id â€” players saw "disarm bomb" on repeat (Jerry 2026-05-30).
+            // Mixing in `totalActions` (changes every action) re-rolls each
+            // trigger across the full 1..10 pool, so consecutive events differ.
+            result.triggeredEventId = uint8(
+                uint256(keccak256(abi.encodePacked(ms.sessionEntropy[sessionId], state.totalActions, "eventId"))) % 10
+            ) + 1;
         }
 
         // Update objective progress if applicable
@@ -1622,7 +1842,7 @@ contract MissionFacet is AccessControlBase {
         LibMissionStorage.MapNode memory currentNode = LibMissionStorage.getNode(nodes, state.currentNodeId);
 
         if (action.actionType == LibMissionStorage.MissionActionType.Move) {
-            result = _processMoveAction(sessionId, action.targetNodeId, state, nodes);
+            result = _processMoveAction(sessionId, action.targetNodeId, state, nodes, participant);
         } else if (action.actionType == LibMissionStorage.MissionActionType.Scan) {
             result = _processScanAction(sessionId, state, nodes);
         } else if (action.actionType == LibMissionStorage.MissionActionType.Loot) {
@@ -1667,10 +1887,11 @@ contract MissionFacet is AccessControlBase {
     }
 
     function _processMoveAction(
-        bytes32,
+        bytes32 sessionId,
         uint8 targetNodeId,
         LibMissionStorage.PackedMissionState storage state,
-        LibMissionStorage.PackedMapNodes storage nodes
+        LibMissionStorage.PackedMapNodes storage nodes,
+        LibMissionStorage.PackedParticipant storage participant
     ) internal returns (LibMissionStorage.ActionResult memory result) {
         LibMissionStorage.MapNode memory targetNode = LibMissionStorage.getNode(nodes, targetNodeId);
 
@@ -1680,10 +1901,37 @@ contract MissionFacet is AccessControlBase {
             return result;
         }
 
+        // Capture fog state BEFORE we discover the tile below.
+        bool wasFog = !targetNode.discovered;
+
+        // B5: stepping blind into a hostile tile can spring an ambush. Only
+        // fires on tiles that were never scanned (wasFog) and that hide an
+        // enemy. Scan reveals current+1..+3 (sets discovered = true), so
+        // scouting ahead defuses this â€” that is Scan's reason to exist.
+        // The enemy is NOT cleared: the squad still has to fight or bypass it.
+        if (wasFog && targetNode.hasEnemy) {
+            LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
+            uint256 ambushRoll = uint256(
+                keccak256(abi.encodePacked(ms.sessionEntropy[sessionId], "ambush", state.totalActions))
+            ) % 100;
+            if (ambushRoll < MOVE_AMBUSH_CHANCE) {
+                participant.damageTaken += MOVE_AMBUSH_DAMAGE;
+                if (participant.damageTaken > participant.initialCharge / 2) {
+                    participant.status = 1; // Incapacitated
+                }
+                result.damageTaken = MOVE_AMBUSH_DAMAGE;
+            }
+        }
+
         // Move to target
         state.currentNodeId = targetNodeId;
 
-        // Discover node
+        // Discover node â€” count toward Discover objective only if we just
+        // un-fogged it. Subsequent moves through the same tile shouldn't
+        // pay out Discover progress.
+        if (wasFog) {
+            result.newlyDiscoveredCount = 1;
+        }
         targetNode.discovered = true;
         LibMissionStorage.setNode(nodes, targetNodeId, targetNode);
 
@@ -1698,19 +1946,42 @@ contract MissionFacet is AccessControlBase {
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
         uint8 mapSize = ms.variantConfigs[state.passCollectionId][state.missionVariant].mapSize;
 
-        // Discover adjacent nodes
+        // Discover surrounding nodes â€” track how many were genuinely revealed
+        // (i.e. previously discovered=false) so Discover objective progress
+        // reflects actual exploration value, not spam-scan farming on
+        // already-mapped neighbours.
+        //
+        // Reveal radius: one tile BEHIND (closes the fog gap left by a +2 move
+        // jump) plus THREE tiles AHEAD. The forward reach is the whole point of
+        // the redesign (Jerry 2026-05-30): the map is linear and Move already
+        // un-fogs its destination (max +2), so the old Â±1 Scan only revealed
+        // current+1 â€” a tile Move would reveal anyway â€” making Scan dead weight
+        // that just burned charge. Reaching current+3 lets Scan out-range Move,
+        // so a player can spot an incoming Combat/Terminal/Loot node and plan
+        // charge/rest/route before committing. That is the recon role Scan was
+        // always priced for (CHARGE_SCAN = 5).
+        uint8 newly = 0;
         uint8 current = state.currentNodeId;
         if (current > 0) {
             LibMissionStorage.MapNode memory prevNode = LibMissionStorage.getNode(nodes, current - 1);
-            prevNode.discovered = true;
-            LibMissionStorage.setNode(nodes, current - 1, prevNode);
+            if (!prevNode.discovered) {
+                newly++;
+                prevNode.discovered = true;
+                LibMissionStorage.setNode(nodes, current - 1, prevNode);
+            }
         }
-        if (current < mapSize - 1) {
-            LibMissionStorage.MapNode memory nextNode = LibMissionStorage.getNode(nodes, current + 1);
-            nextNode.discovered = true;
-            LibMissionStorage.setNode(nodes, current + 1, nextNode);
+        for (uint8 d = 1; d <= 3; d++) {
+            uint8 idx = current + d;
+            if (idx >= mapSize) break;
+            LibMissionStorage.MapNode memory ahead = LibMissionStorage.getNode(nodes, idx);
+            if (!ahead.discovered) {
+                newly++;
+                ahead.discovered = true;
+                LibMissionStorage.setNode(nodes, idx, ahead);
+            }
         }
 
+        result.newlyDiscoveredCount = newly;
         result.success = true;
     }
 
@@ -1828,15 +2099,31 @@ contract MissionFacet is AccessControlBase {
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
         uint256 stealthRoll = uint256(keccak256(abi.encodePacked(ms.sessionEntropy[sessionId], "stealth", state.totalActions)));
 
-        // Stealth success based on difficulty
-        bool success = (stealthRoll % 100) > (currentNode.difficulty * 8);
+        // Stealth success based on difficulty.
+        // 2026-05 upgrade: lowered multiplier 8 â†’ 6 to soften the curve.
+        // Pre-fix: difficulty 1 = 91% / difficulty 10 = 19% â€” the high-end
+        // 19% turned high-difficulty maps into stealth-grinding loops.
+        // Post-fix: difficulty 1 = 93% / difficulty 5 = 70% / difficulty 10 = 40%.
+        // High difficulty stays meaningfully harder, but Stealth-required
+        // missions (Variant 1/3/4 Pass Collection 5) stop being ragequit
+        // material on bad-roll maps.
+        bool success = (stealthRoll % 100) > (currentNode.difficulty * 6);
 
         if (success) {
             state.stealthSuccesses++;
             result.success = true;
 
-            // If enemy present, bypass it
+            // If enemy present, bypass it. Clear `hasEnemy` so the node ends
+            // in a coherent (completed=true, hasEnemy=false) terminal state.
+            // Pre-fix this only set `completed` and left `hasEnemy=true`,
+            // which made downstream consumers disagree: `MapNode.tsx` hid
+            // the enemy icon (checked both flags) but the tooltip in
+            // `MissionMapView` showed "Enemy present" (checked only
+            // `hasEnemy`), and `_processCombatAction` would still proceed
+            // on the now-bypassed node. Mirror `_handleCombatVictory`
+            // (lines 1969-1972) which always clears both.
             if (currentNode.hasEnemy) {
+                currentNode.hasEnemy = false;
                 currentNode.completed = true;
                 LibMissionStorage.setNode(ms.sessionMaps[sessionId], state.currentNodeId, currentNode);
             }
@@ -1961,24 +2248,38 @@ contract MissionFacet is AccessControlBase {
         uint8 totalObjectives = ms.variantConfigs[state.passCollectionId][state.missionVariant].requiredObjectivesCount +
                                ms.variantConfigs[state.passCollectionId][state.missionVariant].bonusObjectivesCount;
 
+        // Discover progresses by however many fog tiles this single action
+        // un-fogged (1 for Move into fog, 0-2 for Scan). Computed once per
+        // action, applied to every Discover objective in the loop below.
+        bool isDiscoverAction =
+            actionType == LibMissionStorage.MissionActionType.Move
+            || actionType == LibMissionStorage.MissionActionType.Scan;
+        uint8 discoverDelta = isDiscoverAction ? result.newlyDiscoveredCount : 0;
+
         for (uint8 i = 0; i < totalObjectives; i++) {
             LibMissionStorage.MissionObjective memory obj = LibMissionStorage.getObjective(objectives, i);
             if (obj.isCompleted) continue;
 
-            bool matches = false;
+            // Per-action progress amount. Default 1 (one action = one tick)
+            // for the existing handlers; Discover deviates because a single
+            // Scan can reveal up to 2 tiles. Survive/Time are handled in
+            // _completeTerminalObjectives, not here.
+            uint8 delta = 0;
 
             if (obj.objectiveType == LibMissionStorage.ObjectiveType.Collect && actionType == LibMissionStorage.MissionActionType.Loot) {
-                matches = true;
+                delta = 1;
             } else if (obj.objectiveType == LibMissionStorage.ObjectiveType.Defeat && actionType == LibMissionStorage.MissionActionType.Combat) {
-                matches = true;
+                delta = 1;
             } else if (obj.objectiveType == LibMissionStorage.ObjectiveType.Hack && actionType == LibMissionStorage.MissionActionType.Hack) {
-                matches = true;
+                delta = 1;
             } else if (obj.objectiveType == LibMissionStorage.ObjectiveType.Stealth && actionType == LibMissionStorage.MissionActionType.Stealth) {
-                matches = true;
+                delta = 1;
+            } else if (obj.objectiveType == LibMissionStorage.ObjectiveType.Discover && discoverDelta > 0) {
+                delta = discoverDelta;
             }
 
-            if (matches) {
-                bool completed = LibMissionStorage.updateObjectiveProgress(objectives, i, 1);
+            if (delta > 0) {
+                bool completed = LibMissionStorage.updateObjectiveProgress(objectives, i, delta);
                 if (completed) {
                     emit MissionObjectiveCompleted(sessionId, i);
                 }
@@ -2000,30 +2301,63 @@ contract MissionFacet is AccessControlBase {
 
         uint256 roll = uint256(keccak256(abi.encodePacked(ms.sessionEntropy[sessionId], eventId, response)));
         uint8 successChance = 50;
+        uint16 failDamage = EVENT_DMG_DEFAULT;
 
-        // Modify success chance based on event type and response
+        // Success chance AND failure damage vary by event type and response, so
+        // picking the right response (and the roll) actually matters.
         if (eventType == LibMissionStorage.EventType.Patrol) {
             if (response == LibMissionStorage.EventResponse.Hide) successChance = 70;
             else if (response == LibMissionStorage.EventResponse.Flee) successChance = 60;
-            else if (response == LibMissionStorage.EventResponse.Fight) successChance = 40;
+            else if (response == LibMissionStorage.EventResponse.Fight) successChance = 45;
+            failDamage = EVENT_DMG_PATROL;
         } else if (eventType == LibMissionStorage.EventType.Trap) {
-            if (response == LibMissionStorage.EventResponse.Disarm) successChance = 50;
+            // Disarm is the skilled play; fleeing a live trap is riskier.
+            if (response == LibMissionStorage.EventResponse.Disarm) successChance = 60;
+            else if (response == LibMissionStorage.EventResponse.Flee) successChance = 40;
+            failDamage = EVENT_DMG_TRAP;
+        } else if (eventType == LibMissionStorage.EventType.Ambush) {
+            // Forced fight â€” no safe response, real teeth on failure.
+            successChance = 50;
+            failDamage = EVENT_DMG_AMBUSH;
         } else if (eventType == LibMissionStorage.EventType.Discovery) {
             successChance = 90; // Almost always good
         } else if (eventType == LibMissionStorage.EventType.Ally) {
-            if (response == LibMissionStorage.EventResponse.Accept) successChance = 80;
+            // Decline is the safe out (no reward, no risk); engaging can pay more.
+            if (response == LibMissionStorage.EventResponse.Decline) successChance = 100;
+            else if (response == LibMissionStorage.EventResponse.Accept) successChance = 80;
             else if (response == LibMissionStorage.EventResponse.Negotiate) successChance = 60;
+        } else if (eventType == LibMissionStorage.EventType.Environmental) {
+            if (response == LibMissionStorage.EventResponse.Hide) successChance = 65;
+            else if (response == LibMissionStorage.EventResponse.Flee) successChance = 55;
+            failDamage = EVENT_DMG_ENVIRONMENTAL;
         }
 
         outcome.success = (roll % 100) < successChance;
 
         if (outcome.success) {
+            // Reward scales with event type: Discovery pays most, Ally pays for
+            // engaging (not Declining), evading a Patrol/hazard pays a small
+            // consolation so working the event loop beats ignoring it. Trap /
+            // Ambush success pays nothing â€” you simply avoided the harm.
             if (eventType == LibMissionStorage.EventType.Discovery) {
                 ms.packedStates[sessionId].secretsFound++;
-                outcome.rewardBonus = 10;
+                outcome.rewardBonus = EVENT_REWARD_FRAGMENTS * 2;
+            } else if (eventType == LibMissionStorage.EventType.Ally) {
+                if (response != LibMissionStorage.EventResponse.Decline) {
+                    outcome.rewardBonus = EVENT_REWARD_FRAGMENTS;
+                }
+            } else if (
+                eventType == LibMissionStorage.EventType.Patrol ||
+                eventType == LibMissionStorage.EventType.Environmental
+            ) {
+                outcome.rewardBonus = EVENT_REWARD_FRAGMENTS / 2;
+            }
+
+            if (outcome.rewardBonus > 0) {
+                ms.packedStates[sessionId].dataFragments += outcome.rewardBonus;
             }
         } else {
-            outcome.damageTaken = 10;
+            outcome.damageTaken = failDamage;
         }
     }
 
@@ -2069,6 +2403,19 @@ contract MissionFacet is AccessControlBase {
 
         // Difficulty multiplier
         reward = (reward * config.difficultyMultiplier) / 10000;
+
+        // B6 â€” engagement bonus: reward squads that actually fight. Combat
+        // costs charge and a loss dents the performance rating, so this is a
+        // genuine risk/reward (not free money), and the cap keeps it from
+        // dominating. Stops "do only the required fights, then stop" from
+        // being strictly optimal.
+        uint256 combatBonusBp = uint256(ms.packedStates[sessionId].combatsWon) * COMBAT_WIN_BONUS_BP;
+        if (combatBonusBp > COMBAT_WIN_BONUS_CAP_BP) {
+            combatBonusBp = COMBAT_WIN_BONUS_CAP_BP;
+        }
+        if (combatBonusBp > 0) {
+            reward += (config.baseReward * combatBonusBp) / 10000;
+        }
 
         // Bonus objectives
         LibMissionStorage.PackedObjectives storage objectives = ms.sessionObjectives[sessionId];

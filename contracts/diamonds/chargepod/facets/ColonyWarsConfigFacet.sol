@@ -610,14 +610,14 @@ contract ColonyWarsConfigFacet is AccessControlBase {
             revert ResolutionNotReady();
         }
         
-        // 1. Cleanup nierozstrzygniętych bitew i sieges
+        // 1. Cleanup nierozstrzygniÄ™tych bitew i sieges
         _cleanupSeasonBattles(seasonId);
         _cleanupSeasonSieges(seasonId);
         
-        // 2. Reset liczników dla nowego sezonu
+        // 2. Reset licznikĂłw dla nowego sezonu
         _resetSeasonCounters(seasonId);
         
-        // 3. Obsłuż długi (opcjonalnie)
+        // 3. ObsĹ‚uĹĽ dĹ‚ugi (opcjonalnie)
         // _handleSeasonDebts(seasonId);
         
         // 4. Rozdaj nagrody
@@ -628,7 +628,7 @@ contract ColonyWarsConfigFacet is AccessControlBase {
         // 5. Zapisz podsumowanie
         // _saveSeasonSummary(seasonId);
         
-        // 6. Oznacz sezon jako zakończony
+        // 6. Oznacz sezon jako zakoĹ„czony
         s.rewarded = true;
         s.active = false;
         
@@ -857,22 +857,17 @@ contract ColonyWarsConfigFacet is AccessControlBase {
         profile.acceptingChallenges = false;
         profile.registered = false;
 
-        // Check if this was user's primary colony
+        // Reassign primary if this was the user's primary colony.
+        // Primary anchors resource/territory mechanics independent of warfare â€”
+        // do not require the replacement to be `registered`, and keep the old
+        // primary as a last resort if no alternative exists.
         bytes32 userPrimary = LibColonyWarsStorage.getUserPrimaryColony(colonyCreator);
         if (userPrimary == colonyId) {
-            // Set new primary from remaining colonies
-            bytes32[] memory userColonies = LibColonyWarsStorage.getUserSeasonColonies(currentSeason, colonyCreator);
-            bytes32 newPrimary = bytes32(0);
-
-            for (uint256 i = 0; i < userColonies.length; i++) {
-                if (userColonies[i] != colonyId && cws.colonyWarProfiles[userColonies[i]].registered) {
-                    newPrimary = userColonies[i];
-                    break;
-                }
+            bytes32 newPrimary = LibColonyWarsStorage.findFallbackPrimaryColony(colonyCreator, colonyId);
+            if (newPrimary != bytes32(0)) {
+                LibColonyWarsStorage.setUserPrimaryColony(colonyCreator, newPrimary);
+                cws.userToColony[colonyCreator] = newPrimary;
             }
-
-            LibColonyWarsStorage.setUserPrimaryColony(colonyCreator, newPrimary);
-            cws.userToColony[colonyCreator] = newPrimary;
         }
 
         // Remove from user's season colonies array
@@ -1099,7 +1094,7 @@ contract ColonyWarsConfigFacet is AccessControlBase {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         bytes32[] storage battles = cws.seasonBattles[seasonId];
         
-        // Release wszystkich tokenów z nierozstrzygniętych bitew
+        // Release wszystkich tokenĂłw z nierozstrzygniÄ™tych bitew
         for (uint256 i = 0; i < battles.length; i++) {
             if (!cws.battleResolved[battles[i]]) {
                 LibColonyWarsStorage.BattleInstance storage battle = cws.battles[battles[i]];
@@ -1164,7 +1159,7 @@ contract ColonyWarsConfigFacet is AccessControlBase {
     function _cleanupSeasonSieges(uint32) internal {
         LibColonyWarsStorage.ColonyWarsStorage storage cws = LibColonyWarsStorage.colonyWarsStorage();
         
-        // Release tokenów z aktywnych oblężeń
+        // Release tokenĂłw z aktywnych oblÄ™ĹĽeĹ„
         for (uint256 i = 0; i < cws.activeSieges.length; i++) {
             bytes32 siegeId = cws.activeSieges[i];
             LibColonyWarsStorage.TerritorySiege storage siege = cws.territorySieges[siegeId];
@@ -1192,7 +1187,7 @@ contract ColonyWarsConfigFacet is AccessControlBase {
         for (uint256 i = 0; i < s.registeredColonies.length; i++) {
             bytes32 colonyId = s.registeredColonies[i];
             LibColonyWarsStorage.ColonyWarProfile storage profile = cws.colonyWarProfiles[colonyId];
-            profile.stakeIncreases = 0; // Reset limitu zwiększeń stake
+            profile.stakeIncreases = 0; // Reset limitu zwiÄ™kszeĹ„ stake
         }
     }
 

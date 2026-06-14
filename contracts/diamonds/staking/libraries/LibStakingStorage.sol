@@ -12,7 +12,7 @@ import {PodRewardRate, InfusionBonus, StakingFees, StakedSpecimen,
         SpecialEvent, ColonyStats, RateLimits, RewardCalcData, InfusionCalcData} from "../../../libraries/StakingModel.sol";
 import {SpecimenCollection, Calibration, ColonyCriteria, ChargeAccessory} from "../../../libraries/HenomorphsModel.sol";
 import {IExternalBiopod, IExternalAccessory, IColonyFacet} from "../interfaces/IStakingInterfaces.sol"; 
-import {RewardCalculator} from "../libraries/RewardCalculator.sol";
+import {RewardCalculator} from "./RewardCalculator.sol";
 import {LibBiopodIntegration} from "./LibBiopodIntegration.sol";  
 
 /**

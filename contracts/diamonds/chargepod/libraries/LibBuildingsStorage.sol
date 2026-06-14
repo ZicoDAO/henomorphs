@@ -411,6 +411,17 @@ library LibBuildingsStorage {
         // ============================================
 
         address boosterCardsContract;
+
+        // ============================================
+        // BOOSTER CLAIM TRACKING (APPEND-ONLY)
+        // ============================================
+
+        /// @notice Whether a user has claimed a booster for a specific building type
+        /// @dev colonyId => buildingType => claimed
+        mapping(bytes32 => mapping(uint8 => bool)) boosterClaimed;
+
+        /// @notice Minimum building level required to claim a booster (0 = disabled)
+        uint8 boosterClaimMinLevel;
     }
 
     // ============================================
@@ -463,11 +474,11 @@ library LibBuildingsStorage {
             } else if (i == BUILDING_TRADE_HUB) {
                 effects.marketFeeReductionBps += adjustedEffect;
             } else if (i == BUILDING_ENERGY_PLANT) {
-                effects.passiveEnergyPerDay += adjustedEffect * 1 ether; // Scale to token units
+                effects.passiveEnergyPerDay += uint256(adjustedEffect) * 1 ether; // Scale to token units
             } else if (i == BUILDING_BIO_LAB) {
-                effects.passiveBioPerDay += adjustedEffect * 1 ether;
+                effects.passiveBioPerDay += uint256(adjustedEffect) * 1 ether;
             } else if (i == BUILDING_MINING_OUTPOST) {
-                effects.passiveBasicPerDay += adjustedEffect * 1 ether;
+                effects.passiveBasicPerDay += uint256(adjustedEffect) * 1 ether;
             }
         }
 
@@ -804,11 +815,11 @@ library LibBuildingsStorage {
             } else if (i == BUILDING_TRADE_HUB) {
                 effects.marketFeeReductionBps += adjustedEffect;
             } else if (i == BUILDING_ENERGY_PLANT) {
-                effects.passiveEnergyPerDay += adjustedEffect * 1 ether;
+                effects.passiveEnergyPerDay += uint256(adjustedEffect) * 1 ether;
             } else if (i == BUILDING_BIO_LAB) {
-                effects.passiveBioPerDay += adjustedEffect * 1 ether;
+                effects.passiveBioPerDay += uint256(adjustedEffect) * 1 ether;
             } else if (i == BUILDING_MINING_OUTPOST) {
-                effects.passiveBasicPerDay += adjustedEffect * 1 ether;
+                effects.passiveBasicPerDay += uint256(adjustedEffect) * 1 ether;
             }
         }
 

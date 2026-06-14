@@ -24,7 +24,7 @@ interface IRewardToken is IERC20 {
 /**
  * @title ResourceEconomyFacet
  * @notice Manages resource nodes, harvesting, and colony resource balances
- * @dev MODUŁ 6 - Dual Token Economy Implementation
+ * @dev MODUĹ 6 - Dual Token Economy Implementation
  *
  * NOTE: This facet uses economyResourceNodes (keyed by auto-increment economyNodeId),
  * separate from territoryResourceNodes used by TerritoryResourceFacet (keyed by territoryId).
@@ -299,7 +299,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         }
 
         // Reward auxiliary currency (Utility token for daily activities)
-        // Uses Treasury → Mint fallback pattern for sustainable tokenomics
+        // Uses Treasury â†’ Mint fallback pattern for sustainable tokenomics
         address auxiliaryCurrency = ResourceHelper.getAuxiliaryCurrency();
         if (auxiliaryCurrency != address(0) && tokenReward > 0) {
             _distributeYlwReward(auxiliaryCurrency, LibMeta.msgSender(), tokenReward);
@@ -372,7 +372,7 @@ contract ResourceEconomyFacet is AccessControlBase {
     error RequisitionInsufficientColonyResources(uint8 resourceType, uint256 requested, uint256 available);
 
     // ============================================================================
-    // COLONY RESOURCE SUPPLY (personal → colony)
+    // COLONY RESOURCE SUPPLY (personal â†’ colony)
     // ============================================================================
 
     event ColonyResourcesSupplied(
@@ -442,7 +442,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         uint16 taxBps = rs.requisitionTaxBps;
         {
             LibBuildingsStorage.ColonyBuildingEffects memory effects =
-                LibBuildingsStorage.getColonyBuildingEffects(colonyId);
+                LibBuildingsStorage.getColonyBuildingEffectsWithCards(colonyId);
             if (effects.marketFeeReductionBps > 0 && taxBps > 0) {
                 uint16 reduction = uint16((uint256(taxBps) * effects.marketFeeReductionBps) / 10000);
                 taxBps = taxBps > reduction ? taxBps - reduction : 0;
@@ -575,7 +575,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         uint16 bonusBps = rs.contributionBonusBps;
         {
             LibBuildingsStorage.ColonyBuildingEffects memory effects =
-                LibBuildingsStorage.getColonyBuildingEffects(colonyId);
+                LibBuildingsStorage.getColonyBuildingEffectsWithCards(colonyId);
             if (effects.marketFeeReductionBps > 0 && bonusBps > 0) {
                 uint16 extraBonus = uint16((uint256(bonusBps) * effects.marketFeeReductionBps) / 10000);
                 bonusBps = bonusBps + extraBonus;
@@ -1173,7 +1173,7 @@ contract ResourceEconomyFacet is AccessControlBase {
     // ============================================================================
 
     /**
-     * @notice Distribute YLW reward with Treasury → Mint fallback
+     * @notice Distribute YLW reward with Treasury â†’ Mint fallback
      * @dev Priority: 1) Transfer from treasury, 2) Mint if treasury insufficient
      * @param rewardToken YLW token address
      * @param recipient User receiving the reward
@@ -1726,11 +1726,11 @@ contract ResourceEconomyFacet is AccessControlBase {
             revert InsufficientResourcesForCrafting(resourceType, amount, available);
         }
 
-        // Determine max achievable rarity based on amount
-        uint8 maxRarity = _getCraftingMaxRarity(amount, rs);
+        // Determine max achievable rarity and boost based on amount
+        (uint8 maxRarity, uint16 boostBps) = _getCraftingMaxRarity(amount, rs);
 
-        // Calculate rarity with randomness
-        rarity = _calculateCraftingRarity(amount, maxRarity, user, resourceType);
+        // Calculate rarity with randomness (boosted by tier)
+        rarity = _calculateCraftingRarity(amount, maxRarity, boostBps, user, resourceType);
 
         // Consume resources
         rs.userResources[user][resourceType] -= amount;
@@ -1763,28 +1763,36 @@ contract ResourceEconomyFacet is AccessControlBase {
     }
 
     /**
-     * @notice Get max achievable rarity based on resource amount
+     * @notice Get max achievable rarity and rarity boost based on resource amount
+     * @return maxRarity Max achievable rarity (0-4)
+     * @return boostBps Rarity boost in basis points for the matched tier
      */
     function _getCraftingMaxRarity(
         uint256 amount,
         LibResourceStorage.ResourceStorage storage rs
-    ) internal view returns (uint8 maxRarity) {
+    ) internal view returns (uint8 maxRarity, uint16 boostBps) {
         // Check tiers from highest to lowest
         for (uint8 i = 4; i > 0; i--) {
             if (rs.craftingTiers[i].resourceAmount > 0 && amount >= rs.craftingTiers[i].resourceAmount) {
-                return rs.craftingTiers[i].maxRarity;
+                return (rs.craftingTiers[i].maxRarity, rs.craftingTiers[i].rarityBoostBps);
             }
         }
-        // Default to Common if below all tiers or tiers not set
-        return 0;
+        // Default to Common with no boost if below all tiers or tiers not set
+        return (0, 0);
     }
 
     /**
-     * @notice Calculate crafting rarity with randomness
+     * @notice Calculate crafting rarity with randomness and tier boost
+     * @param amount Resources spent (affects scaleFactor)
+     * @param maxRarity Hard cap on achievable rarity
+     * @param boostBps Rarity boost from tier config (basis points, e.g. 2500 = 25%)
+     * @param user Crafter address (entropy source)
+     * @param resourceType Resource type (entropy source)
      */
     function _calculateCraftingRarity(
         uint256 amount,
         uint8 maxRarity,
+        uint16 boostBps,
         address user,
         uint8 resourceType
     ) internal view returns (uint8 rarity) {
@@ -1805,20 +1813,42 @@ contract ResourceEconomyFacet is AccessControlBase {
         if (maxRarity == 0) return 0; // Only Common possible
 
         // Scale chances based on amount
-        // Using similar thresholds to mintResourceCard but affected by amount
         uint256 scaleFactor = amount / 1000; // Scale factor based on resources
         if (scaleFactor > 100) scaleFactor = 100; // Cap at 100
 
-        if (maxRarity >= 4 && random < (LEGENDARY_THRESHOLD * scaleFactor / 10)) {
+        // Apply tier rarity boost: increases each threshold by boostBps percentage
+        // e.g. boostBps=2500 (25%) â†’ threshold 1000 becomes 1250
+        uint256 boost = uint256(boostBps);
+
+        uint256 legendaryThreshold = (LEGENDARY_THRESHOLD * scaleFactor / 10);
+        uint256 epicThreshold = (EPIC_THRESHOLD * scaleFactor / 10);
+        uint256 rareThreshold = (RARE_THRESHOLD * scaleFactor / 10);
+        uint256 uncommonThreshold = (UNCOMMON_THRESHOLD * scaleFactor / 10);
+
+        // Apply boost to all thresholds (boost increases the chance window)
+        if (boost > 0) {
+            legendaryThreshold += legendaryThreshold * boost / 10000;
+            epicThreshold += epicThreshold * boost / 10000;
+            rareThreshold += rareThreshold * boost / 10000;
+            uncommonThreshold += uncommonThreshold * boost / 10000;
+        }
+
+        // Cap thresholds at 10000 (100%)
+        if (uncommonThreshold > 10000) uncommonThreshold = 10000;
+        if (rareThreshold > 10000) rareThreshold = 10000;
+        if (epicThreshold > 10000) epicThreshold = 10000;
+        if (legendaryThreshold > 10000) legendaryThreshold = 10000;
+
+        if (maxRarity >= 4 && random < legendaryThreshold) {
             return 4; // Legendary
         }
-        if (maxRarity >= 3 && random < (EPIC_THRESHOLD * scaleFactor / 10)) {
+        if (maxRarity >= 3 && random < epicThreshold) {
             return 3; // Epic
         }
-        if (maxRarity >= 2 && random < (RARE_THRESHOLD * scaleFactor / 10)) {
+        if (maxRarity >= 2 && random < rareThreshold) {
             return 2; // Rare
         }
-        if (maxRarity >= 1 && random < (UNCOMMON_THRESHOLD * scaleFactor / 10)) {
+        if (maxRarity >= 1 && random < uncommonThreshold) {
             return 1; // Uncommon
         }
         return 0; // Common
@@ -1884,7 +1914,7 @@ contract ResourceEconomyFacet is AccessControlBase {
             return (false, "Max supply reached", 0, 0);
         }
 
-        maxRarity = _getCraftingMaxRarity(amount, rs);
+        (maxRarity, ) = _getCraftingMaxRarity(amount, rs);
         canCraft = true;
         reason = "";
     }
@@ -1909,15 +1939,18 @@ contract ResourceEconomyFacet is AccessControlBase {
      * @notice Get crafting tier thresholds
      * @return tierAmounts Array of resource amounts for each tier
      * @return tierMaxRarities Array of max rarities for each tier
+     * @return tierBoostBps Array of rarity boost basis points for each tier
      */
     function getCraftingTiers() external view returns (
         uint256[5] memory tierAmounts,
-        uint8[5] memory tierMaxRarities
+        uint8[5] memory tierMaxRarities,
+        uint16[5] memory tierBoostBps
     ) {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();
         for (uint8 i = 0; i < 5; i++) {
             tierAmounts[i] = rs.craftingTiers[i].resourceAmount;
             tierMaxRarities[i] = rs.craftingTiers[i].maxRarity;
+            tierBoostBps[i] = rs.craftingTiers[i].rarityBoostBps;
         }
     }
 
@@ -1964,11 +1997,11 @@ contract ResourceEconomyFacet is AccessControlBase {
     /**
      * @notice Initialize default crafting tiers (ADMIN ONLY)
      * @dev Sets default tier thresholds:
-     *      - Tier 0: 5,000 → Common
-     *      - Tier 1: 10,000 → Uncommon
-     *      - Tier 2: 25,000 → Rare
-     *      - Tier 3: 50,000 → Epic
-     *      - Tier 4: 100,000 → Legendary
+     *      - Tier 0: 5,000 â†’ Common
+     *      - Tier 1: 10,000 â†’ Uncommon
+     *      - Tier 2: 25,000 â†’ Rare
+     *      - Tier 3: 50,000 â†’ Epic
+     *      - Tier 4: 100,000 â†’ Legendary
      */
     function initializeCraftingTiers() external onlyAuthorized {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();

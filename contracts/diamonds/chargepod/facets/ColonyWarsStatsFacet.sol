@@ -376,7 +376,10 @@ contract ColonyWarsStatsFacet is AccessControlBase {
         stats.ownerAddress = hs.colonyCreators[colonyId];
         stats.currentSeasonScore = LibColonyWarsStorage.getColonyScore(cws.currentSeason, colonyId);
         stats.defensiveStake = profile.defensiveStake;
-        stats.isRegistered = profile.registered;
+        // Only true if the colony is registered for the CURRENT season.
+        // Without this, S3 entries with registered=true but registeredSeasonId!=currentSeason
+        // would still show as registered in S4 UI, hiding the registration CTA.
+        stats.isRegistered = profile.registered && profile.registeredSeasonId == cws.currentSeason;
         stats.warStress = profile.warStress;
         
         // Alliance info
@@ -411,7 +414,7 @@ contract ColonyWarsStatsFacet is AccessControlBase {
         stats.totalEarnedThisSeason = _estimateSeasonEarnings(colonyId, cws);
         stats.totalEarnedAllTime = stats.totalEarnedThisSeason;
 
-        // Estimated season prize - use lightweight O(n) calculation instead of O(n²) calculateTopSeasonPrize
+        // Estimated season prize - use lightweight O(n) calculation instead of O(nÂ˛) calculateTopSeasonPrize
         // Full prize details available via getColonyWarRewardStats()
         stats.estimatedSeasonPrize = _estimateSeasonPrizeLightweight(colonyId, cws);
     }
@@ -1393,7 +1396,7 @@ contract ColonyWarsStatsFacet is AccessControlBase {
     }
 
     /**
-     * @notice O(n) prize estimate - avoids the O(n²) calculateTopSeasonPrize
+     * @notice O(n) prize estimate - avoids the O(nÂ˛) calculateTopSeasonPrize
      * @dev Single pass: get colony score and sum of all scores, then proportional share
      */
     function _estimateSeasonPrizeLightweight(bytes32 colonyId, LibColonyWarsStorage.ColonyWarsStorage storage cws)

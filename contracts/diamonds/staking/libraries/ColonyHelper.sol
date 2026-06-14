@@ -291,10 +291,20 @@ library ColonyHelper {
     }
 
     /**
-     * @dev Check if caller is authorized to manage a colony
+     * @dev Member-level check: returns true for ANY current colony token holder
+     *      (creator, owner, operator, staking listener, or any address that owns
+     *      a token registered in hs.colonies[colonyId]).
+     *
+     * WARNING: DO NOT use this for management actions (expel, dissolve, set
+     * criteria, withdraw stake, cancel attack, etc.) â€” any single member of a
+     * colony would be authorized. Use {isColonyCreator} for management gates.
+     *
+     * Appropriate uses: read/diagnostic checks, and write actions where the
+     * caller funds the operation entirely from their own resources (donations).
+     *
      * @param colonyId Colony ID
      * @param stakingListener Optional staking listener address
-     * @return isAuthorized Whether caller is authorized
+     * @return isAuthorized Whether caller has any membership tie to the colony
      */
     function isAuthorizedForColony(
         bytes32 colonyId, 

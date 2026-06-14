@@ -19,6 +19,16 @@ interface IColonyBoosterCards {
         uint8 ventureType;      // Venture: venture type (0-4)
     }
 
+    // ============ MINTER_ROLE functions ============
+
+    /// @notice Mint a booster card with random rarity
+    function mintRandomBooster(
+        address to,
+        uint8 targetSystem,
+        uint8 subType,
+        bool isBlueprint
+    ) external returns (uint256);
+
     // ============ COLONY_WARS_ROLE functions ============
 
     /// @notice Combine 3 boosters of same system, subType and rarity into 1 upgraded
@@ -60,6 +70,14 @@ interface IColonyBoosterCards {
 
     /// @notice Check if booster is an unactivated blueprint
     function isBlueprint(uint256 tokenId) external view returns (bool);
+
+    /// @notice Get cooldown info for a booster (used by Diamond for getDetachCooldown pass-through)
+    function getCooldownInfo(uint256 tokenId) external view returns (uint32 cooldownUntil, bool locked);
+
+    /// @notice Get flat traits (used by Diamond for getUpgradePreview pass-through)
+    function getTraitsFlat(uint256 tokenId) external view returns (
+        uint8 targetSystem, uint8 subType, uint8 rarity, bool isBlueprintFlag
+    );
 
     /// @notice Get bonuses for a building target
     function getBuildingBonus(bytes32 colonyId, uint8 buildingType)

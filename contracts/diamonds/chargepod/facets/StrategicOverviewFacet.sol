@@ -179,7 +179,7 @@ contract StrategicOverviewFacet is AccessControlBase {
             revert RateLimitExceeded();
         }
         
-        if (!ColonyHelper.isAuthorizedForColony(colonyId, hs.stakingSystemAddress)) {
+        if (!ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress)) {
             revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not colony controller");
         }
         
@@ -238,15 +238,27 @@ contract StrategicOverviewFacet is AccessControlBase {
         profile.registered = false;
         profile.reputation = 5; // Deserter
         
-        // Clean up user mapping
+        // Reassign primary if this was the user's primary colony.
+        // Withdrawing from warfare must not strip the user of resource/territory
+        // access on their other colonies â€” keep the old primary as a last resort
+        // (user can switch later via changePrimaryColony / adminChangePrimaryColony).
         if (userPrimary == colonyId) {
-            LibColonyWarsStorage.setUserPrimaryColony(LibMeta.msgSender(), bytes32(0));
-            cws.userToColony[LibMeta.msgSender()] = bytes32(0);
+            bytes32 newPrimary = LibColonyWarsStorage.findFallbackPrimaryColony(LibMeta.msgSender(), colonyId);
+            if (newPrimary != bytes32(0)) {
+                LibColonyWarsStorage.setUserPrimaryColony(LibMeta.msgSender(), newPrimary);
+                cws.userToColony[LibMeta.msgSender()] = newPrimary;
+            }
         }
         
-        // Process payments
+        // Process payments â€” refund always goes to the original staker (colony creator),
+        // never to msg.sender, so an admin/operator triggering an emergency withdrawal
+        // cannot redirect the stake refund to themselves.
         if (refund > 0) {
-            LibFeeCollection.transferFromTreasury(LibMeta.msgSender(), refund, "emergency_withdrawal");
+            address refundRecipient = hs.colonyCreators[colonyId];
+            if (refundRecipient == address(0)) {
+                refundRecipient = LibMeta.msgSender();
+            }
+            LibFeeCollection.transferFromTreasury(refundRecipient, refund, "emergency_withdrawal");
         }
         season.prizePool += penalty;
         
@@ -865,28 +877,28 @@ contract StrategicOverviewFacet is AccessControlBase {
             return (0, 0, 0, "Not registered");
         }
         
-        // NAPRAWIONA kalkulacja - uwzględnia tokeny jako główny czynnik
+        // NAPRAWIONA kalkulacja - uwzglÄ™dnia tokeny jako gĹ‚Ăłwny czynnik
         uint256[] storage yourTokens = hs.colonies[colonyId];
         uint256[] storage theirTokens = hs.colonies[targetColonyId];
         
-        // Estymuj token power (główny czynnik)
+        // Estymuj token power (gĹ‚Ăłwny czynnik)
         yourPower = yourTokens.length * 150; // Avg 150 power per token
         theirPower = theirTokens.length * 150;
         
-        // Zastosuj bonusy atakującego
+        // Zastosuj bonusy atakujÄ…cego
         yourPower += (yourPower * 20) / 100; // Base attack bonus
         
-        // Estymuj stake bonus (używaj rzeczywistego defensive stake)
+        // Estymuj stake bonus (uĹĽywaj rzeczywistego defensive stake)
         uint256 estimatedStake = yourProfile.defensiveStake; 
         if (estimatedStake >= targetProfile.defensiveStake / 2) {
             uint256 stakeBonus = _estimateStakeBonus(estimatedStake, targetProfile.defensiveStake);
             yourPower += (yourPower * stakeBonus) / 100;
         }
         
-        // Zastosuj bonusy obrońcy
+        // Zastosuj bonusy obroĹ„cy
         theirPower += (theirPower * 6) / 100; // Home advantage
         
-        // Dodaj limited stake power dla obrońcy
+        // Dodaj limited stake power dla obroĹ„cy
         uint256 defenderStakePower = targetProfile.defensiveStake / 25;
         uint256 maxDefenderStakePower = theirPower > 0 ? theirPower / 2 : 50;
         if (defenderStakePower > maxDefenderStakePower) {
@@ -894,7 +906,7 @@ contract StrategicOverviewFacet is AccessControlBase {
         }
         theirPower += defenderStakePower;
         
-        // Alliance bonus (jeśli potwierdzone)
+        // Alliance bonus (jeĹ›li potwierdzone)
         address targetOwner = hs.colonyCreators[targetColonyId];
         if (LibColonyWarsStorage.isUserInAlliance(targetOwner)) {
             theirPower += (theirPower * 8) / 100; // Realistic alliance bonus
@@ -1017,10 +1029,10 @@ contract StrategicOverviewFacet is AccessControlBase {
             uint8 defenderMod
         ) 
     {
-        // Daily seed - zmienia się raz dziennie o północy UTC
+        // Daily seed - zmienia siÄ™ raz dziennie o pĂłĹ‚nocy UTC
         uint256 dailySeed = uint256(keccak256(abi.encodePacked(
-            block.timestamp / 86400,  // Dzień (zmienia się co 24h)
-            block.prevrandao          // Losowość z tego dnia
+            block.timestamp / 86400,  // DzieĹ„ (zmienia siÄ™ co 24h)
+            block.prevrandao          // LosowoĹ›Ä‡ z tego dnia
         )));
         
         // Current 2-hour period within the day (0-11)
@@ -1165,7 +1177,7 @@ contract StrategicOverviewFacet is AccessControlBase {
         
         if (attackerMod > defenderMod) {
             favorType = 0; // Attackers
-            // Oblicz przewagę jako różnicę, nie tylko bonus
+            // Oblicz przewagÄ™ jako rĂłĹĽnicÄ™, nie tylko bonus
             advantage = attackerMod > defenderMod ? uint8(attackerMod - defenderMod) : 0;
         } else if (defenderMod > attackerMod) {
             favorType = 1; // Defenders

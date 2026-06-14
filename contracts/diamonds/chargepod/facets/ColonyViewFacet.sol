@@ -317,12 +317,12 @@ contract ColonyViewFacet is AccessControlBase {
         
         // Check if the caller is authorized to manage this colony
         bool isAdmin = AccessHelper.isAuthorized();
-        bool isColonyOwner = ColonyHelper.isAuthorizedForColony(colonyId, hs.stakingSystemAddress);
-        
+        bool isCreator = ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress);
+
         // Return appropriate max bonus based on caller's role
         if (isAdmin) {
             return 50; // Admins can set up to 50%
-        } else if (isColonyOwner) {
+        } else if (isCreator) {
             // Default to 25% if maxCreatorBonusPercentage is not set
             return hs.maxCreatorBonusPercentage > 0 ? hs.maxCreatorBonusPercentage : 25;
         } else {

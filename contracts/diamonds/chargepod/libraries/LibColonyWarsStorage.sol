@@ -337,7 +337,7 @@ library LibColonyWarsStorage {
         uint32 lastEquipmentUpdate;      // Last time equipment was changed
     }
 
-    // === MODUŁ 6: Resource Economy ===
+    // === MODUĹ 6: Resource Economy ===
     enum ResourceType { BasicMaterials, EnergyCrystals, BioCompounds, RareElements }
     
     struct ResourceNode {
@@ -379,7 +379,7 @@ library LibColonyWarsStorage {
         bool claimed;
     }
 
-    // === MODUŁ 6: Collaborative Crafting ===
+    // === MODUĹ 6: Collaborative Crafting ===
     enum ProjectType { Infrastructure, Research, Defense }
     enum ProjectStatus { Active, Completed, Failed, Cancelled }
 
@@ -574,7 +574,7 @@ library LibColonyWarsStorage {
         // Emergency pause per feature
         mapping(string => bool) featurePaused;
 
-        // Tracking list dla pełnej funkcjonalności
+        // Tracking list dla peĹ‚nej funkcjonalnoĹ›ci
         bytes32[] allAllianceIds;           // Lista wszystkich utworzonych federacji
         mapping(uint32 => bytes32[]) seasonBattles;      // seasonId => battleIds[]
         mapping(uint32 => bytes32[]) seasonAlliances;    // seasonId => allianceIds[] (aktywne w sezonie)
@@ -640,7 +640,7 @@ library LibColonyWarsStorage {
         mapping(uint256 => TerritoryEquipment) territoryEquipment; // territoryId => equipment
         mapping(uint256 => uint256) infraEquippedToTerritory;      // infraNFT tokenId => territoryId
         
-        // MODUŁ 6: Resource Economy
+        // MODUĹ 6: Resource Economy
         mapping(uint256 => ResourceNode) resourceNodes;            // nodeId => node
         mapping(bytes32 => ResourceBalance) colonyResources;       // colonyId => resources
         mapping(uint8 => ProcessingRecipe) processingRecipes;      // recipeId => recipe
@@ -671,7 +671,7 @@ library LibColonyWarsStorage {
         uint256 collectionCounter;
         
         /**
-         * @notice Reverse lookup: contract address → collectionId
+         * @notice Reverse lookup: contract address â†’ collectionId
          * @dev Used for quick validation of incoming transfers
          */
         mapping(address => uint256) contractToCollectionId;
@@ -698,13 +698,13 @@ library LibColonyWarsStorage {
         
         /**
          * @notice Track which collection each staked Territory NFT belongs to
-         * @dev Format: (collectionId, tokenId) → colonyId
+         * @dev Format: (collectionId, tokenId) â†’ colonyId
          */
         mapping(uint256 => mapping(uint256 => bytes32)) stakedTerritoryOwnerByCollection;
         
         /**
          * @notice Track which collection each staked Infrastructure NFT belongs to
-         * @dev Format: (collectionId, tokenId) → colonyId
+         * @dev Format: (collectionId, tokenId) â†’ colonyId
          */
         mapping(uint256 => mapping(uint256 => bytes32)) stakedInfraOwnerByCollection;
         
@@ -716,19 +716,19 @@ library LibColonyWarsStorage {
         
         /**
          * @notice Per-colony, per-collection Territory NFT tracking
-         * @dev Format: colonyId → collectionId → tokenIds[]
+         * @dev Format: colonyId â†’ collectionId â†’ tokenIds[]
          */
         mapping(bytes32 => mapping(uint256 => uint256[])) colonyTerritoryByCollection;
         
         /**
          * @notice Per-colony, per-collection Infrastructure NFT tracking
-         * @dev Format: colonyId → collectionId → tokenIds[]
+         * @dev Format: colonyId â†’ collectionId â†’ tokenIds[]
          */
         mapping(bytes32 => mapping(uint256 => uint256[])) colonyInfraByCollection;
         
         /**
          * @notice Track which collections each colony has used
-         * @dev Format: colonyId → collectionIds[] (for uniqueCollectionsCount)
+         * @dev Format: colonyId â†’ collectionIds[] (for uniqueCollectionsCount)
          */
         mapping(bytes32 => uint256[]) colonyActiveCollections;
 
@@ -749,13 +749,13 @@ library LibColonyWarsStorage {
         
         /**
          * @notice Track which collection each staked Resource NFT belongs to
-         * @dev Format: (collectionId, tokenId) → colonyId
+         * @dev Format: (collectionId, tokenId) â†’ colonyId
          */
         mapping(uint256 => mapping(uint256 => bytes32)) stakedResourceOwnerByCollection;
         
         /**
          * @notice Per-colony, per-collection Resource NFT tracking
-         * @dev Format: colonyId → collectionId → tokenIds[]
+         * @dev Format: colonyId â†’ collectionId â†’ tokenIds[]
          */
         mapping(bytes32 => mapping(uint256 => uint256[])) colonyResourceByCollection;
 
@@ -999,6 +999,28 @@ library LibColonyWarsStorage {
          * Used for 1-hour exclusive capture window instead of siege.siegeEndTime (which is planned end, not actual)
          */
         mapping(uint256 => uint32) territoryDestroyedAt;
+
+        // ============================================
+        // OPT-IN ALLIANCE TASK FORCE TOKENS (APPEND-ONLY)
+        // ============================================
+
+        /**
+         * @notice Per-colony tokens committed to an alliance task force (opt-in model).
+         * @dev taskForceId => colonyId => collectionIds / tokenIds. The leader stores its own
+         *      tokens here on createColonyTaskForce; each member appends its tokens via
+         *      joinColonyTaskForce from the MEMBER's own transaction (= explicit asset consent).
+         *      Read at attack time to build one battle per participating colony.
+         *      Safe append: allianceTaskForces was never populated, so there is no legacy data.
+         */
+        mapping(bytes32 => mapping(bytes32 => uint256[])) taskForceColonyCollections;
+        mapping(bytes32 => mapping(bytes32 => uint256[])) taskForceColonyTokens;
+
+        /**
+         * @notice Index of alliance task forces created by a leader colony, per season.
+         * @dev leaderColonyId => seasonId => taskForceIds[]. Lets the app list a leader's
+         *      alliance task forces for the coordinated-attack picker. Append-only.
+         */
+        mapping(bytes32 => mapping(uint32 => bytes32[])) colonyAllianceTaskForces;
 
     }
 
@@ -1430,6 +1452,27 @@ library LibColonyWarsStorage {
      */
     function setUserPrimaryColony(address user, bytes32 colonyId) internal {
         colonyWarsStorage().userPrimaryColony[user] = colonyId;
+    }
+
+    /**
+     * @notice Find a fallback primary colony for the user in the current season,
+     *         excluding a specific colony. Does not require `registered` â€” primary
+     *         is the anchor for resource/territory mechanics independent of warfare
+     *         participation, so an unregistered colony is still a valid primary.
+     * @param user User whose alternative colony is being looked up
+     * @param excludeColony Colony to skip (usually the one being unregistered/withdrawn)
+     * @return Fallback colony id, or bytes32(0) if none was found
+     */
+    function findFallbackPrimaryColony(address user, bytes32 excludeColony) internal view returns (bytes32) {
+        ColonyWarsStorage storage cws = colonyWarsStorage();
+        bytes32[] memory userColonies = cws.userSeasonColonies[cws.currentSeason][user];
+        for (uint256 i = 0; i < userColonies.length; i++) {
+            bytes32 candidate = userColonies[i];
+            if (candidate != excludeColony && candidate != bytes32(0)) {
+                return candidate;
+            }
+        }
+        return bytes32(0);
     }
 
     /**

@@ -19,7 +19,15 @@ interface IStrategicOverviewFacet {
 }
 
 interface IAllianceEvolutionFacet {
-    function getTreaty(bytes32 allianceId1, bytes32 allianceId2) external view returns (bool active, uint8 treatyType, uint32 activatedAt, uint32 expiresAt);
+    // Real implementation in AllianceEvolutionFacet.sol:373 is `getActiveTreaty`
+    // with 3 outputs (no activatedAt). The previous `getTreaty(...,...,...,...)`
+    // signature in this interface declared a 4-output function that was never
+    // wired into the Diamond cut â€” every cross-alliance attack reverted with
+    // FunctionDoesNotExist(0xf657119c) at the NAP treaty check in initiateAttack.
+    // Verified 2026-05-27 via scripts/diff-deployed-vs-source-selectors.js +
+    // scripts/find-selector-among-all-functions.js (Jerry "siege/attack nawet
+    // nie wywoluje portfela" report).
+    function getActiveTreaty(bytes32 alliance1, bytes32 alliance2) external view returns (bool exists, uint8 treatyType, uint32 expiresAt);
 }
 
 /**
@@ -147,7 +155,8 @@ contract ColonyWarsFacet is AccessControlBase {
 
         if (attackerAllianceId != bytes32(0) && defenderAllianceId != bytes32(0) && attackerAllianceId != defenderAllianceId) {
             // Check if there's an active NAP treaty between alliances
-            (bool hasActiveTreaty, , , ) = IAllianceEvolutionFacet(address(this)).getTreaty(attackerAllianceId, defenderAllianceId);
+            // getActiveTreaty returns (exists, treatyType, expiresAt) â€” 3 values not 4.
+            (bool hasActiveTreaty, , ) = IAllianceEvolutionFacet(address(this)).getActiveTreaty(attackerAllianceId, defenderAllianceId);
             if (hasActiveTreaty) {
                 revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Cannot attack - NAP treaty active between alliances");
             }
@@ -316,7 +325,7 @@ contract ColonyWarsFacet is AccessControlBase {
         if (battle.battleStartTime == 0) {
             revert BattleNotFound();
         }
-        if (!ColonyHelper.isAuthorizedForColony(battle.attackerColony, hs.stakingSystemAddress)) {
+        if (!ColonyHelper.isColonyCreator(battle.attackerColony, hs.stakingSystemAddress)) {
             revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not attacker");
         }
         if (battle.battleState != 0) {
@@ -1365,7 +1374,7 @@ contract ColonyWarsFacet is AccessControlBase {
             return 0;
         }
         
-        return losses > 5 ? 5 : losses; // Cap na 5 porażek
+        return losses > 5 ? 5 : losses; // Cap na 5 poraĹĽek
     }
 
     function _updateSeasonConsecutiveLosses(

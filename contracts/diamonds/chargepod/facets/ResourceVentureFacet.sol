@@ -544,7 +544,7 @@ contract ResourceVentureFacet is AccessControlBase {
         // Colony Laboratory bonus
         if (colonyId != bytes32(0)) {
             LibBuildingsStorage.ColonyBuildingEffects memory effects =
-                LibBuildingsStorage.getColonyBuildingEffects(colonyId);
+                LibBuildingsStorage.getColonyBuildingEffectsWithCards(colonyId);
 
             if (effects.techLevelBonus > 0) {
                 bonus += ps.ventureConfig.colonyBonusBps;

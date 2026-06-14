@@ -46,12 +46,12 @@ contract ColonyHealthFacet is AccessControlBase {
             revert ColonyHelper.ColonyDoesNotExist(colonyId);
         }
         
-        if (!ColonyHelper.isAuthorizedForColony(colonyId, hs.stakingSystemAddress)) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not authorized");
+        if (!ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress)) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Only colony creator or admin");
         }
-        
+
         (uint8 currentHealth,) = ColonyHelper.calculateColonyHealth(colonyId);
-        
+
         if (currentHealth >= 90 && restorationType != 3) {
             revert("Colony already healthy");
         }
@@ -101,7 +101,7 @@ contract ColonyHealthFacet is AccessControlBase {
 
     /**
      * @notice Heal colony using Bio resources instead of payment
-     * @dev UNIQUE RESOURCE USE-CASE: Bio → Colony Healing
+     * @dev UNIQUE RESOURCE USE-CASE: Bio â†’ Colony Healing
      *      Consumes Bio Compounds (resourceType=2) to restore colony health
      *      100 Bio = 10 health points restored
      * @param colonyId Colony to heal
@@ -119,8 +119,8 @@ contract ColonyHealthFacet is AccessControlBase {
             revert ColonyHelper.ColonyDoesNotExist(colonyId);
         }
 
-        if (!ColonyHelper.isAuthorizedForColony(colonyId, hs.stakingSystemAddress)) {
-            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Not authorized");
+        if (!ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress)) {
+            revert AccessHelper.Unauthorized(LibMeta.msgSender(), "Only colony creator or admin");
         }
 
         (uint8 currentHealth,) = ColonyHelper.calculateColonyHealth(colonyId);
@@ -287,7 +287,7 @@ contract ColonyHealthFacet is AccessControlBase {
                     daysSinceActivity: daysSince,
                     needsAttention: health < 50,
                     restorationCost: health < 90 ? hs.chargeFees.colonyMembershipFee.amount : 0,
-                    canRestore: ColonyHelper.isAuthorizedForColony(colonyId, hs.stakingSystemAddress)
+                    canRestore: ColonyHelper.isColonyCreator(colonyId, hs.stakingSystemAddress)
                 });
                 resultIndex++;
             }
