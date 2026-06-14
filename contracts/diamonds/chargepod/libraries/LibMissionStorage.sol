@@ -448,10 +448,10 @@ library LibMissionStorage {
         // 2026-05 upgrade: track how many fog tiles this single action revealed.
         // Move sets 0 or 1 (the entered tile, only if it was previously fog).
         // Scan sets 0..2 (adjacent tiles that were not yet discovered).
-        // Drives Discover-objective progress in _updateObjectiveProgress â€”
+        // Drives Discover-objective progress in _updateObjectiveProgress —
         // before this field, Discover was a no-op type with no handler and
         // any Discover-required objective was uncompletable. Memory-only
-        // struct, appended at the end â†’ no on-chain storage layout impact.
+        // struct, appended at the end → no on-chain storage layout impact.
         uint8 newlyDiscoveredCount;
     }
 
@@ -624,10 +624,10 @@ library LibMissionStorage {
         bool lendingSystemPaused;
 
         // ============ COLLECTION LOOKUPS (added for efficient queries) ============
-        // Reverse mapping: collection address â†’ collection ID (0 = not registered)
+        // Reverse mapping: collection address → collection ID (0 = not registered)
         mapping(address => uint16) passCollectionByAddress;
 
-        // Reverse mapping: specimen collection ID â†’ array of pass collection IDs that support it
+        // Reverse mapping: specimen collection ID → array of pass collection IDs that support it
         mapping(uint16 => uint16[]) passesForSpecimen;
     }
 

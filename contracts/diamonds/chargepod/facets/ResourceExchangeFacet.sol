@@ -21,7 +21,7 @@ interface IRewardToken is IERC20 {
 
 /**
  * @title ResourceExchangeFacet
- * @notice Protocol-level exchange: burn resources â†’ receive YLW at dynamic "pawn shop" rate
+ * @notice Protocol-level exchange: burn resources → receive YLW at dynamic "pawn shop" rate
  * @dev Exchange rates are deliberately LOW so that gameplay mechanics (ventures, buildings,
  *      processing, marketplace) are ALWAYS more profitable than direct exchange.
  *
@@ -35,13 +35,13 @@ interface IRewardToken is IERC20 {
  *
  *      RATE FORMULA:
  *      effectiveRate = baseRate[type]
- *          Ă— scarcityFactor      (0.8x - 1.2x)  supply utilization
- *          Ă— activityFactor      (0.8x - 1.1x)  recent resource activity
- *          Ă— tradeHubFactor      (1.0x - 1.15x) Trade Hub building level
- *          Ă— eventPenalty        (0.5x - 1.0x)  active events = WORSE rate
- *          Ă— cooldownPenalty     (0.7x - 1.0x)  repeated exchanges/day
- *          Ă— volumeFactor        (1.0x - 1.1x)  lifetime exchange loyalty
- *          Ă— ventureStreakFactor  (1.0x - 1.05x) consecutive venture successes
+ *          × scarcityFactor      (0.8x - 1.2x)  supply utilization
+ *          × activityFactor      (0.8x - 1.1x)  recent resource activity
+ *          × tradeHubFactor      (1.0x - 1.15x) Trade Hub building level
+ *          × eventPenalty        (0.5x - 1.0x)  active events = WORSE rate
+ *          × cooldownPenalty     (0.7x - 1.0x)  repeated exchanges/day
+ *          × volumeFactor        (1.0x - 1.1x)  lifetime exchange loyalty
+ *          × ventureStreakFactor  (1.0x - 1.05x) consecutive venture successes
  *
  * @author rutilicus.eth (ArchXS)
  */
@@ -342,15 +342,15 @@ contract ResourceExchangeFacet is AccessControlBase {
         uint256 utilization = (supply * BPS) / cap; // 0-10000
 
         if (utilization < 2500) {
-            return 8000;  // < 25% used: resource is abundant â†’ 0.8x
+            return 8000;  // < 25% used: resource is abundant → 0.8x
         } else if (utilization < 5000) {
-            return 9000;  // 25-50% â†’ 0.9x
+            return 9000;  // 25-50% → 0.9x
         } else if (utilization < 7500) {
-            return 10500; // 50-75% â†’ 1.05x
+            return 10500; // 50-75% → 1.05x
         } else if (utilization < 9000) {
-            return 11000; // 75-90% â†’ 1.1x
+            return 11000; // 75-90% → 1.1x
         } else {
-            return 12000; // > 90% â†’ 1.2x (mild premium, NOT 3x)
+            return 12000; // > 90% → 1.2x (mild premium, NOT 3x)
         }
     }
 
@@ -366,23 +366,23 @@ contract ResourceExchangeFacet is AccessControlBase {
     ) internal view returns (uint256 bps) {
         uint32 lastUpdate = rs.userResourcesLastUpdate[user];
 
-        if (lastUpdate == 0) return 8000; // Never active â†’ 0.8x
+        if (lastUpdate == 0) return 8000; // Never active → 0.8x
 
         uint32 currentTime = uint32(block.timestamp);
-        if (lastUpdate > currentTime) return 8000; // Corrupted timestamp â†’ 0.8x
+        if (lastUpdate > currentTime) return 8000; // Corrupted timestamp → 0.8x
 
         uint32 daysSinceActivity = (currentTime - lastUpdate) / 86400;
 
         if (daysSinceActivity == 0) {
-            return 11000; // Active today â†’ 1.1x
+            return 11000; // Active today → 1.1x
         } else if (daysSinceActivity <= 1) {
-            return 10500; // Active yesterday â†’ 1.05x
+            return 10500; // Active yesterday → 1.05x
         } else if (daysSinceActivity <= 3) {
-            return 10000; // Active within 3 days â†’ 1.0x
+            return 10000; // Active within 3 days → 1.0x
         } else if (daysSinceActivity <= 7) {
-            return 9000;  // Active within week â†’ 0.9x
+            return 9000;  // Active within week → 0.9x
         } else {
-            return 8000;  // Dormant (>7 days) â†’ 0.8x
+            return 8000;  // Dormant (>7 days) → 0.8x
         }
     }
 
@@ -395,13 +395,13 @@ contract ResourceExchangeFacet is AccessControlBase {
      */
     function _tradeHubFactor(address user) internal view returns (uint256 bps) {
         bytes32 colonyId = LibColonyWarsStorage.getUserPrimaryColony(user);
-        if (colonyId == bytes32(0)) return BPS; // No colony â†’ 1.0x (no bonus)
+        if (colonyId == bytes32(0)) return BPS; // No colony → 1.0x (no bonus)
 
         LibBuildingsStorage.ColonyBuildingEffects memory effects =
             LibBuildingsStorage.getColonyBuildingEffectsWithCards(colonyId);
 
         // marketFeeReductionBps: Trade Hub L1=500, L2=1000, L3=1500, L4=2500, L5=4000
-        // Scale to exchange bonus: max 4000 â†’ +15% (1500 bps bonus)
+        // Scale to exchange bonus: max 4000 → +15% (1500 bps bonus)
         // Formula: bonus = marketFeeReductionBps * 1500 / 4000 = marketFeeReductionBps * 3 / 8
         uint256 bonus = (uint256(effects.marketFeeReductionBps) * 3) / 8;
 
@@ -415,8 +415,8 @@ contract ResourceExchangeFacet is AccessControlBase {
      * @notice Active event PENALTY factor
      * @dev During active events, exchange rate DECREASES to encourage gameplay
      *      This is the opposite of the production bonus during events:
-     *      - Events boost production â†’ play more, earn more resources
-     *      - Events penalize exchange â†’ don't dump resources, USE them in event
+     *      - Events boost production → play more, earn more resources
+     *      - Events penalize exchange → don't dump resources, USE them in event
      *      - Resource Rush: -50% exchange rate
      *      - Processing Frenzy: -30% exchange rate
      *      - Crafting Festival: -20% exchange rate
@@ -435,16 +435,16 @@ contract ResourceExchangeFacet is AccessControlBase {
             if (evt.active && block.timestamp >= evt.startTime && block.timestamp <= evt.endTime) {
                 uint256 penalty;
                 if (evt.eventType == 1) {
-                    // Resource Rush â†’ strongest penalty (exchange is worst option during rush)
+                    // Resource Rush → strongest penalty (exchange is worst option during rush)
                     penalty = 5000; // 0.5x
                 } else if (evt.eventType == 2) {
-                    // Processing Frenzy â†’ moderate penalty
+                    // Processing Frenzy → moderate penalty
                     penalty = 7000; // 0.7x
                 } else if (evt.eventType == 3) {
-                    // Crafting Festival â†’ mild penalty
+                    // Crafting Festival → mild penalty
                     penalty = 8000; // 0.8x
                 } else {
-                    // Per-resource or other events â†’ mild penalty
+                    // Per-resource or other events → mild penalty
                     penalty = 8500; // 0.85x
                 }
 
@@ -459,7 +459,7 @@ contract ResourceExchangeFacet is AccessControlBase {
     /**
      * @notice Daily exchange cooldown PENALTY
      * @dev Each additional exchange per day gets a worse rate
-     *      Prevents harvest-and-dump loops where player harvests â†’ exchanges immediately
+     *      Prevents harvest-and-dump loops where player harvests → exchanges immediately
      *      1st exchange: 1.0x (full rate)
      *      2nd: 0.95x
      *      3rd: 0.85x
@@ -473,10 +473,10 @@ contract ResourceExchangeFacet is AccessControlBase {
         uint32 today = uint32(block.timestamp / 86400);
         uint8 countToday = rs.dailyExchangeCount[user][today];
 
-        if (countToday == 0) return BPS;     // 1st exchange â†’ 1.0x
-        if (countToday == 1) return 9500;    // 2nd â†’ 0.95x
-        if (countToday == 2) return 8500;    // 3rd â†’ 0.85x
-        return 7000;                          // 4th+ â†’ 0.70x
+        if (countToday == 0) return BPS;     // 1st exchange → 1.0x
+        if (countToday == 1) return 9500;    // 2nd → 0.95x
+        if (countToday == 2) return 8500;    // 3rd → 0.85x
+        return 7000;                          // 4th+ → 0.70x
     }
 
     /**
@@ -492,11 +492,11 @@ contract ResourceExchangeFacet is AccessControlBase {
     ) internal view returns (uint256 bps) {
         uint256 totalVolume = rs.totalExchangeVolume[user];
 
-        if (totalVolume < 100 ether) return BPS;          // < 100 YLW â†’ 1.0x
-        if (totalVolume < 500 ether) return 10200;         // 100-500 â†’ 1.02x
-        if (totalVolume < 2500 ether) return 10500;        // 500-2500 â†’ 1.05x
-        if (totalVolume < 10000 ether) return 10800;       // 2500-10k â†’ 1.08x
-        return 11000;                                       // >10k â†’ 1.1x
+        if (totalVolume < 100 ether) return BPS;          // < 100 YLW → 1.0x
+        if (totalVolume < 500 ether) return 10200;         // 100-500 → 1.02x
+        if (totalVolume < 2500 ether) return 10500;        // 500-2500 → 1.05x
+        if (totalVolume < 10000 ether) return 10800;       // 2500-10k → 1.08x
+        return 11000;                                       // >10k → 1.1x
     }
 
     /**
@@ -510,10 +510,10 @@ contract ResourceExchangeFacet is AccessControlBase {
         LibProgressionStorage.ProgressionStorage storage ps = LibProgressionStorage.progressionStorage();
         uint32 streak = ps.userStats[user].currentStreak;
 
-        if (streak < 3) return BPS;            // 0-2 â†’ 1.0x
-        if (streak < 5) return 10200;          // 3-4 â†’ 1.02x
-        if (streak < 10) return 10300;         // 5-9 â†’ 1.03x
-        return 10500;                           // 10+ â†’ 1.05x
+        if (streak < 3) return BPS;            // 0-2 → 1.0x
+        if (streak < 5) return 10200;          // 3-4 → 1.02x
+        if (streak < 10) return 10300;         // 5-9 → 1.03x
+        return 10500;                           // 10+ → 1.05x
     }
 
     // ============================================
@@ -690,10 +690,10 @@ contract ResourceExchangeFacet is AccessControlBase {
      * @dev Call once after deploying the facet. Safe to call multiple times (idempotent for rates).
      *
      *      Default base rates (YLW per resource unit):
-     *      - BASIC:  0.002 YLW â†’ 1200/day = 2.4 YLW (12% of harvest income)
-     *      - ENERGY: 0.005 YLW â†’ proportional to 2x rarity
-     *      - BIO:    0.012 YLW â†’ proportional to 4x rarity
-     *      - RARE:   0.035 YLW â†’ proportional to 10x rarity
+     *      - BASIC:  0.002 YLW → 1200/day = 2.4 YLW (12% of harvest income)
+     *      - ENERGY: 0.005 YLW → proportional to 2x rarity
+     *      - BIO:    0.012 YLW → proportional to 4x rarity
+     *      - RARE:   0.035 YLW → proportional to 10x rarity
      */
     function initializeExchangeDefaults() external onlyAuthorized {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();

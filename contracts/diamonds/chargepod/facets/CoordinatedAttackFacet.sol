@@ -35,7 +35,7 @@ interface ICAF_AllianceEvolution {
  *      Folding the logic into ColonyWarsFacet pushed it over the 24KB EIP-170 limit, so
  *      everything coordinated now lives here. Entrypoints and battle creation are in the
  *      SAME contract, so they call each other as plain internal functions and msgSender()
- *      resolves to the real leader throughout â€” no self-call, no garbage sender.
+ *      resolves to the real leader throughout — no self-call, no garbage sender.
  *
  *      ASSET CONSENT MODEL: opt-in. The leader creates a task force with its own tokens;
  *      each member joins from ITS OWN transaction, committing its own tokens. Stake is

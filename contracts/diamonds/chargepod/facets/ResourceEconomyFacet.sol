@@ -24,7 +24,7 @@ interface IRewardToken is IERC20 {
 /**
  * @title ResourceEconomyFacet
  * @notice Manages resource nodes, harvesting, and colony resource balances
- * @dev MODUĹ 6 - Dual Token Economy Implementation
+ * @dev MODUŁ 6 - Dual Token Economy Implementation
  *
  * NOTE: This facet uses economyResourceNodes (keyed by auto-increment economyNodeId),
  * separate from territoryResourceNodes used by TerritoryResourceFacet (keyed by territoryId).
@@ -299,7 +299,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         }
 
         // Reward auxiliary currency (Utility token for daily activities)
-        // Uses Treasury â†’ Mint fallback pattern for sustainable tokenomics
+        // Uses Treasury → Mint fallback pattern for sustainable tokenomics
         address auxiliaryCurrency = ResourceHelper.getAuxiliaryCurrency();
         if (auxiliaryCurrency != address(0) && tokenReward > 0) {
             _distributeYlwReward(auxiliaryCurrency, LibMeta.msgSender(), tokenReward);
@@ -372,7 +372,7 @@ contract ResourceEconomyFacet is AccessControlBase {
     error RequisitionInsufficientColonyResources(uint8 resourceType, uint256 requested, uint256 available);
 
     // ============================================================================
-    // COLONY RESOURCE SUPPLY (personal â†’ colony)
+    // COLONY RESOURCE SUPPLY (personal → colony)
     // ============================================================================
 
     event ColonyResourcesSupplied(
@@ -1173,7 +1173,7 @@ contract ResourceEconomyFacet is AccessControlBase {
     // ============================================================================
 
     /**
-     * @notice Distribute YLW reward with Treasury â†’ Mint fallback
+     * @notice Distribute YLW reward with Treasury → Mint fallback
      * @dev Priority: 1) Transfer from treasury, 2) Mint if treasury insufficient
      * @param rewardToken YLW token address
      * @param recipient User receiving the reward
@@ -1817,7 +1817,7 @@ contract ResourceEconomyFacet is AccessControlBase {
         if (scaleFactor > 100) scaleFactor = 100; // Cap at 100
 
         // Apply tier rarity boost: increases each threshold by boostBps percentage
-        // e.g. boostBps=2500 (25%) â†’ threshold 1000 becomes 1250
+        // e.g. boostBps=2500 (25%) → threshold 1000 becomes 1250
         uint256 boost = uint256(boostBps);
 
         uint256 legendaryThreshold = (LEGENDARY_THRESHOLD * scaleFactor / 10);
@@ -1997,11 +1997,11 @@ contract ResourceEconomyFacet is AccessControlBase {
     /**
      * @notice Initialize default crafting tiers (ADMIN ONLY)
      * @dev Sets default tier thresholds:
-     *      - Tier 0: 5,000 â†’ Common
-     *      - Tier 1: 10,000 â†’ Uncommon
-     *      - Tier 2: 25,000 â†’ Rare
-     *      - Tier 3: 50,000 â†’ Epic
-     *      - Tier 4: 100,000 â†’ Legendary
+     *      - Tier 0: 5,000 → Common
+     *      - Tier 1: 10,000 → Uncommon
+     *      - Tier 2: 25,000 → Rare
+     *      - Tier 3: 50,000 → Epic
+     *      - Tier 4: 100,000 → Legendary
      */
     function initializeCraftingTiers() external onlyAuthorized {
         LibResourceStorage.ResourceStorage storage rs = LibResourceStorage.resourceStorage();

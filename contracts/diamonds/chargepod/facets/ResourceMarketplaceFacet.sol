@@ -412,7 +412,7 @@ contract ResourceMarketplaceFacet is AccessControlBase {
     /**
      * @notice Calculate effective marketplace fee with Trade Hub reduction
      * @dev Trade Hub marketFeeReductionBps (L1=500..L5=4000) reduces the base 2% fee
-     *      Example: Trade Hub L5 = 4000 bps reduction â†’ 200 * 4000 / 10000 = 80 â†’ fee = 120 bps (1.2%)
+     *      Example: Trade Hub L5 = 4000 bps reduction → 200 * 4000 / 10000 = 80 → fee = 120 bps (1.2%)
      * @param buyer Buyer address (fee payer)
      * @return feeBps Effective fee in basis points
      */

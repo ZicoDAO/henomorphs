@@ -414,7 +414,7 @@ contract ColonyWarsStatsFacet is AccessControlBase {
         stats.totalEarnedThisSeason = _estimateSeasonEarnings(colonyId, cws);
         stats.totalEarnedAllTime = stats.totalEarnedThisSeason;
 
-        // Estimated season prize - use lightweight O(n) calculation instead of O(nÂ˛) calculateTopSeasonPrize
+        // Estimated season prize - use lightweight O(n) calculation instead of O(n²) calculateTopSeasonPrize
         // Full prize details available via getColonyWarRewardStats()
         stats.estimatedSeasonPrize = _estimateSeasonPrizeLightweight(colonyId, cws);
     }
@@ -1396,7 +1396,7 @@ contract ColonyWarsStatsFacet is AccessControlBase {
     }
 
     /**
-     * @notice O(n) prize estimate - avoids the O(nÂ˛) calculateTopSeasonPrize
+     * @notice O(n) prize estimate - avoids the O(n²) calculateTopSeasonPrize
      * @dev Single pass: get colony score and sum of all scores, then proportional share
      */
     function _estimateSeasonPrizeLightweight(bytes32 colonyId, LibColonyWarsStorage.ColonyWarsStorage storage cws)

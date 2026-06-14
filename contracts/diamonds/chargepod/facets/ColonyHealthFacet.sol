@@ -101,7 +101,7 @@ contract ColonyHealthFacet is AccessControlBase {
 
     /**
      * @notice Heal colony using Bio resources instead of payment
-     * @dev UNIQUE RESOURCE USE-CASE: Bio â†’ Colony Healing
+     * @dev UNIQUE RESOURCE USE-CASE: Bio → Colony Healing
      *      Consumes Bio Compounds (resourceType=2) to restore colony health
      *      100 Bio = 10 health points restored
      * @param colonyId Colony to heal

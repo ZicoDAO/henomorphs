@@ -51,7 +51,7 @@ contract MissionConfigFacet is AccessControlBase {
     event LendingConfigSet(address indexed paymentToken, uint16 platformFeeBps);
     event LendingSystemPaused(bool paused);
 
-    // Admin reset events â€” used by the cleanup tooling that rescues state
+    // Admin reset events — used by the cleanup tooling that rescues state
     // orphaned by the pre-fix `uint128(combinedId)` truncation in
     // _lockParticipants/_unlockParticipants.
     event AdminTokenUnlocked(uint256 indexed combinedId);
@@ -1149,7 +1149,7 @@ contract MissionConfigFacet is AccessControlBase {
     // VIEW FUNCTIONS (moved from MissionFacet to free bytecode budget)
     // ============================================================
     //
-    // These views are pure storage readers â€” they don't touch any internal
+    // These views are pure storage readers — they don't touch any internal
     // helpers in MissionFacet. Routed via Diamond, so UI calling the diamond
     // proxy address gets the same behavior regardless of which facet hosts
     // the selector. canExtractMission / estimateMissionRewards stay in

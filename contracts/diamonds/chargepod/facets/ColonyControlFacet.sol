@@ -660,7 +660,7 @@ contract ColonyControlFacet is AccessControlBase {
             revert ColonyHelper.ColonyDoesNotExist(colonyId);
         }
         
-        // Only colony creator or admin can expel â€” prevents members from removing each other's tokens
+        // Only colony creator or admin can expel — prevents members from removing each other's tokens
         if (!ColonyHelper.isColonyCreator(colonyId, stakingSys) && !AccessHelper.isAuthorized()) {
             revert AccessHelper.Unauthorized(sender, "Only colony creator or admin can expel");
         }

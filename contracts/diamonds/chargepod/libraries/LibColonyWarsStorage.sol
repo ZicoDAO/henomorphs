@@ -337,7 +337,7 @@ library LibColonyWarsStorage {
         uint32 lastEquipmentUpdate;      // Last time equipment was changed
     }
 
-    // === MODUĹ 6: Resource Economy ===
+    // === MODUŁ 6: Resource Economy ===
     enum ResourceType { BasicMaterials, EnergyCrystals, BioCompounds, RareElements }
     
     struct ResourceNode {
@@ -379,7 +379,7 @@ library LibColonyWarsStorage {
         bool claimed;
     }
 
-    // === MODUĹ 6: Collaborative Crafting ===
+    // === MODUŁ 6: Collaborative Crafting ===
     enum ProjectType { Infrastructure, Research, Defense }
     enum ProjectStatus { Active, Completed, Failed, Cancelled }
 
@@ -574,7 +574,7 @@ library LibColonyWarsStorage {
         // Emergency pause per feature
         mapping(string => bool) featurePaused;
 
-        // Tracking list dla peĹ‚nej funkcjonalnoĹ›ci
+        // Tracking list dla pełnej funkcjonalności
         bytes32[] allAllianceIds;           // Lista wszystkich utworzonych federacji
         mapping(uint32 => bytes32[]) seasonBattles;      // seasonId => battleIds[]
         mapping(uint32 => bytes32[]) seasonAlliances;    // seasonId => allianceIds[] (aktywne w sezonie)
@@ -640,7 +640,7 @@ library LibColonyWarsStorage {
         mapping(uint256 => TerritoryEquipment) territoryEquipment; // territoryId => equipment
         mapping(uint256 => uint256) infraEquippedToTerritory;      // infraNFT tokenId => territoryId
         
-        // MODUĹ 6: Resource Economy
+        // MODUŁ 6: Resource Economy
         mapping(uint256 => ResourceNode) resourceNodes;            // nodeId => node
         mapping(bytes32 => ResourceBalance) colonyResources;       // colonyId => resources
         mapping(uint8 => ProcessingRecipe) processingRecipes;      // recipeId => recipe
@@ -671,7 +671,7 @@ library LibColonyWarsStorage {
         uint256 collectionCounter;
         
         /**
-         * @notice Reverse lookup: contract address â†’ collectionId
+         * @notice Reverse lookup: contract address → collectionId
          * @dev Used for quick validation of incoming transfers
          */
         mapping(address => uint256) contractToCollectionId;
@@ -698,13 +698,13 @@ library LibColonyWarsStorage {
         
         /**
          * @notice Track which collection each staked Territory NFT belongs to
-         * @dev Format: (collectionId, tokenId) â†’ colonyId
+         * @dev Format: (collectionId, tokenId) → colonyId
          */
         mapping(uint256 => mapping(uint256 => bytes32)) stakedTerritoryOwnerByCollection;
         
         /**
          * @notice Track which collection each staked Infrastructure NFT belongs to
-         * @dev Format: (collectionId, tokenId) â†’ colonyId
+         * @dev Format: (collectionId, tokenId) → colonyId
          */
         mapping(uint256 => mapping(uint256 => bytes32)) stakedInfraOwnerByCollection;
         
@@ -716,19 +716,19 @@ library LibColonyWarsStorage {
         
         /**
          * @notice Per-colony, per-collection Territory NFT tracking
-         * @dev Format: colonyId â†’ collectionId â†’ tokenIds[]
+         * @dev Format: colonyId → collectionId → tokenIds[]
          */
         mapping(bytes32 => mapping(uint256 => uint256[])) colonyTerritoryByCollection;
         
         /**
          * @notice Per-colony, per-collection Infrastructure NFT tracking
-         * @dev Format: colonyId â†’ collectionId â†’ tokenIds[]
+         * @dev Format: colonyId → collectionId → tokenIds[]
          */
         mapping(bytes32 => mapping(uint256 => uint256[])) colonyInfraByCollection;
         
         /**
          * @notice Track which collections each colony has used
-         * @dev Format: colonyId â†’ collectionIds[] (for uniqueCollectionsCount)
+         * @dev Format: colonyId → collectionIds[] (for uniqueCollectionsCount)
          */
         mapping(bytes32 => uint256[]) colonyActiveCollections;
 
@@ -749,13 +749,13 @@ library LibColonyWarsStorage {
         
         /**
          * @notice Track which collection each staked Resource NFT belongs to
-         * @dev Format: (collectionId, tokenId) â†’ colonyId
+         * @dev Format: (collectionId, tokenId) → colonyId
          */
         mapping(uint256 => mapping(uint256 => bytes32)) stakedResourceOwnerByCollection;
         
         /**
          * @notice Per-colony, per-collection Resource NFT tracking
-         * @dev Format: colonyId â†’ collectionId â†’ tokenIds[]
+         * @dev Format: colonyId → collectionId → tokenIds[]
          */
         mapping(bytes32 => mapping(uint256 => uint256[])) colonyResourceByCollection;
 
@@ -1456,7 +1456,7 @@ library LibColonyWarsStorage {
 
     /**
      * @notice Find a fallback primary colony for the user in the current season,
-     *         excluding a specific colony. Does not require `registered` â€” primary
+     *         excluding a specific colony. Does not require `registered` — primary
      *         is the anchor for resource/territory mechanics independent of warfare
      *         participation, so an unregistered colony is still a valid primary.
      * @param user User whose alternative colony is being looked up

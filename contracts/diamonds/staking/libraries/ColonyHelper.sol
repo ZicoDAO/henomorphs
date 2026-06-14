@@ -296,7 +296,7 @@ library ColonyHelper {
      *      a token registered in hs.colonies[colonyId]).
      *
      * WARNING: DO NOT use this for management actions (expel, dissolve, set
-     * criteria, withdraw stake, cancel attack, etc.) â€” any single member of a
+     * criteria, withdraw stake, cancel attack, etc.) — any single member of a
      * colony would be authorized. Use {isColonyCreator} for management gates.
      *
      * Appropriate uses: read/diagnostic checks, and write actions where the

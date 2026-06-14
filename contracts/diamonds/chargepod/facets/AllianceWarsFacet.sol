@@ -1541,12 +1541,12 @@ contract AllianceWarsFacet is AccessControlBase {
             revert SameColony();
         }
 
-        // Cannot change while in alliance (prevents manipulation) â€” UNLESS this is
+        // Cannot change while in alliance (prevents manipulation) — UNLESS this is
         // the user's first-ever primary set. Without this escape, users who joined
         // an alliance before setting a primary are permanently stuck: they cannot
         // self-fix and the only path used to be `adminChangePrimaryColony`. The
         // anti-manipulation intent (don't let alliance members rotate primary to
-        // game maintenance/harvest gating) is preserved â€” once any non-zero
+        // game maintenance/harvest gating) is preserved — once any non-zero
         // primary is set, the in-alliance lock applies as before.
         // Direct storage read (NOT getUserPrimaryColony) so we don't accept the
         // userToColony fallback as "already set".

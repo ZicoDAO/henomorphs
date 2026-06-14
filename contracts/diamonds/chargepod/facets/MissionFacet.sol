@@ -36,7 +36,7 @@ contract MissionFacet is AccessControlBase {
     // payoff (success = resources), give Scan information value via move-into-
     // fog ambush risk (B5), and reward squads that actually fight (B6).
 
-    // B4 â€” per-event-type damage applied to the squad lead on a FAILED
+    // B4 — per-event-type damage applied to the squad lead on a FAILED
     // response. Same channel as combat defeat (participant.damageTaken;
     // incapacitation at > initialCharge / 2).
     uint16 internal constant EVENT_DMG_PATROL = 15;
@@ -45,16 +45,16 @@ contract MissionFacet is AccessControlBase {
     uint16 internal constant EVENT_DMG_ENVIRONMENTAL = 18;
     uint16 internal constant EVENT_DMG_DEFAULT = 12;
 
-    // B4 â€” dataFragments granted on a successful, reward-bearing event.
+    // B4 — dataFragments granted on a successful, reward-bearing event.
     uint8 internal constant EVENT_REWARD_FRAGMENTS = 8;
 
-    // B5 â€” chance (%) that moving onto an UNDISCOVERED tile hiding an enemy
+    // B5 — chance (%) that moving onto an UNDISCOVERED tile hiding an enemy
     // springs an ambush (damage, enemy NOT cleared). Scanning the tile first
-    // sets discovered = true and avoids this entirely â€” Scan's reason to exist.
+    // sets discovered = true and avoids this entirely — Scan's reason to exist.
     uint8 internal constant MOVE_AMBUSH_CHANCE = 50;
     uint16 internal constant MOVE_AMBUSH_DAMAGE = 18;
 
-    // B6 â€” engagement bonus: combat victories pay a small reward (basis points
+    // B6 — engagement bonus: combat victories pay a small reward (basis points
     // of baseReward per win, capped). Combat costs charge and a loss dents the
     // performance rating, so this is a genuine risk/reward, not free money.
     uint16 internal constant COMBAT_WIN_BONUS_BP = 200;      // +2% per win
@@ -82,7 +82,7 @@ contract MissionFacet is AccessControlBase {
     );
     event MissionEventTriggered(bytes32 indexed sessionId, uint8 eventId, LibMissionStorage.EventType eventType);
     event MissionEventResolved(bytes32 indexed sessionId, uint8 eventId, bool success);
-    // Emitted by expireMissionEvent â€” surfaced to UI so the player sees
+    // Emitted by expireMissionEvent — surfaced to UI so the player sees
     // "event timed out, mission continues" instead of being silently
     // unstuck. Penalty already accounted for via state.eventsFailed.
     event MissionEventTimedOut(bytes32 indexed sessionId, uint8 eventId);
@@ -128,7 +128,7 @@ contract MissionFacet is AccessControlBase {
     error EventResponseRequired(bytes32 sessionId, uint8 eventId);
     error NoEventPending(bytes32 sessionId);
     error EventDeadlinePassed(bytes32 sessionId);
-    // 2026-05 upgrade â€” distinguishes "event expired, please clean up" from
+    // 2026-05 upgrade — distinguishes "event expired, please clean up" from
     // "event still has time" so expireMissionEvent can be permissionless
     // without racing legitimate respondToEvent calls.
     error EventStillActive(bytes32 sessionId, uint256 currentBlock, uint256 deadline);
@@ -416,8 +416,8 @@ contract MissionFacet is AccessControlBase {
             // event. Emit its result BEFORE the event-trigger branch so a
             // Combat action that coincides with an event still surfaces its
             // win/lose. Previously the early `break` below skipped this emit,
-            // so the client â€” which derives combat outcome SOLELY from
-            // MissionActionPerformed â€” opened the event modal with no combat
+            // so the client — which derives combat outcome SOLELY from
+            // MissionActionPerformed — opened the event modal with no combat
             // result toast: the player saw charge spent with no resolution.
             emit MissionActionPerformed(
                 sessionId,
@@ -472,7 +472,7 @@ contract MissionFacet is AccessControlBase {
             revert EventDeadlinePassed(sessionId);
         }
 
-        // Capture before clearing â€” the resolved event id is needed for the
+        // Capture before clearing — the resolved event id is needed for the
         // emit below, which previously logged 0 (the already-cleared value).
         uint8 resolvedEventId = state.pendingEventId;
 
@@ -483,7 +483,7 @@ contract MissionFacet is AccessControlBase {
             state.eventsResolved++;
         } else {
             state.eventsFailed++;
-            // Apply the event's bite to the squad lead â€” mirrors combat defeat
+            // Apply the event's bite to the squad lead — mirrors combat defeat
             // (participant.damageTaken + incapacitation at > initialCharge / 2).
             // Until now outcome.damageTaken was computed and discarded, which is
             // exactly why events were consequence-free.
@@ -513,7 +513,7 @@ contract MissionFacet is AccessControlBase {
 
     /**
      * @notice Auto-resolve a pending event whose response deadline has passed.
-     * @dev Permissionless cleanup â€” the session initiator (or any keeper)
+     * @dev Permissionless cleanup — the session initiator (or any keeper)
      *      can call this to break the EventPending lock without abandoning
      *      the squad. Penalty is the same as a failed Ignore response:
      *      eventsFailed++ (counts toward "eventIgnored" failure reason in
@@ -522,7 +522,7 @@ contract MissionFacet is AccessControlBase {
      *      become callable again.
      *
      *      This addresses a deployed-state bug where the contract had no
-     *      auto-fail path for EventPending â€” a player who missed the event
+     *      auto-fail path for EventPending — a player who missed the event
      *      response window was forced to abandon (forfeiting the squad
      *      lock + accumulated rewards).
      */
@@ -554,7 +554,7 @@ contract MissionFacet is AccessControlBase {
         state.phase = uint8(LibMissionStorage.MissionPhase.Active);
 
         // After clearing, the player may have already met all required
-        // objectives â€” flip phase straight to ReadyToComplete so they can
+        // objectives — flip phase straight to ReadyToComplete so they can
         // extract without an extra action tx.
         if (_checkAllRequiredObjectivesComplete(sessionId)) {
             state.phase = uint8(LibMissionStorage.MissionPhase.ReadyToComplete);
@@ -1356,7 +1356,7 @@ contract MissionFacet is AccessControlBase {
             LibMissionStorage.setNode(nodes, i, node);
         }
 
-        // Quota enforcement â€” pre-fix, _determineNodeType rolled each non-
+        // Quota enforcement — pre-fix, _determineNodeType rolled each non-
         // forced slot independently against `lootNodeChance` etc., so a 6-8
         // node map could legitimately end with 0 Loot tiles while the
         // template's required Collect target was 3-5. _ensureMinimumPayloads
@@ -1427,7 +1427,7 @@ contract MissionFacet is AccessControlBase {
         //   pass 3: EXCESS Combat tiles (haveEnemy > needEnemy)
         //   pass 4: EXCESS Terminal tiles (haveTerminal > needTerminal)
         // Objective / Exit / start / first `minCombatNodes` Combats are NEVER
-        // converted â€” they're either mission-critical or guaranteed minimums.
+        // converted — they're either mission-critical or guaranteed minimums.
         //
         // 2026-05-11 PATCH (v1): single-pass Empty-only was too restrictive.
         // 2026-05-11 PATCH (v2): even 3-pass (Empty/Event/Secret) wasn't
@@ -1436,7 +1436,7 @@ contract MissionFacet is AccessControlBase {
         // (passes 3-4) guarantees quotas are met whenever the math allows:
         //   needLoot + needEnemy + needTerminal <= mapSize - 2.
         // For V4 mapSize=14 / minCombat=5 / needEnemy=4 / needLoot=6 /
-        // needTerminal=2 = 12 â‰¤ 12, the patch now satisfies even worst-case
+        // needTerminal=2 = 12 ≤ 12, the patch now satisfies even worst-case
         // RNG. The 1 excess Combat (minCombat 5 - needEnemy 4) gets demoted
         // to Loot in pass 3, providing the final tile needed.
         uint8 minCombatProtect = config.minCombatNodes;
@@ -1696,8 +1696,8 @@ contract MissionFacet is AccessControlBase {
      * @dev Called from extractMission BEFORE rewards calculation so
      * _calculateFinalRewards / performance rating reflect the freshly-
      * marked objectives. _checkAllRequiredObjectivesComplete (the gate
-     * that flipped Activeâ†’ReadyToComplete) accepts these via live check,
-     * so by the time we reach extract the conditions are guaranteed â€”
+     * that flipped Active→ReadyToComplete) accepts these via live check,
+     * so by the time we reach extract the conditions are guaranteed —
      * but the on-chain `isCompleted` flag still needs to be set for
      * downstream readers (UI, rewards, perfect-completion check).
      */
@@ -1742,7 +1742,7 @@ contract MissionFacet is AccessControlBase {
         for (uint8 i = 0; i < requiredCount; i++) {
             LibMissionStorage.MissionObjective memory obj = LibMissionStorage.getObjective(objectives, i);
             if (obj.isCompleted) continue;
-            // Live check for terminal objectives â€” Survive/Time can satisfy
+            // Live check for terminal objectives — Survive/Time can satisfy
             // the gate even before they are formally marked completed
             // (the formal mark + event happens in _completeTerminalObjectives
             // at extractMission time). Without this, phase would never flip
@@ -1755,7 +1755,7 @@ contract MissionFacet is AccessControlBase {
             if (obj.objectiveType == LibMissionStorage.ObjectiveType.Time) {
                 // Player must complete within obj.targetAmount blocks of the
                 // reveal block (when actual gameplay starts). targetAmount is
-                // a direct block budget â€” admin sets meaningful values per
+                // a direct block budget — admin sets meaningful values per
                 // variant via objective templates.
                 uint256 elapsed = uint256(state.lastActionBlock) > uint256(state.revealBlock)
                     ? uint256(state.lastActionBlock) - uint256(state.revealBlock)
@@ -1802,7 +1802,7 @@ contract MissionFacet is AccessControlBase {
             // Derive the event ID from a per-action hash, NOT a fixed slice of
             // sessionEntropy. The old `(entropy >> 24) % 10` depended only on
             // the session seed, so every event a mission ever rolled was the
-            // SAME id â€” players saw "disarm bomb" on repeat (Jerry 2026-05-30).
+            // SAME id — players saw "disarm bomb" on repeat (Jerry 2026-05-30).
             // Mixing in `totalActions` (changes every action) re-rolls each
             // trigger across the full 1..10 pool, so consecutive events differ.
             result.triggeredEventId = uint8(
@@ -1907,7 +1907,7 @@ contract MissionFacet is AccessControlBase {
         // B5: stepping blind into a hostile tile can spring an ambush. Only
         // fires on tiles that were never scanned (wasFog) and that hide an
         // enemy. Scan reveals current+1..+3 (sets discovered = true), so
-        // scouting ahead defuses this â€” that is Scan's reason to exist.
+        // scouting ahead defuses this — that is Scan's reason to exist.
         // The enemy is NOT cleared: the squad still has to fight or bypass it.
         if (wasFog && targetNode.hasEnemy) {
             LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
@@ -1926,7 +1926,7 @@ contract MissionFacet is AccessControlBase {
         // Move to target
         state.currentNodeId = targetNodeId;
 
-        // Discover node â€” count toward Discover objective only if we just
+        // Discover node — count toward Discover objective only if we just
         // un-fogged it. Subsequent moves through the same tile shouldn't
         // pay out Discover progress.
         if (wasFog) {
@@ -1946,7 +1946,7 @@ contract MissionFacet is AccessControlBase {
         LibMissionStorage.MissionStorage storage ms = LibMissionStorage.missionStorage();
         uint8 mapSize = ms.variantConfigs[state.passCollectionId][state.missionVariant].mapSize;
 
-        // Discover surrounding nodes â€” track how many were genuinely revealed
+        // Discover surrounding nodes — track how many were genuinely revealed
         // (i.e. previously discovered=false) so Discover objective progress
         // reflects actual exploration value, not spam-scan farming on
         // already-mapped neighbours.
@@ -1954,8 +1954,8 @@ contract MissionFacet is AccessControlBase {
         // Reveal radius: one tile BEHIND (closes the fog gap left by a +2 move
         // jump) plus THREE tiles AHEAD. The forward reach is the whole point of
         // the redesign (Jerry 2026-05-30): the map is linear and Move already
-        // un-fogs its destination (max +2), so the old Â±1 Scan only revealed
-        // current+1 â€” a tile Move would reveal anyway â€” making Scan dead weight
+        // un-fogs its destination (max +2), so the old ±1 Scan only revealed
+        // current+1 — a tile Move would reveal anyway — making Scan dead weight
         // that just burned charge. Reaching current+3 lets Scan out-range Move,
         // so a player can spot an incoming Combat/Terminal/Loot node and plan
         // charge/rest/route before committing. That is the recon role Scan was
@@ -2100,8 +2100,8 @@ contract MissionFacet is AccessControlBase {
         uint256 stealthRoll = uint256(keccak256(abi.encodePacked(ms.sessionEntropy[sessionId], "stealth", state.totalActions)));
 
         // Stealth success based on difficulty.
-        // 2026-05 upgrade: lowered multiplier 8 â†’ 6 to soften the curve.
-        // Pre-fix: difficulty 1 = 91% / difficulty 10 = 19% â€” the high-end
+        // 2026-05 upgrade: lowered multiplier 8 → 6 to soften the curve.
+        // Pre-fix: difficulty 1 = 91% / difficulty 10 = 19% — the high-end
         // 19% turned high-difficulty maps into stealth-grinding loops.
         // Post-fix: difficulty 1 = 93% / difficulty 5 = 70% / difficulty 10 = 40%.
         // High difficulty stays meaningfully harder, but Stealth-required
@@ -2316,7 +2316,7 @@ contract MissionFacet is AccessControlBase {
             else if (response == LibMissionStorage.EventResponse.Flee) successChance = 40;
             failDamage = EVENT_DMG_TRAP;
         } else if (eventType == LibMissionStorage.EventType.Ambush) {
-            // Forced fight â€” no safe response, real teeth on failure.
+            // Forced fight — no safe response, real teeth on failure.
             successChance = 50;
             failDamage = EVENT_DMG_AMBUSH;
         } else if (eventType == LibMissionStorage.EventType.Discovery) {
@@ -2338,7 +2338,7 @@ contract MissionFacet is AccessControlBase {
             // Reward scales with event type: Discovery pays most, Ally pays for
             // engaging (not Declining), evading a Patrol/hazard pays a small
             // consolation so working the event loop beats ignoring it. Trap /
-            // Ambush success pays nothing â€” you simply avoided the harm.
+            // Ambush success pays nothing — you simply avoided the harm.
             if (eventType == LibMissionStorage.EventType.Discovery) {
                 ms.packedStates[sessionId].secretsFound++;
                 outcome.rewardBonus = EVENT_REWARD_FRAGMENTS * 2;
@@ -2404,7 +2404,7 @@ contract MissionFacet is AccessControlBase {
         // Difficulty multiplier
         reward = (reward * config.difficultyMultiplier) / 10000;
 
-        // B6 â€” engagement bonus: reward squads that actually fight. Combat
+        // B6 — engagement bonus: reward squads that actually fight. Combat
         // costs charge and a loss dents the performance rating, so this is a
         // genuine risk/reward (not free money), and the cap keeps it from
         // dominating. Stops "do only the required fights, then stop" from

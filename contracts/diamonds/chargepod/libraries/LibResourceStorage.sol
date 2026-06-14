@@ -379,7 +379,7 @@ library LibResourceStorage {
      *      - Linear decay punishes large balances too harshly
      *      - Sqrt decay: decayAmount = sqrt(currentAmount) * rate * days / scaleFactor
      *      - This makes decay proportionally smaller for larger balances
-     *      - Example at 1% rate: 100 resources â†’ 1 decay, 10000 resources â†’ 10 decay (not 100)
+     *      - Example at 1% rate: 100 resources → 1 decay, 10000 resources → 10 decay (not 100)
      * @param user User address
      */
     function applyResourceDecay(address user) internal {

@@ -104,7 +104,7 @@ contract ColonyWarsRegistrationFacet is AccessControlBase {
         // Pre-2026-05-21 this checked profile.registered alone, which blocked
         // legacy colonies (registered=true with registeredSeasonId=0 because the
         // field was appended after their original registration) from joining S4
-        // â€” even though captureTerritory grandfather-clauses them in. Aligns the
+        // — even though captureTerritory grandfather-clauses them in. Aligns the
         // two paths: stale colonies CAN re-register; only current-season dupes revert.
         if (cws.colonyWarProfiles[colonyId].registered &&
             cws.colonyWarProfiles[colonyId].registeredSeasonId == currentSeason) {
@@ -180,7 +180,7 @@ contract ColonyWarsRegistrationFacet is AccessControlBase {
         _resetColonyWarProfile(colonyId, cws);
 
         // Reassign primary if this was the user's primary colony.
-        // Primary anchors resource/territory mechanics independent of warfare â€”
+        // Primary anchors resource/territory mechanics independent of warfare —
         // do not require the replacement to be `registered`, and keep the old
         // primary as a last resort if no alternative exists.
         bytes32 userPrimary = LibColonyWarsStorage.getUserPrimaryColony(LibMeta.msgSender());
